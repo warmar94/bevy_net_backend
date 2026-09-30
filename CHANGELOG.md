@@ -5,7 +5,7 @@ All notable changes to this crate are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (before 1.0: a minor bump for any API
 change or a Bevy / key dependency bump).
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-10-01
 
 ### Added
 
