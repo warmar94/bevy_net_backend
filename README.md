@@ -12,7 +12,7 @@
   <a href="https://crates.io/crates/russh"><img alt="russh 0.63.3 (optional)" src="https://img.shields.io/badge/russh-0.63.3%20(optional)-orange"></a>
 </p>
 
-<p align="center"><b>HTTP, WebSocket and SSH/SFTP for Bevy</b>: fire a request from a system, get exactly one typed answer back as a Bevy message.</p>
+<p align="center"><b>HTTP, WebSocket and SSH/SFTP for Bevy</b>: fire a request, get exactly one typed answer back as a Bevy message.</p>
 
 ---
 
