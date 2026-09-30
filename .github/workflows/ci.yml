@@ -38,6 +38,11 @@ jobs:
           - "--no-default-features --features ws,json"
           - "--features ws"
           - "--features ws,gzip"
+          - "--features ssh"
+          - "--no-default-features --features ssh"
+          - "--features ssh,sftp"
+          - "--features ssh,ssh-rsa"
+          - "--features ssh,ws"
           - "--all-features"
     runs-on: ubuntu-latest
     steps:
@@ -71,6 +76,12 @@ jobs:
       - run: cargo test --locked --no-default-features --features ws,json
       - run: cargo test --locked --features ws
       - run: cargo test --locked --features ws,gzip
+      # SSH: the real transport runs against the in-process mock SSH server on 127.0.0.1.
+      - run: cargo test --locked --features ssh
+      - run: cargo test --locked --no-default-features --features ssh
+      - run: cargo test --locked --features ssh,sftp
+      - run: cargo test --locked --features ssh,ssh-rsa
+      - run: cargo test --locked --features ssh,ws
       - run: cargo test --locked --all-features
 
   doc:
@@ -83,6 +94,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --locked --no-deps --all-features
       - run: cargo doc --locked --no-deps --no-default-features
+      - run: cargo doc --locked --no-deps --features ssh
 
   # The minimum supported Rust version (Cargo.toml `rust-version`) really builds.
   msrv:
@@ -96,8 +108,8 @@ jobs:
       - run: cargo build --locked --all-features
       - run: cargo build --locked --no-default-features
 
-  # The dependency rules: no async runtime (also with `ws`), no OpenSSL / native-tls / aws-lc, no
-  # second TLS provider, no second webpki-roots.
+  # The dependency rules: no async runtime unless `ssh` is enabled (also none with `ws`), no OpenSSL /
+  # native-tls / aws-lc / libssh2 in any set, one ring, one rustls, one russh, no second webpki-roots.
   deps:
     runs-on: ubuntu-latest
     steps:
@@ -105,21 +117,35 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.96.0"
+      # "No tokio unless you enable `ssh`": every set without `ssh`.
       - run: |
-          for f in "" "--features ws" "--no-default-features --features ws" "--all-features"; do
-            if cargo tree --locked --target all -e normal,build $f --prefix none | grep -E '^(tokio|openssl-sys|native-tls|aws-lc-sys|aws-lc-rs|reqwest|hyper|rustls-rustcrypto) '; then
+          for f in "--no-default-features" "" "--features gzip" "--no-default-features --features http" "--no-default-features --features json" "--features ws" "--no-default-features --features ws" "--features ws,gzip"; do
+            if cargo tree --locked --target all -e normal,build $f --prefix none | grep -E '^(tokio|tokio-macros|mio|russh|openssl-sys|native-tls|aws-lc-sys|aws-lc-rs|reqwest|hyper|rustls-rustcrypto|libssh2-sys) '; then
               echo "forbidden dependency with [$f]"; exit 1
+            fi
+          done
+      # With `ssh`: tokio is allowed, but still no OpenSSL / aws-lc / libssh2 / libsodium.
+      - run: |
+          for f in "--features ssh" "--features ssh,sftp" "--features ssh,ssh-rsa" "--all-features"; do
+            if cargo tree --locked --target all -e normal,build $f --prefix none | grep -E '^(openssl-sys|native-tls|aws-lc-sys|aws-lc-rs|reqwest|hyper|rustls-rustcrypto|libssh2-sys|ssh2|libsodium-sys) '; then
+              echo "forbidden dependency with [$f]"; exit 1
+            fi
+          done
+      - run: |
+          for c in ring rustls russh tokio; do
+            if [ "$(cargo tree --locked --all-features -e normal,build -i $c --depth 0 --prefix none | wc -l)" != "1" ]; then
+              echo "more than one $c"; exit 1
             fi
           done
       # No aws-lc anywhere, dev-dependencies included (rcgen is built with ring only). Note: tokio
       # does appear in the dev tree through bevy's wasm-only dependencies; the tokio rule above is
       # checked on normal + build dependencies only.
       - run: |
-          if grep -q 'name = "aws-lc' Cargo.lock; then echo "aws-lc in Cargo.lock"; exit 1; fi
-          if cargo tree --locked --all-features --target all -e normal,dev,build --prefix none | grep -E '^(aws-lc|openssl-sys|native-tls) '; then
+          if grep -qE 'name = "(aws-lc|openssl|libssh2)' Cargo.lock; then echo "aws-lc / openssl / libssh2 in Cargo.lock"; exit 1; fi
+          if cargo tree --locked --all-features --target all -e normal,dev,build --prefix none | grep -E '^(aws-lc|openssl-sys|native-tls|libssh2-sys) '; then
             echo "forbidden crate in the dev tree"; exit 1
           fi
-      # No key material in the repository (test certificates are generated in memory).
+      # No key material in the repository (test certificates and SSH keys are generated at runtime).
       - run: |
           if grep -rlE "BEGIN ([A-Z]+ )?PRIVATE KEY" --exclude-dir=target --exclude-dir=.git .; then echo "key material in the repository"; exit 1; fi
       - run: |

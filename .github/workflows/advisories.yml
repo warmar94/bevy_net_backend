@@ -1,0 +1,21 @@
+name: Advisories
+
+# RustSec advisories for every dependency (cargo-deny). Runs on pull requests, on pushes to main and
+# weekly, so a new advisory against a pinned dependency (e.g. russh) turns this red without a change
+# here. RUSTSEC-2023-0071 (rsa, Marvin; only with the opt-in `ssh-rsa` feature) is accepted in
+# deny.toml.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 6 * * 1"
+
+jobs:
+  advisories:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories

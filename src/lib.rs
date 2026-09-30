@@ -7,9 +7,11 @@
 //! error, cancelled, or shutdown on `AppExit`. Nothing is ever dropped silently.
 //!
 //! Features: `http` (the real transport: ureq on a few worker threads, rustls with ring), `json`
-//! (typed requests), `gzip`, `ws` (named WebSocket connections: `WsClient` and friends). Default: `http`,
-//! `json`. Without `http` the crate still builds, and the
-//! [`FakeHttpTransport`] drives everything in tests. The README is the full manual.
+//! (typed requests), `gzip`, `ws` (named WebSocket connections: `WsClient` and friends), `ssh`
+//! (named SSH connections that run commands, ADMIN / DEV builds only: `SshClient`), `sftp` (file
+//! operations on them), `ssh-rsa` (RSA keys for SSH). Default: `http`, `json`. No tokio unless you
+//! enable `ssh`. Without `http` the crate still builds, and the [`FakeHttpTransport`] drives
+//! everything in tests. The README is the full manual.
 #![cfg_attr(
     feature = "json",
     doc = r##"
@@ -55,6 +57,8 @@ mod credentials;
 mod inflight;
 mod request;
 mod response;
+#[cfg(feature = "ssh")]
+mod ssh;
 #[cfg(any(feature = "http", feature = "ws"))]
 mod tls;
 mod transport;
@@ -65,7 +69,7 @@ mod ws;
 mod tests;
 
 /// Every Rust example in the README compiles (checked by `cargo test --all-features`).
-#[cfg(all(doctest, feature = "http", feature = "json", feature = "ws"))]
+#[cfg(all(doctest, feature = "http", feature = "json", feature = "ws", feature = "ssh", feature = "sftp"))]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
@@ -81,7 +85,16 @@ pub use inflight::{InFlight, RequestInfo, RequestKind, DEADLINE_GRACE};
 pub use request::{OutgoingRequest, PreparedRequest, RequestId, RequestPurpose};
 #[cfg(feature = "json")]
 pub use response::JsonResponse;
-pub use response::{BackendError, HttpResponse, RawResponse, Rejection};
+pub use response::{BackendError, HostKeyProblem, HttpResponse, RawResponse, Rejection};
+#[cfg(feature = "ssh")]
+pub use ssh::{
+    FakeSshTransport, RusshTransport, SshAuth, SshClient, SshCommand, SshConnId, SshConnectionInfo, SshConnections, SshEvent, SshExit, SshFinished, SshName,
+    SshOutput, SshPrompt, SshPromptAnswers, SshPromptRequest, SshPromptResponder, SshReconnect, SshSettings, SshState, SshStateChanged, SshStream, SshTarget,
+    SshTransport, SshTransportRes, DEFAULT_SFTP_MAX_BYTES, DEFAULT_SFTP_TIMEOUT, DEFAULT_SSH_COMMAND_TIMEOUT, DEFAULT_SSH_CONNECT_TIMEOUT,
+    DEFAULT_SSH_MAX_OUTPUT_BYTES, MAX_SSH_COMMAND_BYTES,
+};
+#[cfg(feature = "sftp")]
+pub use ssh::{SftpEntry, SftpEntryKind, SftpFinished, SftpOp, SftpOutcome, SftpProgress};
 pub use transport::fake::FakeHttpTransport;
 #[cfg(feature = "http")]
 pub use transport::http_pool::UreqTransport;
@@ -103,6 +116,10 @@ pub mod prelude {
         BackendAppExt, BackendCredentials, BackendError, BackendPlugin, BackendSystems, BearerToken, HttpClient, HttpConfig, HttpResponse, InFlight,
         OutgoingRequest, RequestId,
     };
+    #[cfg(feature = "sftp")]
+    pub use crate::{SftpFinished, SftpOutcome, SftpProgress};
+    #[cfg(feature = "ssh")]
+    pub use crate::{SshClient, SshConnections, SshFinished, SshOutput, SshState, SshStateChanged};
     #[cfg(feature = "ws")]
     pub use crate::{WsClient, WsConnections, WsFrame, WsMessage, WsSettings, WsState, WsStateChanged};
     #[cfg(all(feature = "ws", feature = "json"))]
@@ -123,7 +140,9 @@ use bevy_time::TimeSystems;
 /// `http` a `UreqTransport` as the [`HttpTransportRes`] (unless one exists; replacing it
 /// later is fine, its threads only start on the first request). With feature `ws` it also adds
 /// the WebSocket side (`WsClient`, `WsConnections`, the `Ws*` messages and a
-/// `TungsteniteTransport` unless a `WsTransportRes` exists).
+/// `TungsteniteTransport` unless a `WsTransportRes` exists). With feature `ssh` it adds the SSH side
+/// (`SshClient`, `SshConnections`, the `Ssh*` / `Sftp*` messages and a `RusshTransport` unless an
+/// `SshTransportRes` exists; its thread only starts on the first connect).
 ///
 /// ```
 /// use std::time::Duration;
@@ -136,12 +155,18 @@ use bevy_time::TimeSystems;
 #[derive(Clone, Debug, Default)]
 pub struct BackendPlugin {
     config: HttpConfig,
+    #[cfg(feature = "ssh")]
+    ssh: SshSettings,
 }
 
 impl BackendPlugin {
     /// A plugin with this config.
     pub fn new(config: HttpConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            #[cfg(feature = "ssh")]
+            ssh: SshSettings::default(),
+        }
     }
 
     /// Replace the config (builder style).
@@ -149,11 +174,19 @@ impl BackendPlugin {
         self.config = config;
         self
     }
+
+    /// The SSH settings (feature `ssh`), e.g. to allow SSH in a release build of an admin tool.
+    #[cfg(feature = "ssh")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "ssh")))]
+    pub fn with_ssh(mut self, settings: SshSettings) -> Self {
+        self.ssh = settings;
+        self
+    }
 }
 
-/// The plugin's system sets, named after phases: HTTP and WebSocket (feature `ws`) systems both
-/// run in them, and a later kind of connection will too. `#[non_exhaustive]`: a later version may
-/// add a set.
+/// The plugin's system sets, named after phases: HTTP, WebSocket (feature `ws`) and SSH (feature
+/// `ssh`) systems all run in them (in that order within a set). `#[non_exhaustive]`: a later
+/// version may add a set.
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum BackendSystems {
@@ -175,7 +208,7 @@ impl Plugin for BackendPlugin {
     fn build(&self, app: &mut App) {
         match self.config.validate() {
             Ok(()) => tracing::info!(">>> NET-BACKEND: base URL {}", self.config.base_url()),
-            Err(ConfigError::NoBaseUrl) if cfg!(feature = "ws") => {
+            Err(ConfigError::NoBaseUrl) if cfg!(any(feature = "ws", feature = "ssh")) => {
                 tracing::debug!(">>> NET-BACKEND: no HTTP base URL set; HTTP requests are answered with an error until one is")
             }
             Err(ConfigError::NoBaseUrl) => tracing::info!(">>> NET-BACKEND: no HTTP base URL set; HTTP requests are answered with an error until one is"),
@@ -205,9 +238,11 @@ impl Plugin for BackendPlugin {
         }
         #[cfg(feature = "ws")]
         ws::build(app);
+        #[cfg(feature = "ssh")]
+        ssh::build(app, &self.ssh);
         #[cfg(not(feature = "http"))]
         if !app.world().contains_resource::<HttpTransportRes>() {
-            if cfg!(feature = "ws") {
+            if cfg!(any(feature = "ws", feature = "ssh")) {
                 tracing::debug!(">>> NET-BACKEND: no HTTP transport compiled in (feature `http` is off)");
             } else {
                 tracing::info!(">>> NET-BACKEND: no transport compiled in (feature `http` is off); insert an `HttpTransportRes`");

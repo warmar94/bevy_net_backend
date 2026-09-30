@@ -52,4 +52,41 @@ change or a Bevy / key dependency bump).
 - WebSocket I/O deadlines: one deadline for TCP + TLS + handshake, a read budget per loop turn,
   dead-peer detection that does not count time blocked on our own writes.
 - Examples `chat_client` and `mock_ws_server` (features `ws`, `json`).
-- Features: `http` and `json` (default), `gzip`, `ws`.
+- Feature `ssh` (admin / dev builds only): named SSH connections that run commands. `SshClient`
+  (`connect(name, SshTarget)`, `disconnect`, `run`, `cancel`), `SshTarget` (host, port, user,
+  `SshAuth` key files / key files with a passphrase / ssh-agent, known_hosts files, pinned
+  fingerprints with `trust_host_key_fingerprint`, `from_ssh_config` for `~/.ssh/config` aliases,
+  timeouts, keepalive, limits), `SshCommand` (timeout, output limit, stdin), `SshSettings` given
+  with `BackendPlugin::with_ssh` (`allow_in_release`, connection and request limits),
+  `SshConnections` / `SshState`, the messages `SshStateChanged`, `SshOutput` (stdout / stderr
+  chunks) and `SshFinished` (exactly one per command, with `SshExit` and an honest `started`), the
+  `SshTransport` seam with `FakeSshTransport` and the real `RusshTransport` (russh 0.63.3 with ring,
+  one private tokio current-thread runtime on its own thread, started on the first connect).
+- SSH host keys are always checked by the crate's own strict known_hosts matcher (patterns,
+  negation, hashed hosts, `[host]:port`, `@revoked`); no trust-on-first-use, known_hosts is never
+  written. Strict key exchange (Terrapin) is required for the ciphers that need it. SHA-1 RSA
+  signatures are never used.
+- SSH refuses to run in release builds unless `SshSettings::allow_in_release(true)`.
+- Feature `sftp`: `upload`, `upload_file`, `download`, `download_file`, `list_dir`, `create_dir`,
+  `remove_file`, `remove_dir`, `rename`; `SftpProgress` and `SftpFinished` (`SftpOutcome`,
+  `SftpEntry`).
+- Feature `ssh-rsa`: RSA host keys and RSA key files (the `rsa` crate carries RUSTSEC-2023-0071).
+- `BackendError::HostKey { host, fingerprint, problem }` (`HostKeyProblem`), `AuthFailed` and
+  `Ssh`, and `BackendError::host_key(..)` for fakes; `BodyTooLarge` also covers SSH output and SFTP
+  transfers.
+- `RequestKind::Ssh` and `RequestKind::Sftp`: SSH requests appear in `InFlight`, and the one shared
+  `cancel` works for HTTP, WebSocket and SSH requests alike.
+- Examples `ssh_console` and `mock_ssh_server` (feature `ssh`; SFTP with `sftp`).
+- SSH, opt-in runtime settings (no extra features): `SshAuth::password` and
+  `SshAuth::keyboard_interactive` (multi-prompt, e.g. password + 2FA code, via
+  `SshPromptResponder` / the ready-made `SshPromptAnswers`); `SshTarget::with_reconnect(SshReconnect)`
+  (off by default, backoff with jitter; never re-runs a command) with `SshState::Reconnecting`;
+  `SshTarget::allow_terrapin_vulnerable` (off by default); `RusshTransport::with_release_allowed`.
+- SSH prefers AES-GCM and refuses only the Terrapin-vulnerable combination (no strict key
+  exchange with ChaCha20-Poly1305 or CBC + EtM); the host key types already in known_hosts are
+  preferred, and a different key type is `Unknown`, not `Changed`.
+- ssh_config `Include` is expanded by the crate with limits (depth 16, 64 files, 1 MiB).
+- `SftpEntry::safe_file_name()`; listed names are documented as untrusted and capped.
+- CI: a RustSec advisory check (cargo-deny) on pull requests, pushes and weekly.
+- Features: `http` and `json` (default), `gzip`, `ws`, `ssh`, `sftp`, `ssh-rsa`. No tokio unless
+  `ssh` is enabled.

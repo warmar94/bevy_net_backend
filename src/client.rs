@@ -120,7 +120,7 @@ impl HttpClient {
     /// still reach the server; its result is discarded). Cancelling an id that was already
     /// answered does nothing.
     pub fn cancel(&self, id: RequestId) {
-        self.cancels.lock().unwrap_or_else(PoisonError::into_inner).push(id);
+        self.cancels.push(id);
     }
 
     pub(crate) fn share_cancels(&mut self, cancels: crate::inflight::CancelList) {

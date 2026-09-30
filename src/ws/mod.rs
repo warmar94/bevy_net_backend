@@ -40,6 +40,9 @@ pub use link::TungsteniteTransport;
 #[cfg(feature = "json")]
 pub use protocol::JsonEnvelope;
 pub use protocol::{WsIncoming, WsProtocol};
+/// The WebSocket systems, for ordering the SSH systems after them.
+#[cfg(feature = "ssh")]
+pub(crate) use systems::{ws_exit, ws_receive, ws_send};
 pub use transport::{FakeWsTransport, WsHandshake, WsLinkEvent, WsLinkId, WsTransport, WsTransportRes};
 
 /// The name of a WebSocket connection (`"main"`, `"chat"`, …). Cheap to clone.
@@ -875,7 +878,7 @@ impl WsClient {
     /// in the next frame's `First` (one already sent may still reach the server; its answer is
     /// discarded).
     pub fn cancel(&self, id: RequestId) {
-        self.cancels.lock().unwrap_or_else(PoisonError::into_inner).push(id);
+        self.cancels.push(id);
     }
 
     pub(crate) fn share_cancels(&mut self, cancels: crate::inflight::CancelList) {

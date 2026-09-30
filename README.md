@@ -5,11 +5,14 @@
 [![Bevy 0.19.0](https://img.shields.io/badge/Bevy-0.19.0-informational)](https://bevyengine.org)
 [![ureq 3.4.2](https://img.shields.io/badge/ureq-3.4.2-orange)](https://crates.io/crates/ureq)
 [![tungstenite 0.30.0 (optional)](https://img.shields.io/badge/tungstenite-0.30.0%20(optional)-orange)](https://crates.io/crates/tungstenite)
+[![russh 0.63.3 (optional)](https://img.shields.io/badge/russh-0.63.3%20(optional)-orange)](https://crates.io/crates/russh)
 
 Call **your game's own HTTPS JSON API** from [Bevy](https://bevyengine.org): accounts, save
 games, leaderboards, inventories, matchmaking tickets, whatever your Laravel, Express, Go or
 Django backend serves. With feature `ws`, also **named WebSocket connections** to it: live
-chat, lobbies, match events and server pushes, with reconnect and heartbeat built in.
+chat, lobbies, match events and server pushes, with reconnect and heartbeat built in. With feature
+`ssh`, for **admin and developer tools only**, named SSH connections that run commands on your
+servers (and, with `sftp`, move files).
 
 A system fires a request and gets a `RequestId` back at once. A few frames later **exactly one
 answer** arrives as a Bevy message: the decoded value, or an error that says what happened
@@ -64,6 +67,7 @@ fn main() {
   - [8. Testing your game without a server](#8-testing-your-game-without-a-server)
   - [9. Your own transport](#9-your-own-transport)
   - [10. WebSocket connections (feature `ws`)](#10-websocket-connections-feature-ws)
+  - [11. SSH commands and SFTP (feature `ssh`, admin / dev builds only)](#11-ssh-commands-and-sftp-feature-ssh-admin--dev-builds-only)
 - [Backend compatibility](#backend-compatibility)
 - [How it works](#how-it-works)
 - [TLS exception: the default build is not pure Rust](#tls-exception-the-default-build-is-not-pure-rust)
@@ -98,8 +102,12 @@ fn main() {
 - **WebSocket (feature `ws`):** named connections (`connect("main", …)`), typed requests and
   pushes over a JSON envelope, reconnect with backoff and jitter, heartbeat and dead-peer
   detection, credentials on every handshake, one thread per connection.
-- **Small and runtime-free:** ureq 3 (blocking HTTP/1.1), tungstenite (sync) + rustls; no tokio, no
-  hyper, no OpenSSL.
+- **SSH for admin / dev tools (feature `ssh`):** named connections, commands with streamed
+  output and one answer each (exit status, timeout, cancel), strict known_hosts checking, key
+  files, ssh-agent and `~/.ssh/config`; SFTP with `sftp`. Refuses to run in release builds unless
+  you opt in.
+- **Small, and no tokio unless you enable `ssh`:** ureq 3 (blocking HTTP/1.1), tungstenite (sync)
+  + rustls; no hyper, no OpenSSL. Only `ssh` brings tokio, on one private thread of its own.
 
 ## Cargo features
 
@@ -109,6 +117,13 @@ fn main() {
 | `json` | yes | `get_json` / `post_json` / `send_json`, `JsonResponse<T>`, `OutgoingRequest::with_json`, `RawResponse::json`, `JsonBodyField` (serde + serde_json). |
 | `gzip` | no | Accept gzip-compressed responses (ureq's decoder, flate2). |
 | `ws` | no | Named WebSocket connections: `WsClient`, `WsConnections`, the `Ws*` messages, `TungsteniteTransport` (tungstenite 0.30, sync, one thread per connection, rustls + ring, no permessage-deflate). With `json`: `JsonEnvelope`, `WsRequest`, `WsPushMessage`, `WsResponse<T>`, `WsPush<P>`. |
+| `ssh` | no | **Admin / dev builds only.** Named SSH connections that run commands: `SshClient`, `SshConnections`, the `Ssh*` messages, `RusshTransport` (russh 0.63, ring for the AEAD ciphers and RustCrypto for the rest; tokio on one private thread), strict known_hosts, key files / ssh-agent / `~/.ssh/config`. |
+| `sftp` | no | SFTP on SSH connections (implies `ssh`): upload, download, list, create / remove directory, remove file, rename (russh-sftp). |
+| `ssh-rsa` | no | RSA host keys and RSA key files for SSH (implies `ssh`; rsa-sha2-256/512, never SHA-1). Off by default: the `rsa` crate carries the unfixed Marvin timing advisory RUSTSEC-2023-0071. Without it, ed25519 and ECDSA keys work. |
+
+Crates in the build (normal + build dependencies, this crate excluded): default 90, `gzip` 95,
+`ws` 104, `ssh` 209, `ssh` + `sftp` 219, `ssh` + `ssh-rsa` 212, everything 228; `ssh` without
+default features 195.
 
 Without `http` the crate still builds: every type, the `FakeHttpTransport` and your own
 `HttpTransport` work, and requests without a transport are answered with `NoTransport`.
@@ -131,6 +146,9 @@ bevy_net_backend = { version = "0.1.0", features = ["gzip"] }
 
 # HTTP + WebSocket.
 bevy_net_backend = { version = "0.1.0", features = ["ws"] }
+
+# An admin / dev tool: SSH commands and SFTP (never in a build for players).
+bevy_net_backend = { version = "0.1.0", features = ["ssh", "sftp"] }
 
 # Only the types and the fake transport (e.g. a crate that brings its own transport).
 bevy_net_backend = { version = "0.1.0", default-features = false }
@@ -361,15 +379,18 @@ fn on_save(mut answers: MessageReader<JsonResponse<Save>>) {
 | `Network(why)` | DNS, connect, reset, protocol error, worker threads not starting (ureq's words) | no for a DNS / connect / worker-start failure, else maybe |
 | `Tls(why)` | TLS failure: handshake, certificate (rustls' / ureq's words) | no for a handshake or certificate failure (before any request byte), else maybe |
 | `Timeout(why)` | the timeout ran out; it counts from hand-over to the transport, waiting for a free worker included | no if `why` starts with `not sent:`, else maybe |
-| `BodyTooLarge { limit }` | the response body is over the limit | yes |
+| `BodyTooLarge { limit }` | the response body is over the limit (SSH: the command's output or an SFTP transfer) | yes |
 | `Status(response)` | a status outside 200–299, 3xx included (redirects are not followed) | yes |
 | `Decode { message, response }` | a 2xx body that is not the expected JSON | yes |
 | `Cancelled` | `HttpClient::cancel` | no if it was still waiting for a worker, else maybe |
 | `Shutdown` | the app exited (`AppExit`) first | no, unless it was already on the wire before the exit frame |
 | `NoTransport` | no `HttpTransportRes`, or it was removed / replaced first | no if it was still waiting for a worker, else maybe |
-| `Disconnected { reason, sent }` | WebSocket only: the connection went away, was closed by the game, or never opened (see [WebSocket](#10-websocket-connections-feature-ws)) | as `sent` says: `Some(true)` it went out before, `Some(false)` never |
+| `Disconnected { reason, sent }` | WebSocket and SSH: the connection went away, was closed by the game, or never opened (see [WebSocket](#10-websocket-connections-feature-ws), [SSH](#11-ssh-commands-and-sftp-feature-ssh-admin--dev-builds-only)) | as `sent` says: `Some(true)` it went out before, `Some(false)` never, `None` unknown |
 | `Closed { code, reason }` | WebSocket only, on `WsStateChanged` / `WsConnectionInfo`: the server closed with a close frame | – |
 | `Rejected(rejection)` | WebSocket only: the server answered the request with an error; `rejection.bytes()` / `text()` / `json()` (`Debug` / `Display` do not show it) | yes |
+| `HostKey { host, fingerprint, problem }` | SSH only: the server's host key is unknown, changed or revoked (`HostKeyProblem`) | no |
+| `AuthFailed(why)` | SSH only: no configured key was accepted (or none could be loaded) | no |
+| `Ssh(why)` | SSH only: a protocol error, a refused channel / exec / subsystem, an SFTP status (the server's words) | see `SshFinished::started` |
 
 `error.was_sent()` sums the column up: `Some(false)` never sent, `Some(true)` the server has it
 (or had it before a loss), `None` maybe.
@@ -740,6 +761,217 @@ When a connection drops, requests already sent are answered `Disconnected`, exce
 again after the reconnect; the default is off. Frames sent while not connected wait in an outbox
 (64 by default) and go out when the connection opens.
 
+### 11. SSH commands and SFTP (feature `ssh`, admin / dev builds only)
+
+> **Never ship SSH to players.** An SSH key (or access to an ssh-agent) inside a build you give
+> to players is **shell access to your server for anyone who extracts it** — and extracting it is
+> easy. SSH is for admin and developer tools that stay on your own machines: a deploy button in an
+> editor build, a server console in an internal tool. Keys are loaded at runtime from the admin's
+> machine; there is deliberately no way to pass key bytes. **In a release build
+> (`debug_assertions` off) the plugin refuses every SSH request** (answered `InvalidRequest`,
+> nothing connects) unless the tool opts in with
+> `BackendPlugin::default().with_ssh(SshSettings::default().allow_in_release(true))`. Give the key
+> a narrow account on the server (`command="…"`, `from="…"`, `no-pty`, `no-port-forwarding` in
+> `authorized_keys`, a dedicated user with narrow sudo rights).
+
+```toml
+bevy_net_backend = { version = "0.1.0", features = ["ssh", "sftp"] }
+```
+
+```rust,no_run
+use bevy::prelude::*;
+use bevy_net_backend::prelude::*;
+use bevy_net_backend::{SshAuth, SshCommand, SshTarget};
+use std::time::Duration;
+
+fn connect(ssh: Res<SshClient>) {
+    ssh.connect(
+        "build",
+        SshTarget::new("build.example.com", "deploy")
+            .with_auth(SshAuth::agent())
+            .with_auth(SshAuth::key_file("/home/admin/.ssh/id_ed25519"))
+            .with_known_hosts_file("/home/admin/.ssh/known_hosts"),
+    );
+    // Waits for the connection; runs once it is up.
+    ssh.run("build", SshCommand::new("systemctl restart game-api").with_timeout(Duration::from_secs(30)));
+}
+
+fn show(mut output: MessageReader<SshOutput>, mut finished: MessageReader<SshFinished>, mut states: MessageReader<SshStateChanged>) {
+    for change in states.read() {
+        if let Some(error) = &change.error {
+            warn!("`{}` is {:?}: {error}", change.name, change.state);
+        }
+    }
+    for chunk in output.read() {
+        info!("{} {:?}: {}", chunk.id, chunk.stream, chunk.text());
+    }
+    for answer in finished.read() {
+        match &answer.result {
+            Ok(exit) if exit.success() => info!("{} done", answer.id),
+            Ok(exit) => warn!("{} exited with {:?} / signal {:?}", answer.id, exit.status, exit.signal),
+            Err(error) => warn!("{} failed: {error} (started: {:?})", answer.id, answer.started),
+        }
+    }
+}
+
+fn main() {
+    App::new()
+        .add_plugins((MinimalPlugins, BackendPlugin::default()))
+        .add_systems(Startup, connect)
+        .add_systems(Update, show)
+        .run();
+}
+```
+
+- **`SshClient`** (a resource, `Res<SshClient>`, no ordering needed): `connect(name, SshTarget)`,
+  `disconnect(name)`, `run(name, command)` (a `&str`, `String` or `SshCommand`), `cancel(id)` (the
+  shared cancel of every protocol), and with `sftp` the file operations below. Applied in
+  `PostUpdate` (`BackendSystems::Send`). A command made while its connection is connecting waits
+  for it.
+- **Messages out**, all written in `First`: `SshStateChanged { name, state, error }`,
+  `SshOutput { id, name, stream, data }` (stdout / stderr chunks as they arrive; 0..n per command,
+  all before or in the same frame as its answer; a chunk can end in the middle of a line or a UTF-8
+  character, `text()` decodes lossily), and **exactly one** `SshFinished { id, name, started,
+  result }` per command. A non-zero exit status is still `Ok(SshExit { status, signal, … })`: the
+  command ran; `exit.success()` checks for 0.
+- **State:** `SshConnections` (resource): `state(name)`, `is_connected(name)`, `get(name)` →
+  `SshConnectionInfo` (state, the server's host key fingerprint, last error, open requests,
+  reconnect attempts). `SshState` is `Connecting`, `Connected`, `Reconnecting { attempt, retry_in }`
+  or `Disconnected`. Every name passed to `connect` gets an entry, a refused one too
+  (`Disconnected` with the error). Only open connections count against `with_max_connections`;
+  beyond 256 remembered names the oldest `Disconnected` ones are forgotten.
+- **Reconnect is OFF by default.** `SshTarget::with_reconnect(SshReconnect::default())` turns it on:
+  exponential backoff with full jitter as for WebSocket (base 1 s, cap 30 s, optional
+  `with_max_attempts`, the counter resets after 10 s connected). **A reconnect never re-runs a
+  command:** commands running when the connection was lost are answered `Disconnected` with their
+  honest `started`; commands not sent yet wait for the new connection (until their own timeout).
+  Host key, authentication, protocol (`Ssh`) and invalid-settings errors are not retried. Without
+  it, a lost connection goes `Disconnected` with the error; `connect` again.
+- **Host keys are always checked.** The server's key must be in a known_hosts file
+  (`with_known_hosts_file`, any number; default `~/.ssh/known_hosts` when neither a file nor a
+  pinned fingerprint is given) or match a fingerprint pinned in code with
+  `trust_host_key_fingerprint("SHA256:…")` (only pin a fingerprint you read on the server itself,
+  e.g. `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`). An unknown, changed or `@revoked` key
+  is `BackendError::HostKey { host, fingerprint, problem }` before anything is sent; there is no
+  trust-on-first-use and nothing is ever written to known_hosts. The matcher follows OpenSSH:
+  patterns with `*` / `?` / `!`, hashed hosts, `[host]:port` for other ports, `@revoked` (wins
+  over pins too). As OpenSSH does, the key types already listed for the host are asked for first,
+  and only a different key **of the same type** is `Changed`; a host listed only with another type
+  (an old RSA line, say) is `Unknown` for the new type. `@cert-authority` lines and host
+  certificates are not supported.
+- **Authentication** (`SshAuth`, tried in order): `key_file(path)`,
+  `key_file_with_passphrase(path, passphrase)` (OpenSSH, PKCS#8 or PuTTY format, at most 256 KiB;
+  the passphrase is a redacted `Secret`), `agent()` (Unix: `SSH_AUTH_SOCK`; Windows: the OpenSSH
+  agent's pipe, then Pageant; certificate identities are skipped). ed25519 and ECDSA keys always;
+  RSA keys with feature `ssh-rsa` (SHA-2 signatures only). **Keys are the recommendation.** For
+  servers that need it, opt in to `SshAuth::password(secret)` or
+  `SshAuth::keyboard_interactive(responder)` (multi-prompt flows such as a password plus a 2FA
+  code; `SshPromptAnswers::new().answer_containing("password", pw).answer_containing("code", otp)`
+  answers prompts by word, or implement `SshPromptResponder`; it runs on the SSH thread, must not
+  block, at most 8 rounds; prompt texts are server-supplied). Collect the values from the admin at
+  runtime; they are held in `Secret` and never logged or shown in `Debug`. If every method fails,
+  the answer is `BackendError::AuthFailed` naming the methods tried (key file names, never paths
+  or secrets).
+- **`~/.ssh/config`:** `SshTarget::from_ssh_config("alias")` (or `from_ssh_config_file(path,
+  alias)`) takes `HostName`, `Port`, `User`, `IdentityFile` and `ConnectTimeout` from it when
+  connecting; settings given in code win. `Include` is followed by the crate itself, with limits
+  (nesting depth 16 like OpenSSH, 64 files, 1 MiB for all files together; `~` and relative paths
+  as OpenSSH, relative to `~/.ssh`; globs): a config that includes itself is an error, not a
+  crash. `Match`, `%` tokens, `ProxyJump` / `ProxyCommand` and `UserKnownHostsFile` are not
+  supported (the connection goes straight to the host).
+- **`SshTarget`** (builder, per connection): port (22), user, auth, known_hosts files, pins,
+  connect timeout (15 s: ONE deadline for TCP + key exchange + host key + authentication, a server
+  that trickles bytes cannot stretch it), keepalive (every 15 s of silence, lost after 3 unanswered),
+  command timeout (60 s), output limit (8 MiB), SFTP timeout (5 min) and transfer limit (256 MiB),
+  channels (8 commands at once; more wait, counted in their timeout). `SshCommand`: `with_timeout`,
+  `with_max_output_bytes`, `with_stdin(bytes)` (then end-of-file; without it stdin is closed at
+  once). `with_reconnect`, `allow_terrapin_vulnerable` (below). `SshSettings` (plugin):
+  `allow_in_release`, `with_max_connections` (16 open at once), `with_max_requests_per_connection`
+  (256). The release guard is also built into `RusshTransport` itself
+  (`RusshTransport::new().with_release_allowed(..)`; the plugin passes `allow_in_release` on), so
+  calling the transport directly does not bypass it.
+- **Command lines may hold secrets:** `SshCommand`'s `Debug` shows only lengths, and the crate
+  never logs a command or its output. Remember that a command line is visible in the server's
+  process list: pass a secret through `with_stdin` instead.
+- **Security (Terrapin, CVE-2023-48795):** strict key exchange is always offered, and AES-GCM is
+  the preferred cipher (it is not affected), so servers without strict key exchange (OpenSSH before
+  9.6 without a distribution backport) still connect through AES-GCM. Only the truly vulnerable
+  combination is refused: no strict key exchange AND ChaCha20-Poly1305 or CBC with an
+  encrypt-then-MAC MAC negotiated (a server that offers nothing else); the `Ssh` error says why.
+  `SshTarget::allow_terrapin_vulnerable(true)` (off by default, logged as a warning) accepts it
+  anyway, for an old server you cannot update. SHA-1 `ssh-rsa` signatures are never used.
+- **Requests on one connection run at the same time** (commands and SFTP operations alike): when
+  one step depends on another (upload, then move), start it after the first one's answer.
+
+**SSH answers:**
+
+| Answer | When | `started` |
+|---|---|---|
+| `Ok(SshExit)` | the command ended (any exit status or signal) | `Some(true)` |
+| `Timeout("not sent: …")` | no free channel, or the connection did not open in time | `Some(false)` |
+| `Timeout(…)` otherwise | ran longer than its timeout: TERM signal sent, channel closed (**the remote process may keep running**, see below) | `Some(true)` (or `None` if the exec reply never came) |
+| `Cancelled` | `cancel(id)`: TERM and close as for a timeout | `Some(true)` if it was running, `Some(false)` if it was still waiting, `None` in between |
+| `BodyTooLarge { limit }` | its output went over the limit; it was stopped | `Some(true)` |
+| `Disconnected { sent, .. }` | the connection went away / was closed / was replaced (also with reconnect on: a running command is never re-run); or not connected when asked | as `sent` |
+| `Shutdown` | the app exited first (a command of the exit frame is never sent) | as far as known |
+| `Ssh(…)` | the server refused the channel or the exec request | `Some(false)` |
+| `InvalidRequest` | unknown connection, bad command (empty, NUL, over 64 KiB), too many requests, SSH disabled in a release build | `Some(false)` |
+
+Stopping a remote command is best effort: SSH has no reliable kill. The crate sends a `TERM`
+signal and closes the channel; a server may ignore the signal, and a process without a terminal
+may keep running after its channel is gone. Commands that must stop should
+have their own timeout on the server (`timeout 30 ./deploy.sh`).
+
+#### SFTP (feature `sftp`)
+
+```rust,no_run
+use bevy::prelude::*;
+use bevy_net_backend::prelude::*;
+
+fn upload(ssh: Res<SshClient>) {
+    ssh.upload("build", "releases/notes.txt", b"version 1.2.3".to_vec());
+    ssh.upload_file("build", "target/release/server.tar.gz", "releases/server.tar.gz");
+    ssh.list_dir("build", "releases");
+}
+
+fn done(mut finished: MessageReader<SftpFinished>, mut progress: MessageReader<SftpProgress>) {
+    for step in progress.read() {
+        info!("{}: {} of {:?} bytes", step.id, step.done, step.total);
+    }
+    for answer in finished.read() {
+        match &answer.result {
+            Ok(SftpOutcome::Listing(entries)) => info!("{} entries", entries.len()),
+            Ok(outcome) => info!("{}: {outcome:?}", answer.id),
+            Err(error) => warn!("{}: {error}", answer.id),
+        }
+    }
+}
+# let _ = (upload, done);
+```
+
+`upload(name, remote, bytes)`, `upload_file(name, local, remote)` (both create or truncate the
+remote file), `download(name, remote)` (into memory: `SftpOutcome::Data`),
+`download_file(name, remote, local)` (written as `<local>.part`, renamed over `local` only when
+complete; the part file's name is unique, `<local>.<process>-<id>-<n>.part`, so nothing else is
+overwritten; it is removed on failure, but a transfer killed after the 1 s grace can leave it),
+`list_dir` (`Listing(Vec<SftpEntry>)`, sorted, at most 10 000 entries, names at most 4 KiB, 4 MiB
+of names in total), `create_dir`, `remove_file`, `remove_dir` (empty directories), `rename`, or any
+`SftpOp` with `sftp(name, op)`. Each gets exactly one `SftpFinished { id, name, started, result }`;
+transfers also report `SftpProgress` (about 10 per second). Relative remote paths start in the
+login directory. Transfers over `with_max_transfer_bytes` are `BodyTooLarge`; an upload over it
+(from memory or from a file) is refused before anything is sent (`started: Some(false)`); a whole
+operation is bounded by `with_sftp_timeout`. An
+interrupted upload can leave a partial remote file. Errors carry the server's SFTP status text
+(`Ssh("SFTP: No such file")`). The SFTP channel is opened on first use and shared by the
+connection's operations. Local files are read and written on tokio's small blocking pool, never on
+the SSH thread itself.
+
+> **Listed names are untrusted input.** A hostile or broken server can list `../../.bashrc`,
+> `C:\Windows\evil.dll` or `a/b`. Never join `SftpEntry::name` into a local path: use
+> `entry.safe_file_name()`, which returns `None` for anything that is not one plain file name
+> (`..`, separators, drive letters, control characters, Windows device names, …). The crate never
+> turns a listed name into a local path itself; `download_file` writes only where you tell it to.
+
 ## Backend compatibility
 
 - **HTTP** works with any backend that speaks HTTPS and JSON (or raw bytes): Laravel / PHP,
@@ -750,7 +982,12 @@ again after the reconnect; the default is off. Frames sent while not connected w
   Socket.IO, SignalR, Phoenix Channels) need an adapter for that protocol. Adapters are planned
   for a later version; until then use `WsProtocol` or raw frames if your server can also speak
   plain WebSocket.
-- **SSH** access (for admin and developer tools) is planned for a later version.
+- **SSH** (feature `ssh`, admin / dev tools) works with any standard SSH server: OpenSSH on Linux,
+  BSD, macOS or Windows, and other servers speaking SSH-2 with ed25519 or ECDSA host keys (RSA with
+  feature `ssh-rsa`). Servers without strict key exchange (OpenSSH before 9.6, unless the
+  distribution backported it) connect through AES-GCM, which the client prefers; only a server that
+  offers nothing but ChaCha20-Poly1305 or CBC + encrypt-then-MAC is refused (see Terrapin above).
+  SFTP needs the server's `sftp` subsystem (OpenSSH's default).
 
 ## How it works
 
@@ -815,6 +1052,16 @@ again after the reconnect; the default is off. Frames sent while not connected w
   tick. Reconnects, backoff, credentials and every answer live on the ECS side; a reconnect is a
   new thread. On exit a close (1001) is queued to every link and no thread is joined (a process
   that exits right away usually wins that race).
+- **SSH thread (feature `ssh`).** russh needs tokio, so `RusshTransport` owns ONE std thread
+  (`net-backend-ssh`) with a tokio *current-thread* runtime, started on the first `connect` and
+  stopped when the app exits (or the transport is dropped); tokio's blocking pool is capped at 2
+  threads (`net-backend-ssh-io`, for DNS lookups and decrypting key files). Nothing runs on the
+  game's threads or Bevy's task pools, and without feature `ssh` tokio is not even compiled.
+  Every connection is a task on that thread; every command or SFTP operation is a task of its
+  connection with its own deadline. The socket of each connection sits behind a kill switch tied
+  to its task, so a connection that times out or is closed never lingers in the background. On
+  exit the plugin answers everything `Shutdown` first; then the thread closes each connection
+  (≤ 1 s to say goodbye) and ends, and the game does not wait for it.
 - **TLS.** rustls with ring's crypto and the Mozilla root certificates (webpki-roots; the OS
   certificate store is not used). The ring provider is always handed to ureq explicitly and never
   installed process-wide, so a game that also links another rustls provider (for example
@@ -831,13 +1078,17 @@ no system library. The crate never uses OpenSSL, native-tls or aws-lc, in any fe
 
 Without the `http` feature nothing of this is compiled (and no C either).
 
+SSH (feature `ssh`) uses the same ring crate for its AEAD ciphers (ChaCha20-Poly1305, AES-GCM);
+everything else in russh (key exchange, ed25519 / ECDSA, AES-CTR, HMAC) is RustCrypto. It never
+uses OpenSSL, libssh2 or aws-lc either.
+
 ## API reference
 
 Everything is re-exported at the crate root; `prelude` holds the everyday items.
 
 | Item | Kind | What it is |
 |---|---|---|
-| `BackendPlugin` | plugin | `new(config)`, `with_config`, `default()`. Inserts config, client, in-flight map, credentials, `HttpResponse`, and (feature `http`) a `UreqTransport` unless an `HttpTransportRes` exists. |
+| `BackendPlugin` | plugin | `new(config)`, `with_config`, `with_ssh` (feature `ssh`), `default()`. Inserts config, client, in-flight map, credentials, `HttpResponse`, and (feature `http`) a `UreqTransport` unless an `HttpTransportRes` exists. |
 | `BackendSystems` | system sets | `Receive` (`First`), `Send` (`PostUpdate`), `Exit` (`Last`, on `AppExit`). `#[non_exhaustive]`. |
 | `HttpConfig` | resource | base URL, timeout, default headers, workers, `allow_insecure_http`, body limit; `validate()`, getters, `set_base_url`, `set_timeout`. |
 | `ConfigError` | enum | `NoBaseUrl`, `BadBaseUrl`, `BadHeader`. |
@@ -849,13 +1100,13 @@ Everything is re-exported at the crate root; `prelude` holds the everyday items.
 | `HttpResponse` | message | `id`, `result: Result<RawResponse, BackendError>`. |
 | `JsonResponse<T>` | message | `id`, `result: Result<T, BackendError>` (feature `json`). |
 | `RawResponse` | struct | `status`, `headers`, `body`; `new`, `with_header`, `is_success`, `body()`, `text()`, `json()`. |
-| `BackendError` | enum | see [Reading answers and errors](#4-reading-answers-and-errors); `status()`, `response()`, `is_invalid_request()`, `was_sent()`, `close_code()`. |
+| `BackendError` | enum | see [Reading answers and errors](#4-reading-answers-and-errors); `status()`, `response()`, `is_invalid_request()`, `was_sent()`, `close_code()`, `host_key(..)` (a constructor for fakes). |
 | `Credentials` | trait | `apply(&self, &mut OutgoingRequest)`; `ws_auth_message()` (default none: a first frame for WebSocket auth). |
 | `BackendCredentials` | resource | `new`, `set`, `clear`, `is_set`. |
 | `BearerToken`, `ApiKeyHeader`, `ApiKeyQuery`, `JsonBodyField` | credentials | ready-made `Credentials` (`JsonBodyField`: feature `json`). |
 | `Secret` | string | redacted in `Debug` / `Display`; `new`, `expose`, `is_empty`. No comparison, no zeroing on drop. |
-| `InFlight` | resource | HTTP and WebSocket: `contains`, `len`, `is_empty`, `ids`, `describe` (→ `RequestInfo`). |
-| `RequestInfo` (struct), `RequestKind` (enum) | types | what a pending request is: `kind` (`Http`, `WebSocket`), `method`, `target`; `#[non_exhaustive]`. |
+| `InFlight` | resource | HTTP, WebSocket and SSH: `contains`, `len`, `is_empty`, `ids`, `describe` (→ `RequestInfo`). |
+| `RequestInfo` (struct), `RequestKind` (enum) | types | what a pending request is: `kind` (`Http`, `WebSocket`, `Ssh`, `Sftp`), `method`, `target` (never an SSH command line); `#[non_exhaustive]`. |
 | `Rejection` | struct | the payload of `BackendError::Rejected`: `new`, `bytes`, `text`, `json` (json). |
 | `HttpTransport` | trait | `submit`, `poll`, `cancel`, `shutdown`. |
 | `HttpTransportResult` | type | `Result<RawResponse, BackendError>`. |
@@ -878,6 +1129,21 @@ Everything is re-exported at the crate root; `prelude` holds the everyday items.
 | `WsTransport`, `WsTransportRes`, `WsLinkId`, `WsLinkEvent`, `WsHandshake` | seam (`ws`) | `open`, `send`, `close`, `poll`, `shutdown`; one link = one connection attempt. |
 | `FakeWsTransport` | transport (`ws`) | `manual_accept`, `accept`, `reject_next`, `echo_envelope`, `push`, `drop_link`, `fail_link`, `opened`, `last_link`, `live_links`, `sent`, `all_sent`, `closed`, `shutdown_count`. |
 | `TungsteniteTransport` | transport (`ws`) | the real one; `new()`. |
+| `SshClient` | resource (`ssh`) | `connect`, `disconnect`, `run`, `cancel` (the shared one); with `sftp`: `upload`, `upload_file`, `download`, `download_file`, `list_dir`, `create_dir`, `remove_file`, `remove_dir`, `rename`, `sftp`. |
+| `SshTarget` | builder (`ssh`) | `new(host, user)`, `from_ssh_config`, `from_ssh_config_file`, `with_port`, `with_user`, `with_auth`, `with_known_hosts_file`, `trust_host_key_fingerprint`, timeouts, keepalive, limits, `with_max_channels`, `with_reconnect`, `allow_terrapin_vulnerable`, `validate`, getters. |
+| `SshAuth` | auth (`ssh`) | `key_file`, `key_file_with_passphrase`, `agent`; opt-in `password`, `keyboard_interactive`. `Debug` shows file names only, never secrets. |
+| `SshPromptResponder`, `SshPromptAnswers`, `SshPromptRequest`, `SshPrompt` | auth (`ssh`) | keyboard-interactive: the responder trait (`respond(&request) -> Option<Vec<Secret>>`), a ready-made word-matching responder (`answer_containing`), one round of server prompts (`name`, `instructions`, `prompts`: `text`, `echo`). |
+| `SshReconnect` | builder (`ssh`) | `with_base`, `with_cap`, `with_max_attempts`, `with_stable_after`, `with_jitter`, `delay_bound`; given with `SshTarget::with_reconnect`. |
+| `SshCommand`, `SshExit`, `SshStream` | types (`ssh`) | a command (`new`, `with_timeout`, `with_max_output_bytes`, `with_stdin`; `From<&str>`); how it ended (`status`, `signal`, byte counts, `success()`); stdout / stderr. |
+| `SshSettings` | builder (`ssh`) | plugin-wide: `allow_in_release`, `with_max_connections`, `with_max_requests_per_connection`, `is_allowed`. Given with `BackendPlugin::with_ssh`. |
+| `SshConnections`, `SshConnectionInfo`, `SshState`, `SshName` | state (`ssh`) | as for WebSocket; info: `state`, `fingerprint`, `last_error`, `pending_requests`, `attempt`; `SshState::Reconnecting { attempt, retry_in }`. |
+| `SshStateChanged`, `SshOutput`, `SshFinished` | messages (`ssh`) | state changes; output chunks; the one answer per command (`started`, `result`). |
+| `SftpOp`, `SftpOutcome`, `SftpEntry`, `SftpEntryKind`, `SftpProgress`, `SftpFinished` | types / messages (`sftp`) | an operation, its outcome (`Uploaded`, `Downloaded`, `Data`, `Listing`, `Done`), a listing entry (`safe_file_name()`; `name` is untrusted), progress, the one answer. |
+| `HostKeyProblem` | enum | `Unknown`, `Changed`, `Revoked` (in `BackendError::HostKey`). |
+| `SshTransport`, `SshTransportRes`, `SshEvent`, `SshConnId` | seam (`ssh`) | `connect`, `run`, `sftp` + `supports_sftp` (default: none), `cancel`, `close`, `poll`, `shutdown`. |
+| `FakeSshTransport` | transport (`ssh`) | `manual_connect`, `accept`, `reject_next`, `on_command`, `output`, `finish`, `drop_conn`, `on_next_sftp`, `sftp_progress`, `sftp_finish`, `connects`, `last_conn`, `live_conns`, `commands`, `running`, `sftp_ops`, `cancelled`, `closed`, `shutdown_count`. Never touches the network. |
+| `RusshTransport` | transport (`ssh`) | the real one; `new()`, `with_release_allowed`. |
+| `DEFAULT_SSH_CONNECT_TIMEOUT`, `DEFAULT_SSH_COMMAND_TIMEOUT`, `DEFAULT_SSH_MAX_OUTPUT_BYTES`, `DEFAULT_SFTP_TIMEOUT`, `DEFAULT_SFTP_MAX_BYTES`, `MAX_SSH_COMMAND_BYTES` | consts (`ssh`) | 15 s, 60 s, 8 MiB, 5 min, 256 MiB, 64 KiB. |
 
 ## Limits and what it does not do
 
@@ -910,11 +1176,22 @@ Everything is re-exported at the crate root; `prelude` holds the everyday items.
   below `trace` like `ureq`. Received frames the game does not take are limited to 32 times the
   message limit per connection (then it closes with 1008).
 
+- **SSH (feature `ssh`):** reconnect only when enabled and never for a running command; no
+  agent or port forwarding, no PTY / interactive shell, no host certificates; ssh_config without
+  `Match`, `%` tokens, `ProxyJump` / `ProxyCommand` or `UserKnownHostsFile`. Output arrives in
+  chunks, not lines. A cancelled or timed-out remote process may keep running (see the SSH
+  section). SFTP downloads read 64 KiB at a time, one request after the other (uploads keep 16
+  writes of 32 KiB in flight), so a download's speed is bounded by the round trip. russh logs agent
+  sign requests at `debug` (challenge bytes, not secrets) and packet details at `trace`: keep
+  `russh` at `info` or below like `ureq`. A lost connection is noticed through russh's own
+  disconnect report, backed by a once-a-second check of the session; a lost network without any
+  reset is noticed by the keepalive (15 s, 3 misses).
+
 ## Compatibility
 
-| bevy_net_backend | Bevy | ureq | tungstenite (`ws`) | rustls | Rust (MSRV) |
-|---|---|---|---|---|---|
-| 0.1.0 | 0.19.0 | 3.4.2 | 0.30.0 | 0.23.45 | 1.95 |
+| bevy_net_backend | Bevy | ureq | tungstenite (`ws`) | russh (`ssh`) | rustls | Rust (MSRV) |
+|---|---|---|---|---|---|---|
+| 0.1.0 | 0.19.0 | 3.4.2 | 0.30.0 | 0.63.3 | 0.23.45 | 1.95 |
 
 ## Examples
 
@@ -928,6 +1205,8 @@ from `examples/mock_server.rs` on 127.0.0.1 inside the example process.
 | `mock_server` | the mock API on its own and its JSON contract: `--seconds N` (maximum runtime, default 60; it exits by itself), `--bind ADDR` (default `127.0.0.1:0`). |
 | `chat_client` (features `ws`, `json`) | a named connection, a typed request and its answer, typed pushes, state changes, disconnect. Starts `mock_ws_server` unless `BACKEND_WS_URL` is set. |
 | `mock_ws_server` (features `ws`, `json`) | the mock WebSocket server and its envelope contract (echo, `chat.send` + push, `fail`, `close`, `drop`, `stall`, periodic `server.tick`, `/secure` needing a bearer token): `--seconds N`, `--bind ADDR` (default `127.0.0.1:0`), `--tick-ms N`. |
+| `ssh_console` (feature `ssh`; SFTP steps with `sftp`) | connect with a known_hosts file, run commands and print their output and exit, then upload, list, download and remove a file one step after the other, disconnect. Starts `mock_ssh_server` with a throwaway key (written to `target/ssh-example/`) unless `SSH_HOST`, `SSH_USER`, `SSH_KEY` and `SSH_KNOWN_HOSTS` are set. |
+| `mock_ssh_server` (feature `ssh`; SFTP with `sftp`) | the mock SSH server: canned commands (never executes anything), an in-memory SFTP file system, a throwaway host key; alone it writes a throwaway client key and a known_hosts file to `--out-dir` (default `target/mock-ssh`): `--seconds N`, `--bind ADDR` (default `127.0.0.1:0`), `--user NAME`, `--host NAME` (the name clients reach it by, for the known_hosts line; with `--bind 0.0.0.0:P` and no `--host` the line says `CHANGE-ME`, or pin the printed fingerprint), `--password PW` and `--kbd PW:CODE` (also accept a password / a keyboard-interactive `Password:` + `Verification code:` login; throwaway test values only, visible in the process list). |
 
 ```text
 cargo run --example fetch_json
@@ -937,6 +1216,8 @@ cargo run --example mock_server -- --seconds 1800 --bind 127.0.0.1:8080
 BACKEND_URL=http://127.0.0.1:8000/api cargo run --example fetch_json
 cargo run --example chat_client --features ws,json
 cargo run --example mock_ws_server --features ws,json -- --seconds 1800 --bind 127.0.0.1:9001
+cargo run --example ssh_console --features ssh,sftp
+cargo run --example mock_ssh_server --features ssh,sftp -- --seconds 600
 ```
 
 Pointed at your own backend (`BACKEND_URL`), `fetch_json` expects `GET /characters/1` →
@@ -952,16 +1233,28 @@ header comment (the login reads `BACKEND_USERNAME` / `BACKEND_PASSWORD`).
   `--features ws` (and `--all-features`) also the WebSocket tests: every lifecycle path on a
   `FakeWsTransport`, the real transport against `mock_ws_server` (large messages across many
   short read timeouts, reconnect, heartbeat, 401, 1009, exit), and a TLS test with large messages
-  cut by read timeouts mid-record. `cargo test --all-features` also compiles every Rust block of
-  this README.
+  cut by read timeouts mid-record. With `--features ssh` (and `ssh,sftp`) also the SSH tests:
+  every lifecycle path on a `FakeSshTransport` (including one app with HTTP, WebSocket and SSH
+  cancelling each other's requests), the real `RusshTransport` against `mock_ssh_server` with
+  throwaway keys generated at runtime (commands, timeouts, cancel, output limit, strict host keys,
+  passphrases, ssh_config, SFTP) and hostile raw TCP peers (silent, trickling, huge banner) that
+  must not stretch the connect deadline. `cargo test --all-features` also compiles every Rust block
+  of this README.
 - Tests never contact another host. CI runs the feature combinations on Linux, Windows and macOS
-  with Rust 1.96.0.
+  with Rust 1.96.0, and a RustSec advisory check (cargo-deny) on every pull request, every push
+  and weekly. RUSTSEC-2023-0071 (rsa, Marvin) is accepted in `deny.toml`: `rsa` is compiled only
+  with the opt-in `ssh-rsa` feature, but `Cargo.lock` always lists it, and no fixed release exists.
 - `tests/live.rs` holds live HTTPS checks, `#[ignore]`d: they run only with
   `cargo test --test live -- --ignored` and `BNB_TEST_HTTPS_URL` set to a server that serves the
   mock's contract over HTTPS (for example `mock_server` behind a TLS-terminating reverse proxy on
   a test machine).
 - `tests/live_ws.rs` does the same for WebSocket: `cargo test --features ws --test live_ws -- --ignored`
   with `BNB_TEST_WSS_URL` set to `mock_ws_server` behind a TLS proxy (for example `wss://…/ws`).
+- `tests/live_ssh.rs` checks a real OpenSSH server: `cargo test --features ssh,sftp --test live_ssh
+  -- --ignored --test-threads 1` with `BNB_TEST_HOST`, `BNB_TEST_SSH_USER`, `BNB_TEST_SSH_KEY` (a key
+  file) and `BNB_TEST_SSH_KNOWN_HOSTS` (a known_hosts file) set, optionally `BNB_TEST_SSH_PORT` and
+  `BNB_TEST_SSH_PASSPHRASE`. It runs harmless commands only (`echo`, `uname`, `whoami`, `sleep`)
+  and SFTP inside a new temporary directory in the user's home that it removes again.
 - Against your real API, run the examples with `BACKEND_URL` (see [Examples](#examples)).
 
 ## FAQ
@@ -985,6 +1278,20 @@ other frame can miss them.
 
 **Where does the token live between sessions?** Wherever your game keeps it; this crate only
 sends what is in `BackendCredentials`.
+
+**Can my game use SSH to talk to its servers?** Not a game you give to players: an SSH key in a
+player build is shell access for anyone who extracts it. Use HTTP or WebSocket with per-player
+tokens for that. SSH is for your own admin and developer tools, and release builds refuse it
+unless the tool explicitly opts in (`SshSettings::allow_in_release`).
+
+**Can SSH log in with a password or a 2FA code?** Yes, opt-in: `SshAuth::password` and
+`SshAuth::keyboard_interactive` (see the SSH section). Keys stay the recommendation; the values are
+typed by the admin at runtime and never logged.
+
+**Why does `ssh` bring tokio when nothing else does?** Every maintained, complete SSH client in
+Rust that needs neither C nor OpenSSL is built on tokio (russh). The crate keeps it contained: one
+current-thread runtime on one thread of its own, started on the first connect, and nothing of it
+without the feature.
 
 **Does it follow the system proxy?** The `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY`
 environment variables, yes (not for loopback hosts). Windows' registry proxy settings, no.

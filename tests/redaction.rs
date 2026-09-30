@@ -1,7 +1,9 @@
 //! Secrets never reach the logs: every `tracing` event of this crate (at every level, TRACE
 //! included) is captured while requests with every kind of credential run, succeed, fail and are
-//! cancelled; none contains a secret. (Debug / Display redaction is unit-tested in the crate.)
-//! Own test binary: it installs a process-wide subscriber.
+//! cancelled; none contains a secret. With feature `ssh` also a real SSH connection to the mock
+//! (encrypted key + passphrase, a wrong passphrase, a command line, stdin and output holding
+//! secrets). (Debug / Display redaction is unit-tested in the crate.) Own test binary: it
+//! installs a process-wide subscriber.
 
 use std::fmt::{self, Write as _};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -16,6 +18,13 @@ use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Metadata, Subscriber};
 
 const SECRETS: [&str; 4] = ["fake-bearer-7f3a", "fake-header-9c2e", "fake-query-41bd", "fake-field-d00d"];
+#[cfg(feature = "ssh")]
+const SSH_SECRETS: [&str; 4] = ["fake-ssh-pass-5e1f", "fake-ssh-cmd-77aa", "fake-ssh-stdin-9b9b", "fake-ssh-wrong-0a0a"];
+
+#[cfg(feature = "ssh")]
+#[allow(dead_code)]
+#[path = "../examples/mock_ssh_server.rs"]
+mod mock_ssh_server;
 
 /// Puts one kind of credentials into the resource.
 type SetCredentials = dyn Fn(&mut BackendCredentials);
@@ -88,6 +97,8 @@ fn no_secret_is_ever_logged() {
     }
     app.world_mut().write_message(AppExit::Success);
     app.step();
+    #[cfg(feature = "ssh")]
+    ssh_part();
 
     let logs = capture.0.lock().unwrap_or_else(PoisonError::into_inner).clone();
     assert!(logs.contains(">>> NET-BACKEND"), "nothing captured:\n{logs}");
@@ -95,4 +106,43 @@ fn no_secret_is_ever_logged() {
     for secret in SECRETS {
         assert!(!logs.contains(secret), "`{secret}` was logged:\n{logs}");
     }
+    #[cfg(feature = "ssh")]
+    {
+        assert!(logs.contains("ssh `main` connected"), "the SSH part logged nothing:\n{logs}");
+        for secret in SSH_SECRETS {
+            assert!(!logs.contains(secret), "`{secret}` was logged:\n{logs}");
+        }
+    }
+}
+
+/// A real SSH connection (to the mock) whose passphrase, command line, stdin and output are
+/// secrets, plus a failed login with a wrong passphrase.
+#[cfg(feature = "ssh")]
+fn ssh_part() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("redaction-ssh-{}", std::process::id()));
+    let client = mock_ssh_server::random_key();
+    let key = dir.join("id_test");
+    mock_ssh_server::write_key(&client, &key, Some(SSH_SECRETS[0])).unwrap_or_else(|e| panic!("{e}"));
+    let mock = mock_ssh_server::MockSshServer::start("tester", client.public_key().clone()).unwrap_or_else(|e| panic!("{e}"));
+    let target = |passphrase: &str| {
+        SshTarget::new("127.0.0.1", "tester")
+            .with_port(mock.port())
+            .with_auth(SshAuth::key_file_with_passphrase(&key, passphrase))
+            .trust_host_key_fingerprint(mock.fingerprint())
+    };
+    let mut app = TestApp::builder().frame_duration(Duration::from_millis(1)).real_pause(Duration::from_millis(2)).build();
+    app.add_plugins(BackendPlugin::default());
+    fn ssh(app: &TestApp) -> &SshClient {
+        app.world().resource::<SshClient>()
+    }
+    ssh(&app).connect("main", target(SSH_SECRETS[0]));
+    ssh(&app).connect("wrong", target(SSH_SECRETS[3]));
+    ssh(&app).run("main", format!("echo {}", SSH_SECRETS[1]));
+    ssh(&app).run("main", SshCommand::new("cat").with_stdin(SSH_SECRETS[2].as_bytes().to_vec()));
+    ssh(&app).run("main", format!("stderr {}", SSH_SECRETS[1]));
+    app.step();
+    app.run_until(|world| world.resource::<InFlight>().is_empty(), 3000);
+    app.step_n(5);
+    app.world_mut().write_message(AppExit::Success);
+    app.step();
 }

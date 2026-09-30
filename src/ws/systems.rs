@@ -20,7 +20,7 @@ use super::{
     WsClient, WsConnectionInfo, WsConnections, WsFrame, WsIncoming, WsMessage, WsName, WsQueued, WsRawResponse, WsRoute, WsSettings, WsState, WsStateChanged,
 };
 use crate::credentials::BackendCredentials;
-use crate::inflight::{InFlight, RequestInfo, RequestKind};
+use crate::inflight::{InFlight, Protocol, RequestInfo, RequestKind};
 use crate::request::{check_path, check_scheme, encode_component, OutgoingRequest, RequestId, RequestPurpose};
 use crate::response::{BackendError, Rejection};
 
@@ -104,10 +104,19 @@ impl WsRuntime {
 
     /// The WebSocket rows of `InFlight`: every request not answered yet.
     fn publish(&self, inflight: &mut InFlight) {
-        inflight.set_others(self.conns.iter().flat_map(|(name, conn)| {
-            conn.requests.iter().map(move |r| (r.id, RequestInfo { kind: RequestKind::WebSocket, method: None, target: name.to_string() }))
-        }));
+        inflight.set_rows(
+            Protocol::WebSocket,
+            self.conns.iter().flat_map(|(name, conn)| {
+                conn.requests.iter().map(move |r| (r.id, RequestInfo { kind: RequestKind::WebSocket, method: None, target: name.to_string() }))
+            }),
+        );
     }
+}
+
+/// Whether `id` is a WebSocket request: queued this frame or waiting on a connection.
+fn owns(runtime: &WsRuntime, queued: &[WsQueued], id: RequestId) -> bool {
+    queued.iter().any(|item| matches!(item, WsQueued::Request { id: q, .. } | WsQueued::Fail { id: q, .. } if *q == id))
+        || runtime.conns.values().any(|conn| conn.requests.iter().any(|r| r.id == id))
 }
 
 /// Check a `ws://` / `wss://` URL (scheme, host, no user info or fragment, no path tricks).
@@ -381,10 +390,12 @@ pub(crate) fn ws_send(
     }
     let now = runtime.now(time.as_deref());
     let runtime = &mut *runtime;
-    // Cancels the HTTP side did not claim (one shared cancel path). Taken first, so a request
-    // cancelled in the frame it was made in is never sent (as for HTTP).
-    let mut cancels: Vec<RequestId> = inflight.take_unclaimed();
-    for item in client.drain() {
+    // The WebSocket ids of the shared cancel list (a request queued this frame or waiting), taken
+    // before the queue is applied, so a request cancelled in the frame it was made in is never
+    // sent (as for HTTP).
+    let queued = client.drain();
+    let mut cancels: Vec<RequestId> = inflight.claim_cancels(|id| owns(runtime, &queued, id));
+    for item in queued {
         match item {
             WsQueued::Request { name, id, route, .. } if cancels.contains(&id) => {
                 cancels.retain(|c| *c != id);
@@ -720,8 +731,9 @@ pub(crate) fn ws_exit(
     mut commands: Commands,
 ) {
     let runtime = &mut *runtime;
-    let cancelled: std::collections::HashSet<RequestId> = inflight.take_unclaimed().into_iter().collect();
-    for item in client.drain() {
+    let queued = client.drain();
+    let cancelled: std::collections::HashSet<RequestId> = inflight.claim_cancels(|id| owns(runtime, &queued, id)).into_iter().collect();
+    for item in queued {
         match item {
             WsQueued::Request { name, id, route, .. } | WsQueued::Fail { name, id, route, .. } => {
                 let error = if cancelled.contains(&id) { BackendError::Cancelled } else { BackendError::Shutdown };

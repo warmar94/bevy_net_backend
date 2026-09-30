@@ -106,8 +106,10 @@ pub enum BackendError {
     /// means it was still waiting for a free worker and never went out; otherwise it may or may
     /// not have reached the server.
     Timeout(String),
-    /// The response body was bigger than the limit
-    /// ([`HttpConfig::with_max_body_bytes`](crate::HttpConfig::with_max_body_bytes)).
+    /// The answer was bigger than its limit: an HTTP response body
+    /// ([`HttpConfig::with_max_body_bytes`](crate::HttpConfig::with_max_body_bytes)), an SSH
+    /// command's output (stdout + stderr) or an SFTP transfer (feature `ssh`: `SshTarget` /
+    /// `SshCommand` limits). For SSH the command was stopped (its channel closed) at the limit.
     #[non_exhaustive]
     BodyTooLarge {
         /// The limit in bytes.
@@ -160,6 +162,53 @@ pub enum BackendError {
     /// The server answered a WebSocket request with an error. The payload is kept as bytes with
     /// `text()` / `json()` helpers; `Debug` and `Display` never show it.
     Rejected(Box<Rejection>),
+    /// The SSH server's host key could not be verified (feature `ssh`): the host is not in
+    /// known_hosts (and no pinned fingerprint matches), its key changed, or the key is revoked.
+    /// The connection was closed before authentication: nothing was sent to the server.
+    #[non_exhaustive]
+    HostKey {
+        /// The host as it was looked up in known_hosts (`host`, or `[host]:port` for a port other
+        /// than 22).
+        host: String,
+        /// The server key's fingerprint as OpenSSH shows it (`SHA256:…`): public information, safe
+        /// to show so an admin can compare it with the server's real key.
+        fingerprint: String,
+        /// What is wrong.
+        problem: HostKeyProblem,
+    },
+    /// The SSH server accepted none of the configured authentication methods (feature `ssh`), or a
+    /// key could not be loaded. The text names the methods tried (key file names, not paths), never
+    /// a passphrase or key.
+    AuthFailed(String),
+    /// An SSH protocol error (feature `ssh`): no common algorithm, a refused channel or subsystem,
+    /// a server that does not support strict key exchange with a cipher that needs it, an SFTP
+    /// error status, … (the dependency's or the server's words).
+    Ssh(String),
+}
+
+/// Why an SSH host key was refused ([`BackendError::HostKey`]). `#[non_exhaustive]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum HostKeyProblem {
+    /// The host is in no known_hosts file that was read, and no pinned fingerprint matches. Add
+    /// the key to known_hosts (after checking the fingerprint on the server) or pin it.
+    Unknown,
+    /// known_hosts lists this host with a different key: possibly a man-in-the-middle attack, or
+    /// the server was reinstalled. Never accepted automatically.
+    Changed,
+    /// The key is marked `@revoked` in known_hosts (or a revoked line for the host could not be
+    /// read, which is treated the same way).
+    Revoked,
+}
+
+impl fmt::Display for HostKeyProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            HostKeyProblem::Unknown => "unknown host key",
+            HostKeyProblem::Changed => "the host key CHANGED",
+            HostKeyProblem::Revoked => "the host key is REVOKED",
+        })
+    }
 }
 
 /// The error payload of a [`BackendError::Rejected`] answer (with the default JSON envelope: the
@@ -221,12 +270,15 @@ impl BackendError {
 
     /// What this answer says about whether the request reached the network: `Some(false)` never
     /// sent (invalid, a `Timeout` whose text starts with `not sent:`, a `Disconnected` with
-    /// `sent: Some(false)`), `Some(true)` the server answered (`Status`, `Decode`,
+    /// `sent: Some(false)`, an SSH `HostKey` / `AuthFailed`), `Some(true)` the server answered (`Status`, `Decode`,
     /// `BodyTooLarge`, `Rejected`) or it went out before a loss (`Disconnected` with
-    /// `sent: Some(true)`), `None` unknown ("maybe").
+    /// `sent: Some(true)`), `None` unknown ("maybe"). Exception: an SFTP upload over its transfer
+    /// limit is `BodyTooLarge` but was refused before anything was sent (`SftpFinished::started`
+    /// says `Some(false)`).
     pub fn was_sent(&self) -> Option<bool> {
         match self {
             BackendError::InvalidRequest(_) | BackendError::InsecureHttp { .. } | BackendError::Encode(_) => Some(false),
+            BackendError::HostKey { .. } | BackendError::AuthFailed(_) => Some(false),
             BackendError::Timeout(why) if why.starts_with("not sent:") => Some(false),
             BackendError::Disconnected { sent, .. } => *sent,
             BackendError::Status(_) | BackendError::Decode { .. } | BackendError::BodyTooLarge { .. } | BackendError::Rejected(_) => Some(true),
@@ -242,7 +294,12 @@ impl BackendError {
         }
     }
 
-    #[cfg(feature = "ws")]
+    /// A [`HostKey`](Self::HostKey) error (for custom SSH transports and tests).
+    pub fn host_key(host: impl Into<String>, fingerprint: impl Into<String>, problem: HostKeyProblem) -> Self {
+        BackendError::HostKey { host: host.into(), fingerprint: fingerprint.into(), problem }
+    }
+
+    #[cfg(any(feature = "ws", feature = "ssh"))]
     pub(crate) fn disconnected(reason: impl Into<String>, sent: Option<bool>) -> Self {
         BackendError::Disconnected { reason: reason.into(), sent }
     }
@@ -266,6 +323,11 @@ impl fmt::Debug for BackendError {
             BackendError::Disconnected { reason, sent } => f.debug_struct("Disconnected").field("reason", reason).field("sent", sent).finish(),
             BackendError::Closed { code, reason } => f.debug_struct("Closed").field("code", code).field("reason", reason).finish(),
             BackendError::Rejected(rejection) => f.debug_tuple("Rejected").field(rejection).finish(),
+            BackendError::HostKey { host, fingerprint, problem } => {
+                f.debug_struct("HostKey").field("host", host).field("fingerprint", fingerprint).field("problem", problem).finish()
+            }
+            BackendError::AuthFailed(why) => f.debug_tuple("AuthFailed").field(why).finish(),
+            BackendError::Ssh(why) => f.debug_tuple("Ssh").field(why).finish(),
         }
     }
 }
@@ -281,7 +343,7 @@ impl fmt::Display for BackendError {
             BackendError::Network(why) => write!(f, "network error: {why}"),
             BackendError::Tls(why) => write!(f, "TLS error: {why}"),
             BackendError::Timeout(why) => write!(f, "timed out ({why})"),
-            BackendError::BodyTooLarge { limit } => write!(f, "the response body is larger than the limit of {limit} bytes"),
+            BackendError::BodyTooLarge { limit } => write!(f, "the answer is larger than the limit of {limit} bytes"),
             BackendError::Status(response) => write!(f, "HTTP status {}", response.status),
             // serde_json's message can quote the body: it stays in the field, out of Display.
             BackendError::Decode { response, .. } => write!(f, "the answer (HTTP {}) is not the expected JSON", response.status),
@@ -294,6 +356,9 @@ impl fmt::Display for BackendError {
             BackendError::Closed { code, reason } if reason.is_empty() => write!(f, "closed by the server (code {code})"),
             BackendError::Closed { code, reason } => write!(f, "closed by the server (code {code}: {reason})"),
             BackendError::Rejected(_) => f.write_str("the server rejected the request"),
+            BackendError::HostKey { host, fingerprint, problem } => write!(f, "SSH host key check failed for `{host}`: {problem} ({fingerprint})"),
+            BackendError::AuthFailed(why) => write!(f, "SSH authentication failed: {why}"),
+            BackendError::Ssh(why) => write!(f, "SSH error: {why}"),
         }
     }
 }

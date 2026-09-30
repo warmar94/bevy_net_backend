@@ -1,0 +1,18 @@
+# cargo-deny configuration. CI uses only the RustSec advisory check (.github/workflows/advisories.yml),
+# on every pull request, every push to main and once a week, so new advisories (russh, tokio, ring,
+# rustls, ...) show up even when nothing here changed.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+# Only this crate's own direct dependencies are checked for "unmaintained" notices.
+unmaintained = "workspace"
+ignore = [
+    # rsa 0.10.0-rc (Marvin: a timing side channel in RSA decryption / signing; no patched release
+    # exists). It is only compiled with the opt-in `ssh-rsa` feature, but Cargo.lock always lists it,
+    # so the check would always fail. Accepted by the owner and documented in the README. Review
+    # this entry whenever `rsa` publishes a fixed release.
+    { id = "RUSTSEC-2023-0071", reason = "rsa (Marvin): only with the opt-in ssh-rsa feature; no patched release exists" },
+]

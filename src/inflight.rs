@@ -26,8 +26,8 @@ use crate::transport::{HttpTransportRes, HttpTransportResult};
 /// transport never reports it (a stuck worker, a custom transport that forgets it).
 pub const DEADLINE_GRACE: Duration = Duration::from_secs(5);
 
-/// The kind of connection a pending request belongs to. `#[non_exhaustive]`: later versions add
-/// kinds (an SSH command).
+/// The kind of connection a pending request belongs to. `#[non_exhaustive]`: later versions may
+/// add kinds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum RequestKind {
@@ -35,6 +35,10 @@ pub enum RequestKind {
     Http,
     /// A request on a WebSocket connection (feature `ws`).
     WebSocket,
+    /// A command on an SSH connection (feature `ssh`).
+    Ssh,
+    /// A file operation on an SSH connection (feature `sftp`).
+    Sftp,
 }
 
 /// What a pending request is, for display (a "saving…" list, a debug overlay). Never holds a
@@ -47,7 +51,8 @@ pub struct RequestInfo {
     /// The HTTP method, for [`RequestKind::Http`].
     pub method: Option<Method>,
     /// What the request targets: for HTTP the URL path without the query (as the game wrote it),
-    /// for WebSocket the connection's name.
+    /// for WebSocket and SSH the connection's name (never an SSH command line: it may hold a
+    /// secret).
     pub target: String,
 }
 
@@ -61,36 +66,83 @@ struct Entry {
 
 type Answer = (RequestId, Route, HttpTransportResult);
 
-/// The cancel list every client shares: [`HttpClient::cancel`] and `WsClient::cancel` push into it,
-/// the HTTP `Send` system takes what is HTTP's and leaves the rest for WebSocket.
-pub(crate) type CancelList = Arc<Mutex<Vec<RequestId>>>;
+/// Which protocol's systems own a set of rows in [`InFlight`] (HTTP keeps its own map). Each
+/// protocol replaces only its own rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Protocol {
+    #[cfg(feature = "ws")]
+    WebSocket,
+    #[cfg(feature = "ssh")]
+    Ssh,
+}
 
-/// Every request waiting for its answer, HTTP and WebSocket alike (optional read-only tracking,
-/// e.g. for a "saving…" spinner). An HTTP request appears here in `PostUpdate`
+/// The cancel list every client shares: `HttpClient::cancel`, `WsClient::cancel` and
+/// `SshClient::cancel` push into it. Each protocol's systems CLAIM only the ids they own (a request
+/// they hold or have queued), in any order, and leave the rest. An id nobody claimed during two
+/// `Send` phases in a row (an unknown or already answered id) is dropped by the core `Send`
+/// system, which runs first; two phases, so an id pushed by a game system while a phase was
+/// running still gets one full phase.
+#[derive(Clone, Default)]
+pub(crate) struct CancelList(Arc<Mutex<Vec<(RequestId, u8)>>>);
+
+impl CancelList {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(RequestId, u8)>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Ask for `id` to be cancelled (any protocol).
+    pub(crate) fn push(&self, id: RequestId) {
+        self.lock().push((id, 0));
+    }
+
+    /// Take the ids `owns` recognises, oldest first; leave the others.
+    pub(crate) fn claim(&self, mut owns: impl FnMut(RequestId) -> bool) -> Vec<RequestId> {
+        let mut list = self.lock();
+        let mut claimed = Vec::new();
+        list.retain(|(id, _)| {
+            if owns(*id) {
+                claimed.push(*id);
+                false
+            } else {
+                true
+            }
+        });
+        claimed
+    }
+
+    /// Start of a `Send` phase: drop ids that stayed unclaimed through two phases.
+    pub(crate) fn age(&self) {
+        self.lock().retain_mut(|(_, passes)| {
+            *passes = passes.saturating_add(1);
+            *passes < 3
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.lock().len()
+    }
+}
+
+/// Every request waiting for its answer, HTTP, WebSocket and SSH alike (optional read-only
+/// tracking, e.g. for a "saving…" spinner). An HTTP request appears here in `PostUpdate`
 /// ([`BackendSystems::Send`](crate::BackendSystems::Send)) of the frame it was made in, a
-/// WebSocket request in the same place (also while it waits for its connection). A request leaves
-/// it when it is answered; the answer message follows in `First` (of that frame, or of the next
-/// one for answers decided in `PostUpdate`, such as a cancel).
+/// WebSocket request or SSH command in the same place (also while it waits for its connection). A
+/// request leaves it when it is answered; the answer message follows in `First` (of that frame, or
+/// of the next one for answers decided in `PostUpdate`, such as a cancel).
 #[derive(Resource)]
 pub struct InFlight {
     entries: HashMap<RequestId, Entry>,
-    others: HashMap<RequestId, RequestInfo>,
+    /// Rows of the other protocols, each replaced only by its own systems.
+    rows: HashMap<Protocol, HashMap<RequestId, RequestInfo>>,
     ready: Vec<Answer>,
     cancels: CancelList,
-    unclaimed: Vec<RequestId>,
     epoch: Instant,
 }
 
 impl Default for InFlight {
     fn default() -> Self {
-        Self {
-            entries: HashMap::new(),
-            others: HashMap::new(),
-            ready: Vec::new(),
-            cancels: CancelList::default(),
-            unclaimed: Vec::new(),
-            epoch: Instant::now(),
-        }
+        Self { entries: HashMap::new(), rows: HashMap::new(), ready: Vec::new(), cancels: CancelList::default(), epoch: Instant::now() }
     }
 }
 
@@ -103,29 +155,29 @@ impl fmt::Debug for InFlight {
 impl InFlight {
     /// Whether `id` is still waiting for its answer.
     pub fn contains(&self, id: RequestId) -> bool {
-        self.entries.contains_key(&id) || self.others.contains_key(&id)
+        self.entries.contains_key(&id) || self.rows.values().any(|rows| rows.contains_key(&id))
     }
 
     /// How many requests are waiting.
     pub fn len(&self) -> usize {
-        self.entries.len() + self.others.len()
+        self.rows.values().fold(self.entries.len(), |n, rows| n.saturating_add(rows.len()))
     }
 
     /// Whether nothing is waiting.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.others.is_empty()
+        self.entries.is_empty() && self.rows.values().all(HashMap::is_empty)
     }
 
     /// The waiting ids, oldest first.
     pub fn ids(&self) -> Vec<RequestId> {
-        let mut ids: Vec<RequestId> = self.entries.keys().chain(self.others.keys()).copied().collect();
+        let mut ids: Vec<RequestId> = self.entries.keys().chain(self.rows.values().flat_map(HashMap::keys)).copied().collect();
         ids.sort_unstable();
         ids
     }
 
     /// What a waiting request is (kind, method, target without query / connection name).
     pub fn describe(&self, id: RequestId) -> Option<&RequestInfo> {
-        self.entries.get(&id).map(|e| &e.info).or_else(|| self.others.get(&id))
+        self.entries.get(&id).map(|e| &e.info).or_else(|| self.rows.values().find_map(|rows| rows.get(&id)))
     }
 
     fn now(&self, time: Option<&Time<Real>>) -> Duration {
@@ -133,27 +185,23 @@ impl InFlight {
     }
 
     pub(crate) fn cancel_list(&self) -> CancelList {
-        Arc::clone(&self.cancels)
+        self.cancels.clone()
     }
 
-    fn take_cancels(&self) -> Vec<RequestId> {
-        std::mem::take(&mut *self.cancels.lock().unwrap_or_else(PoisonError::into_inner))
+    /// Take the cancel ids `owns` recognises (see [`CancelList`]); the others stay for the other
+    /// protocols.
+    #[cfg_attr(not(any(feature = "ws", feature = "ssh")), allow(dead_code))]
+    pub(crate) fn claim_cancels(&self, owns: impl FnMut(RequestId) -> bool) -> Vec<RequestId> {
+        self.cancels.claim(owns)
     }
 
-    /// Cancels that were not HTTP requests (for the WebSocket side, which runs right after).
-    #[cfg_attr(not(feature = "ws"), allow(dead_code))]
-    pub(crate) fn take_unclaimed(&mut self) -> Vec<RequestId> {
-        std::mem::take(&mut self.unclaimed)
-    }
-
-    /// Replace the WebSocket rows (the WS side calls this after every change).
-    #[cfg_attr(not(feature = "ws"), allow(dead_code))]
-    pub(crate) fn set_others(&mut self, rows: impl IntoIterator<Item = (RequestId, RequestInfo)>) {
-        // Only WebSocket writes these rows today. A second protocol must key them by kind first
-        // (see NOTES.md, handover step 1), or it silently erases the other's rows.
-        debug_assert!(self.others.values().all(|info| info.kind == RequestKind::WebSocket));
-        self.others.clear();
-        self.others.extend(rows);
+    /// Replace the rows of `protocol` (its systems call this after every change); the rows of the
+    /// other protocols are untouched.
+    #[cfg_attr(not(any(feature = "ws", feature = "ssh")), allow(dead_code))]
+    pub(crate) fn set_rows(&mut self, protocol: Protocol, rows: impl IntoIterator<Item = (RequestId, RequestInfo)>) {
+        let map = self.rows.entry(protocol).or_default();
+        map.clear();
+        map.extend(rows);
     }
 }
 
@@ -213,13 +261,19 @@ pub(crate) fn send_requests(
     time: Option<Res<Time<Real>>>,
     mut exit: MessageReader<AppExit>,
 ) {
-    // Cancels left over from last frame were no one's (no WebSocket side took them).
-    inflight.unclaimed.clear();
+    // This system runs first in the phase: drop cancel ids nobody claimed for two phases.
+    inflight.cancels.age();
     if exit.read().count() > 0 {
         return;
     }
     let queued = client.drain();
-    let cancels = inflight.take_cancels();
+    // Only HTTP's own ids (a request queued this frame or waiting for its answer); the rest stays
+    // in the shared list for the other protocols.
+    let queued_ids: HashSet<RequestId> = queued.iter().map(|Queued::Send { id, .. }| *id).collect();
+    let cancels = {
+        let entries = &inflight.entries;
+        inflight.cancels.claim(|id| queued_ids.contains(&id) || entries.contains_key(&id))
+    };
     if queued.is_empty() && cancels.is_empty() {
         return;
     }
@@ -258,14 +312,11 @@ pub(crate) fn send_requests(
         if claimed.contains(&id) {
             continue;
         }
-        match inflight.entries.remove(&id) {
-            Some(entry) => {
-                if let Some(transport) = transport.as_mut() {
-                    transport.get_mut().cancel(id);
-                }
-                inflight.ready.push((id, entry.route, Err(BackendError::Cancelled)));
+        if let Some(entry) = inflight.entries.remove(&id) {
+            if let Some(transport) = transport.as_mut() {
+                transport.get_mut().cancel(id);
             }
-            None => inflight.unclaimed.push(id),
+            inflight.ready.push((id, entry.route, Err(BackendError::Cancelled)));
         }
     }
 }
@@ -322,14 +373,19 @@ pub(crate) fn shutdown_on_exit(
     mut commands: Commands,
 ) {
     let mut answers = std::mem::take(&mut inflight.ready);
-    for Queued::Send { id, route, .. } in client.drain() {
-        answers.push((id, route, Err(BackendError::Shutdown)));
+    let queued = client.drain();
+    let queued_ids: HashSet<RequestId> = queued.iter().map(|Queued::Send { id, .. }| *id).collect();
+    let cancelled: HashSet<RequestId> = {
+        let entries = &inflight.entries;
+        inflight.cancels.claim(|id| queued_ids.contains(&id) || entries.contains_key(&id)).into_iter().collect()
+    };
+    for Queued::Send { id, route, .. } in queued {
+        let error = if cancelled.contains(&id) { BackendError::Cancelled } else { BackendError::Shutdown };
+        answers.push((id, route, Err(error)));
     }
-    inflight.unclaimed.clear();
-    for id in inflight.take_cancels() {
-        match inflight.entries.remove(&id) {
-            Some(entry) => answers.push((id, entry.route, Err(BackendError::Cancelled))),
-            None => inflight.unclaimed.push(id),
+    for id in &cancelled {
+        if let Some(entry) = inflight.entries.remove(id) {
+            answers.push((*id, entry.route, Err(BackendError::Cancelled)));
         }
     }
     let generation = transport.as_ref().map(|t| t.generation());

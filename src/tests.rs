@@ -344,3 +344,45 @@ fn the_tls_provider_is_ring_with_tls13_and_tls12_suites() {
     assert!(provider.cipher_suites.iter().any(|s| s.version() == &rustls::version::TLS13));
     assert!(provider.cipher_suites.iter().any(|s| s.version() == &rustls::version::TLS12));
 }
+
+#[test]
+fn the_shared_cancel_list_is_claimed_per_protocol_and_forgets_unowned_ids() {
+    use crate::inflight::CancelList;
+    let list = CancelList::default();
+    let (a, b, c) = (RequestId::next(), RequestId::next(), RequestId::next());
+    for id in [a, b, c] {
+        list.push(id);
+    }
+    // One protocol takes only its own id; the others stay for the next protocol.
+    assert_eq!(list.claim(|id| id == b), vec![b]);
+    assert_eq!(list.claim(|id| id == c), vec![c]);
+    assert_eq!(list.len(), 1);
+    // An id nobody claims survives one full phase (it may belong to a request queued late) ...
+    list.age();
+    list.age();
+    assert_eq!(list.len(), 1);
+    // ... and is dropped at the start of the third.
+    list.age();
+    assert_eq!(list.len(), 0);
+    // A late push restarts the count for that id only.
+    list.push(a);
+    list.age();
+    assert_eq!(list.claim(|id| id == a), vec![a]);
+}
+
+#[cfg(feature = "ws")]
+#[test]
+fn each_protocol_replaces_only_its_own_in_flight_rows() {
+    use crate::inflight::{Protocol, RequestInfo, RequestKind};
+    let mut inflight = InFlight::default();
+    let (a, b) = (RequestId::next(), RequestId::next());
+    let row = |kind| RequestInfo { kind, method: None, target: "main".into() };
+    inflight.set_rows(Protocol::WebSocket, [(a, row(RequestKind::WebSocket)), (b, row(RequestKind::WebSocket))]);
+    assert_eq!(inflight.ids(), vec![a, b]);
+    inflight.set_rows(Protocol::WebSocket, [(b, row(RequestKind::WebSocket))]);
+    assert_eq!(inflight.ids(), vec![b]);
+    assert_eq!(inflight.len(), 1);
+    assert_eq!(inflight.describe(b).map(|r| r.kind), Some(RequestKind::WebSocket));
+    inflight.set_rows(Protocol::WebSocket, []);
+    assert!(inflight.is_empty());
+}

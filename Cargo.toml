@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2021"
 # Bevy 0.19's own minimum.
 rust-version = "1.95"
-description = "Talk to your game's own backend from Bevy: HTTPS JSON requests and (feature `ws`) named WebSocket connections, typed answers as Bevy messages, exactly one answer per request, reconnect with backoff, game-supplied credentials with redacted secrets, no async runtime, and fake transports for tests."
+description = "Talk to your game's own backend from Bevy: HTTPS JSON requests, (feature `ws`) named WebSocket connections and (feature `ssh`, admin tools) SSH commands and SFTP, typed answers as Bevy messages, exactly one answer per request, game-supplied credentials with redacted secrets, no tokio unless you enable `ssh`, and fake transports for tests."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/warmar94/bevy_net_backend"
 readme = "README.md"
-keywords = ["bevy", "http", "websocket", "json", "client"]
+keywords = ["bevy", "http", "websocket", "ssh", "json"]
 categories = ["game-development", "network-programming", "web-programming::http-client"]
 # Not part of the published package.
 exclude = ["NOTES.md", "docs/", "/target"]
@@ -29,6 +29,16 @@ gzip = ["http", "ureq/gzip"]
 # Named WebSocket connections: tungstenite (sync, no async runtime) on one dedicated thread per
 # connection, TLS through the same rustls + ring setup as `http`. No permessage-deflate.
 ws = ["dep:tungstenite", "dep:rustls", "dep:webpki-roots"]
+# ADMIN / DEV BUILDS ONLY. Named SSH connections that run commands (russh, ring for the AEAD
+# ciphers, RustCrypto for the rest), strict known_hosts checking, key files / ssh-agent / the
+# user's ~/.ssh/config. The ONLY feature that brings tokio: one private current-thread runtime on
+# its own thread. Refuses to run in release builds unless the plugin opts in.
+ssh = ["dep:russh", "dep:tokio", "dep:ssh2-config", "dep:glob", "dep:hmac", "dep:sha1", "dep:zeroize"]
+# SFTP file operations (upload, download, list, mkdir, remove, rename) on SSH connections.
+sftp = ["ssh", "dep:russh-sftp"]
+# RSA host keys and RSA key files for SSH (rsa-sha2-256/512). Off by default: the `rsa` crate carries
+# the unfixed Marvin timing advisory RUSTSEC-2023-0071.
+ssh-rsa = ["ssh", "russh/rsa"]
 
 # Bevy is pinned EXACTLY and only its sub-crates are used, without default features: the crate adds
 # no Bevy feature a game did not ask for, and a game on Bevy 0.19.0 ends up with ONE Bevy.
@@ -55,6 +65,22 @@ tungstenite = { version = "=0.30.0", default-features = false, features = ["hand
 # Mozilla's root certificates for `wss://` (the same crate ureq uses for `https://`). Caret: the root
 # list must be able to move forward.
 webpki-roots = { version = "1.0.9", optional = true }
+# The SSH client (feature `ssh`). ring only (the same ring as TLS), never aws-lc; RSA only with
+# `ssh-rsa`. Pinned exactly: SSH security fixes arrive as patch releases, bumped deliberately.
+russh = { version = "=0.63.3", default-features = false, features = ["ring"], optional = true }
+# russh needs a tokio runtime: one private current-thread runtime on the crate's own SSH thread.
+tokio = { version = "1.44", default-features = false, features = ["rt", "net", "time", "sync", "macros", "io-util"], optional = true }
+# `~/.ssh/config` host aliases (HostName, Port, User, IdentityFile).
+ssh2-config = { version = "=0.8.1", optional = true }
+# `Include` patterns of ssh_config, expanded by us with limits (the same glob ssh2-config uses).
+glob = { version = "0.3", optional = true }
+# Hashed known_hosts entries (`|1|salt|hash` = HMAC-SHA1); the same versions russh uses.
+hmac = { version = "0.13", optional = true }
+sha1 = { version = "0.11", default-features = false, optional = true }
+# Wipes key file contents read into memory.
+zeroize = { version = "1.7", optional = true }
+# The SFTP subsystem (feature `sftp`).
+russh-sftp = { version = "=3.0.1", optional = true }
 
 [dev-dependencies]
 # Tests + examples: MinimalPlugins, headless.
@@ -65,6 +91,9 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 # A throwaway test CA + localhost certificate generated in memory for the TLS tests (ring backend,
 # no aws-lc). Tests only: nothing key-shaped is in the repository or the package.
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring"] }
+# Random seeds for the throwaway SSH keys of the mock SSH server and the SSH tests (the same
+# getrandom russh already uses). Keys are generated at runtime; none is in the repository.
+getrandom = { version = "0.4", features = ["sys_rng"] }
 
 # Examples run against a mock server they start on 127.0.0.1 (or against `BACKEND_URL`).
 [[example]]
@@ -104,6 +133,28 @@ required-features = ["ws", "json"]
 [[test]]
 name = "live_ws"
 required-features = ["ws", "json"]
+
+[[example]]
+name = "mock_ssh_server"
+required-features = ["ssh"]
+
+[[example]]
+name = "ssh_console"
+required-features = ["ssh"]
+
+[[test]]
+name = "ssh_fake"
+required-features = ["ssh"]
+
+[[test]]
+name = "ssh_loopback"
+required-features = ["ssh"]
+
+# Live SSH checks against a real OpenSSH server. `#[ignore]`d: run only on request, with
+# BNB_TEST_HOST, BNB_TEST_SSH_USER, BNB_TEST_SSH_KEY and BNB_TEST_SSH_KNOWN_HOSTS set.
+[[test]]
+name = "live_ssh"
+required-features = ["ssh"]
 
 [[test]]
 name = "fake"

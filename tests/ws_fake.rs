@@ -358,6 +358,115 @@ fn websocket_requests_are_in_flight_and_share_the_http_cancel() {
     assert!(!app.world().resource::<InFlight>().contains(id));
 }
 
+/// HTTP (fake) + WebSocket (fake) in one app: each protocol owns its `InFlight` rows and claims
+/// only its own cancels, through either client's `cancel`.
+fn both(http: &FakeHttpTransport, fake: &FakeWsTransport) -> TestApp {
+    let mut app = TestApp::new();
+    app.insert_resource(HttpTransportRes::new(http.clone()))
+        .insert_resource(WsTransportRes::new(fake.clone()))
+        .add_plugins(BackendPlugin::new(HttpConfig::new("https://api.example.com")));
+    app.watch::<HttpResponse>().watch::<WsRawResponse>().watch::<WsStateChanged>();
+    app
+}
+
+fn http_answers(app: &TestApp, id: RequestId) -> Vec<HttpResponse> {
+    app.all_messages::<HttpResponse>().into_iter().filter(|a| a.id == id).collect()
+}
+
+#[test]
+fn http_and_websocket_rows_and_cancels_never_interfere() {
+    let http = FakeHttpTransport::new();
+    let fake = FakeWsTransport::new();
+    let mut app = both(&http, &fake);
+    ws(&app).connect("main", settings());
+    app.step_n(2);
+    let link = fake.last_link().unwrap_or_else(|| panic!("no link"));
+    let client = app.world().resource::<HttpClient>();
+    let (h1, h2) = (client.get("/one"), client.get("/two"));
+    let (w1, w2) = (ws(&app).request_raw("main", WsOutgoing::new("echo", b"1".to_vec())), ws(&app).request_raw("main", WsOutgoing::new("echo", b"2".to_vec())));
+    app.step();
+    let inflight = app.world().resource::<InFlight>();
+    assert_eq!(inflight.ids(), vec![h1, h2, w1, w2]);
+    assert_eq!(inflight.describe(h1).map(|i| i.kind), Some(RequestKind::Http));
+    assert_eq!(inflight.describe(w1).map(|i| i.kind), Some(RequestKind::WebSocket));
+    // Crossed on purpose: the HTTP client cancels a WebSocket request and the other way round.
+    app.world().resource::<HttpClient>().cancel(w1);
+    ws(&app).cancel(h1);
+    app.step_n(2);
+    assert_eq!(one_error(&app, w1), BackendError::Cancelled);
+    let h1_answers = http_answers(&app, h1);
+    assert_eq!(h1_answers.len(), 1);
+    assert_eq!(h1_answers[0].result.as_ref().err(), Some(&BackendError::Cancelled));
+    assert_eq!(http.cancelled(), vec![h1], "the HTTP transport only hears of its own id");
+    assert_eq!(app.world().resource::<InFlight>().ids(), vec![h2, w2]);
+    // A WebSocket answer rebuilds the WebSocket rows; the HTTP row stays.
+    fake.push(link, WsFrame::Text(format!(r#"{{"id":{},"ok":true,"data":2}}"#, sent_id(&fake, link, 1))));
+    app.step();
+    assert!(raw_answers(&app, w2).first().is_some_and(|a| a.result.is_ok()));
+    assert_eq!(app.world().resource::<InFlight>().ids(), vec![h2]);
+    // And an HTTP answer leaves WebSocket rows alone.
+    let w3 = ws(&app).request_raw("main", WsOutgoing::new("echo", b"3".to_vec()));
+    app.step();
+    http.reply(h2, Ok(RawResponse::new(StatusCode::OK, "ok")));
+    app.step();
+    assert_eq!(http_answers(&app, h2).len(), 1);
+    assert_eq!(app.world().resource::<InFlight>().ids(), vec![w3]);
+    // Nothing got a second answer.
+    for id in [w1, w2] {
+        assert_eq!(raw_answers(&app, id).len(), 1);
+    }
+    assert_eq!(http_answers(&app, h1).len(), 1);
+}
+
+/// The wire id the fake saw in the `n`-th (0-based) text frame sent on `link`.
+fn sent_id(fake: &FakeWsTransport, link: WsLinkId, n: usize) -> u64 {
+    let frames = fake.sent(link);
+    let text = frames.get(n).and_then(WsFrame::as_text).unwrap_or_else(|| panic!("no frame {n}"));
+    let key = "\"id\":";
+    let start = text.find(key).map(|i| i + key.len()).unwrap_or_else(|| panic!("no id in {text}"));
+    text[start..].chars().take_while(char::is_ascii_digit).collect::<String>().parse().unwrap_or_else(|_| panic!("bad id in {text}"))
+}
+
+#[test]
+fn same_frame_cancels_of_both_protocols_are_never_sent() {
+    let http = FakeHttpTransport::new();
+    let fake = FakeWsTransport::new();
+    let mut app = both(&http, &fake);
+    ws(&app).connect("main", settings());
+    app.step_n(2);
+    let link = fake.last_link().unwrap_or_else(|| panic!("no link"));
+    let h = app.world().resource::<HttpClient>().get("/never");
+    let w = ws(&app).request_raw("main", WsOutgoing::new("echo", b"1".to_vec()));
+    ws(&app).cancel(h);
+    app.world().resource::<HttpClient>().cancel(w);
+    app.step_n(2);
+    assert!(http.requests().is_empty(), "the cancelled HTTP request was submitted");
+    assert!(fake.sent(link).is_empty(), "the cancelled WebSocket request was sent");
+    assert_eq!(one_error(&app, w), BackendError::Cancelled);
+    assert_eq!(http_answers(&app, h).len(), 1);
+}
+
+#[test]
+fn a_cancel_nobody_owns_is_dropped_without_side_effects() {
+    let http = FakeHttpTransport::new();
+    let fake = FakeWsTransport::new();
+    fake.echo_envelope(true);
+    let mut app = both(&http, &fake);
+    ws(&app).connect("main", settings());
+    app.step_n(2);
+    let answered = ws(&app).request_raw("main", WsOutgoing::new("echo", b"1".to_vec()));
+    app.step_n(2);
+    assert_eq!(raw_answers(&app, answered).len(), 1);
+    // Cancel an id that is already answered: nothing happens, now or later.
+    ws(&app).cancel(answered);
+    app.world().resource::<HttpClient>().cancel(answered);
+    let later = ws(&app).request_raw("main", WsOutgoing::new("echo", b"2".to_vec()));
+    app.step_n(4);
+    assert_eq!(raw_answers(&app, answered).len(), 1);
+    assert!(raw_answers(&app, later).first().is_some_and(|a| a.result.is_ok()), "an unrelated request was disturbed");
+    assert!(http.cancelled().is_empty());
+}
+
 #[test]
 fn requests_can_wait_for_the_auth_acknowledgement() {
     struct FirstMessage;
