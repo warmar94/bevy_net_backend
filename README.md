@@ -29,7 +29,7 @@ fn main() {
     App::new()
         .add_plugins((MinimalPlugins, BackendPlugin::new(HttpConfig::new("https://api.example.com"))))
         .add_json_response::<Profile>()
-        .add_systems(Startup, |backend: Res<BackendClient>| {
+        .add_systems(Startup, |backend: Res<HttpClient>| {
             backend.get_json::<Profile>("/me");
         })
         .add_systems(Update, |mut answers: MessageReader<JsonResponse<Profile>>| {
@@ -82,7 +82,7 @@ fn main() {
 - **Never blocks a frame:** requests run on a small fixed pool of worker threads (default 2), not
   on Bevy's task pools. Answers are written in `First`, so `PreUpdate` and `Update` read them in
   the frame they arrived.
-- **No ordering ceremony:** `BackendClient` is used through `Res<BackendClient>` (shared access),
+- **No ordering ceremony:** `HttpClient` is used through `Res<HttpClient>` (shared access),
   so any number of systems in any schedule can fire requests without `.before()` / `.after()`.
 - **Game-controlled auth:** after your own login call, put a `BearerToken`, `ApiKeyHeader`,
   `ApiKeyQuery` or `JsonBodyField` (or your own `Credentials`) into `BackendCredentials`. Secrets
@@ -130,9 +130,9 @@ features, so it adds no Bevy feature your game did not ask for.
 
 1. Add `BackendPlugin` with your API's base URL.
 2. Register each JSON answer type once: `app.add_json_response::<T>()`.
-3. Fire requests from any system with `Res<BackendClient>`; keep the `RequestId` if you need to
+3. Fire requests from any system with `Res<HttpClient>`; keep the `RequestId` if you need to
    match the answer.
-4. Read `JsonResponse<T>` (or `BackendResponse` for raw calls) with a `MessageReader`.
+4. Read `JsonResponse<T>` (or `HttpResponse` for raw calls) with a `MessageReader`.
 
 ```rust,no_run
 use bevy::prelude::*;
@@ -154,7 +154,7 @@ struct Rank {
 #[derive(Resource)]
 struct Submitting(RequestId);
 
-fn submit_score(backend: Res<BackendClient>, mut commands: Commands) {
+fn submit_score(backend: Res<HttpClient>, mut commands: Commands) {
     let id = backend.post_json::<Rank>("/scores", &Score { level: 3, points: 12_500 });
     commands.insert_resource(Submitting(id));
 }
@@ -244,7 +244,7 @@ struct Craft<'a> {
     recipe: &'a str,
 }
 
-fn requests(backend: Res<BackendClient>) {
+fn requests(backend: Res<HttpClient>) {
     // GET  /inventory               -> JsonResponse<Inventory>
     backend.get_json::<Inventory>("/inventory");
     // POST /craft  {"recipe":"axe"}  -> JsonResponse<Inventory>
@@ -265,13 +265,13 @@ app.add_plugins(BackendPlugin::new(HttpConfig::new("https://api.example.com")))
   `Content-Type: application/json`.
 - A 2xx body is decoded into `T`. An empty body decodes as JSON `null`, so `()` and `Option<T>`
   accept a `204 No Content`.
-- A type that was never registered is not sent: the request is answered on `BackendResponse`
+- A type that was never registered is not sent: the request is answered on `HttpResponse`
   with `InvalidRequest` (naming the missing `add_json_response`) and a warning is logged.
 - A body that cannot be serialized is answered with `Encode` and never sent.
 
 ### 3. Raw requests and full control
 
-Raw calls answer with `BackendResponse` (status, headers, bytes):
+Raw calls answer with `HttpResponse` (status, headers, bytes):
 
 ```rust
 use bevy::prelude::*;
@@ -279,7 +279,7 @@ use bevy_net_backend::http::Method;
 use bevy_net_backend::prelude::*;
 use std::time::Duration;
 
-fn raw(backend: Res<BackendClient>) {
+fn raw(backend: Res<HttpClient>) {
     backend.get("/health");
     backend.request(Method::PUT, "/avatar", Some(vec![0x89, b'P', b'N', b'G']));
     backend.send(
@@ -346,7 +346,7 @@ fn on_save(mut answers: MessageReader<JsonResponse<Save>>) {
 | `BodyTooLarge { limit }` | the response body is over the limit | yes |
 | `Status(response)` | a status outside 200–299, 3xx included (redirects are not followed) | yes |
 | `Decode { message, response }` | a 2xx body that is not the expected JSON | yes |
-| `Cancelled` | `BackendClient::cancel` | maybe |
+| `Cancelled` | `HttpClient::cancel` | maybe |
 | `Shutdown` | the app exited (`AppExit`) first | maybe |
 | `NoTransport` | no `HttpTransportRes`, or it was removed / replaced first | no / maybe |
 
@@ -376,7 +376,7 @@ struct Token {
     token: String,
 }
 
-fn log_in(backend: Res<BackendClient>) {
+fn log_in(backend: Res<HttpClient>) {
     // The login call must not carry an old token.
     let request = OutgoingRequest::post("/login")
         .with_json(&Login { email: "player@example.com", password: "from-the-login-form" })
@@ -451,7 +451,7 @@ use bevy_net_backend::prelude::*;
 #[derive(Resource)]
 struct Search(RequestId);
 
-fn new_search(backend: Res<BackendClient>, old: Option<Res<Search>>, mut commands: Commands) {
+fn new_search(backend: Res<HttpClient>, old: Option<Res<Search>>, mut commands: Commands) {
     if let Some(old) = old {
         backend.cancel(old.0); // answered with Cancelled; a late result is discarded
     }
@@ -512,13 +512,13 @@ app.add_plugins(MinimalPlugins)
     .insert_resource(HttpTransportRes::new(fake.clone()))
     .add_plugins(BackendPlugin::new(HttpConfig::new("https://api.example.com/v1")));
 
-let id = app.world().resource::<BackendClient>().get("/me");
+let id = app.world().resource::<HttpClient>().get("/me");
 app.update(); // PostUpdate: handed to the fake
 app.update(); // First: answered, readable in Update
 
 let (_, request) = fake.last_request().expect("a request");
 assert_eq!(request.uri.to_string(), "https://api.example.com/v1/me");
-let answers = app.world().resource::<Messages<BackendResponse>>();
+let answers = app.world().resource::<Messages<HttpResponse>>();
 let mut cursor = answers.get_cursor();
 let answer = cursor.read(answers).find(|a| a.id == id).expect("an answer");
 assert_eq!(answer.result.as_ref().map(|r| r.text()).ok(), Some(r#"{"name":"Ayla"}"#.to_string()));
@@ -531,7 +531,7 @@ assert_eq!(answer.result.as_ref().map(|r| r.text()).ok(), Some(r#"{"name":"Ayla"
   answer them with `Timeout`. `waiting()`, `requests()`, `last_request()`, `cancelled()`,
   `shutdown_count()` let tests assert what the game sent.
 - The crate's own tests use `bevy_headless_test`'s strict `TestApp` (ambiguity detection on every
-  main schedule); the plugin's systems are ordered, and `Res<BackendClient>` never conflicts.
+  main schedule); the plugin's systems are ordered, and `Res<HttpClient>` never conflicts.
 
 ### 9. Your own transport
 
@@ -545,7 +545,7 @@ implementation.
 ## How it works
 
 ```text
- game system ──Res<BackendClient>──▶ queue ─┐
+ game system ──Res<HttpClient>──▶ queue ─┐
                                             │ PostUpdate  BackendSystems::Send
                                             ▼   defaults + credentials + URL checks
                                      InFlight map ──submit──▶ HttpTransport (UreqTransport:
@@ -554,7 +554,7 @@ implementation.
                              poll ◀─────────┘   deadlines, status + body-limit rules
                                             │
                                             ▼
-                  BackendResponse / JsonResponse<T>  ──▶ PreUpdate / Update readers
+                  HttpResponse / JsonResponse<T>  ──▶ PreUpdate / Update readers
 ```
 
 - **One owner of every answer.** The plugin's `InFlight` map (ECS side) is the only thing that
@@ -601,16 +601,16 @@ Everything is re-exported at the crate root; `prelude` holds the everyday items.
 
 | Item | Kind | What it is |
 |---|---|---|
-| `BackendPlugin` | plugin | `new(config)`, `with_config`, `default()`. Inserts config, client, in-flight map, credentials, `BackendResponse`, and (feature `http`) a `UreqTransport` unless an `HttpTransportRes` exists. |
+| `BackendPlugin` | plugin | `new(config)`, `with_config`, `default()`. Inserts config, client, in-flight map, credentials, `HttpResponse`, and (feature `http`) a `UreqTransport` unless an `HttpTransportRes` exists. |
 | `BackendSystems` | system sets | `Receive` (`First`), `Send` (`PostUpdate`), `Exit` (`Last`, on `AppExit`). `#[non_exhaustive]`. |
 | `HttpConfig` | resource | base URL, timeout, default headers, workers, `allow_insecure_http`, body limit; `validate()`, getters, `set_base_url`, `set_timeout`. |
 | `ConfigError` | enum | `NoBaseUrl`, `BadBaseUrl`, `BadHeader`. |
-| `BackendClient` | resource | `send`, `request`, `get`, `cancel`; with `json`: `send_json`, `get_json`, `post_json`, `is_json_registered`. |
+| `HttpClient` | resource | `send`, `request`, `get`, `cancel`; with `json`: `send_json`, `get_json`, `post_json`, `is_json_registered`. |
 | `BackendAppExt` | trait on `App` | `add_json_response::<T>()` (feature `json`). |
 | `RequestId` | id | opaque, unique per process, `Copy + Eq + Hash + Ord + Display`. |
 | `OutgoingRequest` | request | constructors, `with_*` builders, accessors (`method`, `path`, `query`, `headers`, `body`, `timeout`, `purpose`, `uses_credentials`, `error`), `query_mut`, `headers_mut`, `set_body`, `reject`. |
 | `RequestPurpose` | enum | `Http` (and `WebSocketHandshake`, reserved). |
-| `BackendResponse` | message | `id`, `result: Result<RawResponse, BackendError>`. |
+| `HttpResponse` | message | `id`, `result: Result<RawResponse, BackendError>`. |
 | `JsonResponse<T>` | message | `id`, `result: Result<T, BackendError>` (feature `json`). |
 | `RawResponse` | struct | `status`, `headers`, `body`; `new`, `with_header`, `is_success`, `body()`, `text()`, `json()`. |
 | `BackendError` | enum | see [Reading answers and errors](#4-reading-answers-and-errors); `status()`, `response()`, `is_invalid_request()`. |
@@ -724,5 +724,3 @@ Issues and pull requests are welcome. Please run `cargo fmt`, `cargo clippy --al
 opening a pull request. Unless you explicitly state otherwise, any contribution intentionally
 submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual
 licensed as above, without any additional terms or conditions.
-#   b e v y _ n e t _ b a c k e n d  
- 
