@@ -10,7 +10,7 @@ env:
   RUSTFLAGS: -D warnings
   RUSTDOCFLAGS: -D warnings
 
-# Rust is pinned to our dev version (never @stable): a newer Rust's new clippy lints must not turn CI red on
+# Rust is pinned to the dev version (never @stable): a newer Rust's new clippy lints must not turn CI red on
 # unchanged code. Upgrading Rust = bump this in every job, run clippy, fix. Users are unaffected (rust-version).
 jobs:
   fmt:

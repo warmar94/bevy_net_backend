@@ -112,8 +112,9 @@ impl SftpOp {
             SftpOp::UploadBytes { remote, data } => {
                 check_remote(remote)?;
                 // The same answer as an over-limit `upload_file`: refused before anything is sent.
-                if u64::try_from(data.len()).unwrap_or(u64::MAX) > max_bytes {
-                    return Err(BackendError::BodyTooLarge { limit: max_bytes });
+                let size = u64::try_from(data.len()).unwrap_or(u64::MAX);
+                if size > max_bytes {
+                    return Err(BackendError::RequestTooLarge { limit: max_bytes, size });
                 }
                 Ok(())
             }
@@ -439,7 +440,7 @@ pub(super) mod ops {
                 })
                 .await?;
                 if total > max_bytes {
-                    return Err(too_large(max_bytes));
+                    return Err(BackendError::RequestTooLarge { limit: max_bytes, size: total });
                 }
                 report.started();
                 let bytes = upload(session, &remote, total, report, ChunkSource::File { file: Some(file), path: local }).await?;
@@ -598,10 +599,25 @@ pub(super) mod ops {
         let handle = session.open(remote, flags, FileAttributes::empty()).await.map_err(map_error)?.handle;
         let result = write_all(session, &handle, total, report, &mut source).await;
         let closed = session.close(handle).await.map_err(map_error);
-        let written = result?;
+        let written = check_written(result?, total)?;
         closed?;
         report.progress(written, Some(total));
         Ok(written)
+    }
+
+    /// A local file that shrank while it was read ends early: the remote file is incomplete, so
+    /// that is an error (bytes were written: `Ssh`, never `InvalidRequest`), not a short success.
+    pub(super) fn check_written(written: u64, total: u64) -> Result<u64, BackendError> {
+        if written == total {
+            Ok(written)
+        } else {
+            Err(changed_size())
+        }
+    }
+
+    /// The answer when the local file changed size during an upload (it grew or shrank).
+    pub(super) fn changed_size() -> BackendError {
+        BackendError::Ssh("the local file changed size during the upload; the remote file is incomplete".into())
     }
 
     /// Pipelined writes: up to `WRITE_WINDOW` in flight; the first failure stops the upload.
@@ -627,7 +643,8 @@ pub(super) mod ops {
                 let len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
                 if offset.saturating_add(len) > total {
                     // The local file grew while it was uploaded: stop at the size that was checked.
-                    return Err(BackendError::InvalidRequest("the local file changed size during the upload".into()));
+                    // Bytes were already written: not `InvalidRequest` (that would say "never sent").
+                    return Err(changed_size());
                 }
                 let (session, handle, at) = (std::sync::Arc::clone(session), handle.to_string(), offset);
                 in_flight.spawn(async move { session.write(handle, at, chunk).await.map(|_| len) });
@@ -737,6 +754,18 @@ pub(super) mod ops {
 #[cfg(test)]
 mod tests {
     use super::{safe_file_name, SftpEntry, SftpEntryKind};
+    use crate::response::BackendError;
+
+    #[test]
+    fn a_local_file_that_changed_size_is_an_honest_error_not_a_short_success() {
+        assert_eq!(super::ops::check_written(4096, 4096).ok(), Some(4096));
+        for (written, total) in [(1024, 4096), (0, 4096), (5000, 4096)] {
+            let error = super::ops::check_written(written, total).err();
+            assert!(matches!(&error, Some(BackendError::Ssh(why)) if why.contains("changed size")), "{error:?}");
+            // Bytes may have been written: never "not sent".
+            assert_eq!(error.and_then(|e| e.was_sent()), None);
+        }
+    }
 
     #[test]
     fn listed_names_that_are_not_one_plain_file_name_are_unsafe() {

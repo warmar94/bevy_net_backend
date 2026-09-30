@@ -285,6 +285,10 @@ impl Credentials for JsonBodyField {
         if request.purpose() != crate::RequestPurpose::Http {
             return;
         }
+        if request.is_multipart() {
+            request.reject("JsonBodyField cannot authenticate a multipart upload (its body is a form, not JSON); use a header credential (BearerToken, ApiKeyHeader) or add the field to the form yourself");
+            return;
+        }
         let Some(body) = request.body() else { return };
         let Ok(serde_json::Value::Object(mut object)) = serde_json::from_slice::<serde_json::Value>(body) else {
             return;

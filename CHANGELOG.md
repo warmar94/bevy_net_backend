@@ -50,7 +50,7 @@ change or a Bevy / key dependency bump).
 - WebSocket reconnect policy: TLS / certificate errors are permanent by default
   (`WsReconnect::with_tls_retry(true)` to retry them).
 - WebSocket I/O deadlines: one deadline for TCP + TLS + handshake, a read budget per loop turn,
-  dead-peer detection that does not count time blocked on our own writes.
+  dead-peer detection that does not count time blocked on the client's own writes.
 - Examples `chat_client` and `mock_ws_server` (features `ws`, `json`).
 - Feature `ssh` (admin / dev builds only): named SSH connections that run commands. `SshClient`
   (`connect(name, SshTarget)`, `disconnect`, `run`, `cancel`), `SshTarget` (host, port, user,
@@ -73,7 +73,7 @@ change or a Bevy / key dependency bump).
 - Feature `ssh-rsa`: RSA host keys and RSA key files (the `rsa` crate carries RUSTSEC-2023-0071).
 - `BackendError::HostKey { host, fingerprint, problem }` (`HostKeyProblem`), `AuthFailed` and
   `Ssh`, and `BackendError::host_key(..)` for fakes; `BodyTooLarge` also covers SSH output and SFTP
-  transfers.
+  downloads.
 - `RequestKind::Ssh` and `RequestKind::Sftp`: SSH requests appear in `InFlight`, and the one shared
   `cancel` works for HTTP, WebSocket and SSH requests alike.
 - Examples `ssh_console` and `mock_ssh_server` (feature `ssh`; SFTP with `sftp`).
@@ -88,5 +88,19 @@ change or a Bevy / key dependency bump).
 - ssh_config `Include` is expanded by the crate with limits (depth 16, 64 files, 1 MiB).
 - `SftpEntry::safe_file_name()`; listed names are documented as untrusted and capped.
 - CI: a RustSec advisory check (cargo-deny) on pull requests, pushes and weekly.
+- `multipart/form-data` uploads (part of `http`, no new dependency): `Multipart` (`text`, `file`,
+  repeated names, `with_max_bytes` default 32 MiB, `with_max_parts` default 256), a fresh random
+  boundary per request checked against the content, browser-style escaping of names;
+  `HttpClient::post_multipart`, `send_multipart`, `post_multipart_json::<T>` (json),
+  `OutgoingRequest::with_multipart` / `is_multipart` (cleared again when `with_json`, `with_body`
+  or `set_body` replaces the form). `JsonBodyField` refuses a multipart request. Refused before
+  sending (`InvalidRequest`): a field name or file name that ends with a backslash (real servers
+  drop such a part or turn the file into a text field) or contains a control character other
+  than CR / LF.
+- `BackendError::RequestTooLarge { limit, size }` (`was_sent() == Some(false)`, and
+  `BackendError::request_too_large(..)`): a request refused before sending because it is too big
+  (multipart forms, WebSocket requests over the message limit, SSH command lines over 64 KiB, SFTP
+  uploads over the transfer limit). `BodyTooLarge` is always the answer being too big.
+- Example `upload`; the mock server's `POST /upload` parses multipart and echoes what it received.
 - Features: `http` and `json` (default), `gzip`, `ws`, `ssh`, `sftp`, `ssh-rsa`. No tokio unless
   `ssh` is enabled.

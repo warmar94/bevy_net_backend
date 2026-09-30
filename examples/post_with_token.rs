@@ -62,7 +62,7 @@ struct ApiError {
     errors: BTreeMap<String, Vec<String>>,
 }
 
-/// Which step we are at, and the id we wait for.
+/// The current step, and the id being waited for.
 #[derive(Resource)]
 enum Step {
     SaveWithoutLogin(RequestId),

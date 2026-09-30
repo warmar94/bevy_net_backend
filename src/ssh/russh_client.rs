@@ -552,7 +552,7 @@ fn terrapin_refusal(strict_kex: bool, cipher: &str, macs: [&str; 2]) -> Option<B
 const CIPHERS: &[russh::cipher::Name] =
     &[russh::cipher::AES_256_GCM, russh::cipher::CHACHA20_POLY1305, russh::cipher::AES_256_CTR, russh::cipher::AES_192_CTR, russh::cipher::AES_128_CTR];
 
-/// russh's client settings for a target: our keepalive, no inactivity timeout, Nagle off, AES-GCM
+/// russh's client settings for a target: the crate's keepalive, no inactivity timeout, Nagle off, AES-GCM
 /// first, and host key algorithms without SHA-1 RSA (and without RSA at all unless `ssh-rsa`),
 /// the types already in known_hosts for this host first (as OpenSSH does).
 fn client_config(target: &SshTarget, known_types: &[Algorithm]) -> client::Config {

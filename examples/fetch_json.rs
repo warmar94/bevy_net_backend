@@ -32,7 +32,7 @@ struct Character {
     level: u32,
 }
 
-/// The id of the request we wait for.
+/// The id of the request being waited for.
 #[derive(Resource)]
 struct Waiting(RequestId);
 

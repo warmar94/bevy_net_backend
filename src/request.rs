@@ -86,6 +86,7 @@ pub struct OutgoingRequest {
     timeout: Option<Duration>,
     purpose: RequestPurpose,
     credentials: bool,
+    multipart: bool,
     error: Option<BackendError>,
 }
 
@@ -102,6 +103,7 @@ impl fmt::Debug for OutgoingRequest {
             .field("timeout", &self.timeout)
             .field("purpose", &self.purpose)
             .field("credentials", &self.credentials)
+            .field("multipart", &self.multipart)
             .finish_non_exhaustive()
     }
 }
@@ -120,6 +122,7 @@ impl OutgoingRequest {
             timeout: None,
             purpose: RequestPurpose::Http,
             credentials: true,
+            multipart: false,
             error: None,
         }
     }
@@ -169,9 +172,11 @@ impl OutgoingRequest {
         self
     }
 
-    /// Set the body (bytes, sent as they are; set a `Content-Type` header to match).
+    /// Set the body (bytes, sent as they are; set a `Content-Type` header to match). It replaces a
+    /// form set with `with_multipart`: [`is_multipart`](Self::is_multipart) is `false` again.
     pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Self {
         self.body = Some(body.into());
+        self.multipart = false;
         self
     }
 
@@ -184,6 +189,7 @@ impl OutgoingRequest {
         match serde_json::to_vec(value) {
             Ok(body) => {
                 self.body = Some(body);
+                self.multipart = false;
                 self.headers.insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
             }
             Err(e) => {
@@ -193,6 +199,38 @@ impl OutgoingRequest {
             }
         }
         self
+    }
+
+    /// Encode `form` as the `multipart/form-data` body and set its `Content-Type` (with the
+    /// boundary). An invalid or too large form does not panic: the request is answered with the
+    /// error (`InvalidRequest`, `RequestTooLarge`) and never sent. Large uploads may need a longer
+    /// [`with_timeout`](Self::with_timeout).
+    #[cfg(feature = "http")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http")))]
+    pub fn with_multipart(mut self, form: &crate::Multipart) -> Self {
+        match form.encode() {
+            Ok((content_type, body)) => match HeaderValue::try_from(content_type) {
+                Ok(value) => {
+                    self.body = Some(body);
+                    self.multipart = true;
+                    self.headers.insert(http::header::CONTENT_TYPE, value);
+                }
+                Err(_) => self.reject("the multipart content type is not a valid header value"),
+            },
+            Err(error) => {
+                if self.error.is_none() {
+                    self.error = Some(error);
+                }
+            }
+        }
+        self
+    }
+
+    /// Whether the body is a form from `with_multipart` (feature `http`), for
+    /// [`Credentials`](crate::Credentials) that must not touch such a body. A later `with_body`,
+    /// `with_json` or `set_body` replaces the form and clears this.
+    pub fn is_multipart(&self) -> bool {
+        self.multipart
     }
 
     /// This request's own timeout, instead of the config's (clamped like
@@ -253,9 +291,11 @@ impl OutgoingRequest {
         self.body.as_deref()
     }
 
-    /// Replace the body.
+    /// Replace the body (no longer a multipart form afterwards: [`is_multipart`](Self::is_multipart)
+    /// is `false`).
     pub fn set_body(&mut self, body: Option<Vec<u8>>) {
         self.body = body;
+        self.multipart = false;
     }
 
     /// The request's own timeout, if set.

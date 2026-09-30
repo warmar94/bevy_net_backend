@@ -6,7 +6,8 @@
 //! [`BackendError`]: network, TLS, timeout, an HTTP status with the server's body, a decode
 //! error, cancelled, or shutdown on `AppExit`. Nothing is ever dropped silently.
 //!
-//! Features: `http` (the real transport: ureq on a few worker threads, rustls with ring), `json`
+//! Features: `http` (the real transport: ureq on a few worker threads, rustls with ring, and
+//! `multipart/form-data` uploads with `Multipart`), `json`
 //! (typed requests), `gzip`, `ws` (named WebSocket connections: `WsClient` and friends), `ssh`
 //! (named SSH connections that run commands, ADMIN / DEV builds only: `SshClient`), `sftp` (file
 //! operations on them), `ssh-rsa` (RSA keys for SSH). Default: `http`, `json`. No tokio unless you
@@ -55,6 +56,8 @@ mod client;
 mod config;
 mod credentials;
 mod inflight;
+#[cfg(feature = "http")]
+mod multipart;
 mod request;
 mod response;
 #[cfg(feature = "ssh")]
@@ -82,6 +85,8 @@ pub use credentials::{ApiKeyHeader, ApiKeyQuery, BackendCredentials, BearerToken
 /// `HeaderMap`, `HeaderName`, `HeaderValue`, `Uri`.
 pub use http;
 pub use inflight::{InFlight, RequestInfo, RequestKind, DEADLINE_GRACE};
+#[cfg(feature = "http")]
+pub use multipart::{Multipart, DEFAULT_MULTIPART_MAX_BYTES, DEFAULT_MULTIPART_MAX_PARTS};
 pub use request::{OutgoingRequest, PreparedRequest, RequestId, RequestPurpose};
 #[cfg(feature = "json")]
 pub use response::JsonResponse;
@@ -112,6 +117,8 @@ pub use ws::{JsonEnvelope, WsPush, WsPushMessage, WsRequest, WsResponse};
 pub mod prelude {
     #[cfg(feature = "json")]
     pub use crate::JsonResponse;
+    #[cfg(feature = "http")]
+    pub use crate::Multipart;
     pub use crate::{
         BackendAppExt, BackendCredentials, BackendError, BackendPlugin, BackendSystems, BearerToken, HttpClient, HttpConfig, HttpResponse, InFlight,
         OutgoingRequest, RequestId,

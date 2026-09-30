@@ -1,4 +1,4 @@
-//! Our own strict known_hosts check (russh's helper is too weak: single-space splitting, exact
+//! The crate's own strict known_hosts check (russh's helper is too weak: single-space splitting, exact
 //! host match only, no `@revoked`, TOFU writes). Read-only; built on `ssh_key`'s key parser.
 //!
 //! Rules (OpenSSH's): host patterns with `*`, `?` and `!` negation (a matching negated pattern
@@ -15,7 +15,7 @@ use sha1::Sha1;
 
 use crate::response::{BackendError, HostKeyProblem};
 
-/// The largest known_hosts file read (OpenSSH has no limit; ours keeps memory bounded).
+/// The largest known_hosts file read (OpenSSH has no limit; this one keeps memory bounded).
 pub(crate) const MAX_KNOWN_HOSTS_BYTES: u64 = 4 * 1024 * 1024;
 /// Lines longer than this are skipped (no key is that long; RSA 16384 is about 2.8 KB).
 const MAX_LINE: usize = 16 * 1024;

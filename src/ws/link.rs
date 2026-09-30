@@ -285,7 +285,7 @@ fn is_no_data(error: &io::Error) -> bool {
     matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
 }
 
-/// tungstenite's error in our kinds, with its own words.
+/// tungstenite's error in the crate's kinds, with its own words.
 fn map_error(error: tungstenite::Error) -> BackendError {
     match error {
         tungstenite::Error::Http(response) => {
@@ -422,10 +422,10 @@ fn session(handshake: &WsHandshake, commands: &Receiver<Command>, sink: &EventSi
     let write_limit = write_limit(handshake);
     let mut last_ping = Instant::now();
     // The last sign of life from the server: a received message, or (below the protocol) a byte.
-    // Time spent blocked in our own writes is not counted against it.
+    // Time spent blocked in the link's own writes is not counted against it.
     let mut alive = Instant::now();
     let mut closing: Option<Instant> = None;
-    // Set when WE close because of an error (1008 / 1009): the link reports it after the close
+    // Set when the CLIENT closes because of an error (1008 / 1009): the link reports it after the close
     // handshake had its chance to reach the server.
     let mut failure: Option<BackendError> = None;
     let mut close_code: Option<u16> = None;
@@ -480,7 +480,7 @@ fn session(handshake: &WsHandshake, commands: &Receiver<Command>, sink: &EventSi
             Err(_) if closing.is_some() => return finish(failure, close_code, close_reason),
             Err(e) => return WsLinkEvent::Failed(write_failed(e)),
         }
-        // Time blocked on our own writes does not count as the server's silence.
+        // Time blocked on the link's own writes does not count as the server's silence.
         let blocked = before_writes.elapsed();
         if blocked > handshake.read_timeout {
             alive = alive.checked_add(blocked).map_or_else(Instant::now, |a| a.min(Instant::now()));
@@ -504,7 +504,7 @@ fn session(handshake: &WsHandshake, commands: &Receiver<Command>, sink: &EventSi
                     }
                     _ => None,
                 };
-                // After we closed because of an error, frames are discarded.
+                // After the client closed because of an error, frames are discarded.
                 if let (Some(frame), None) = (frame, &failure) {
                     let len = frame.len();
                     if sink.queued_bytes.load(Ordering::SeqCst).saturating_add(len) > budget {
@@ -553,7 +553,7 @@ fn session(handshake: &WsHandshake, commands: &Receiver<Command>, sink: &EventSi
 }
 
 /// Read and discard what the server still sends, straight from the stream under tungstenite, for
-/// up to 1 s or until it closes (so our close frame is not overtaken by a TCP reset).
+/// up to 1 s or until it closes (so the client's close frame is not overtaken by a TCP reset).
 fn drain_below(ws: &mut WebSocket<Stream>) {
     let until = deadline_after(Duration::from_secs(1));
     let stream = ws.get_mut();

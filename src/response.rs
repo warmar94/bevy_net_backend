@@ -106,10 +106,11 @@ pub enum BackendError {
     /// means it was still waiting for a free worker and never went out; otherwise it may or may
     /// not have reached the server.
     Timeout(String),
-    /// The answer was bigger than its limit: an HTTP response body
+    /// The ANSWER was bigger than its limit: an HTTP response body
     /// ([`HttpConfig::with_max_body_bytes`](crate::HttpConfig::with_max_body_bytes)), an SSH
-    /// command's output (stdout + stderr) or an SFTP transfer (feature `ssh`: `SshTarget` /
-    /// `SshCommand` limits). For SSH the command was stopped (its channel closed) at the limit.
+    /// command's output (stdout + stderr) or an SFTP download (feature `ssh`: `SshTarget` /
+    /// `SshCommand` limits). The request went out. For SSH the command was stopped (its channel
+    /// closed) at the limit. A request that is itself too big is [`RequestTooLarge`](Self::RequestTooLarge).
     #[non_exhaustive]
     BodyTooLarge {
         /// The limit in bytes.
@@ -158,6 +159,16 @@ pub enum BackendError {
         code: u16,
         /// The close reason (may be empty).
         reason: String,
+    },
+    /// The REQUEST was bigger than its limit and was refused before anything was sent: a
+    /// multipart upload over `Multipart::with_max_bytes` (feature `http`), a WebSocket request over
+    /// the message limit, an SSH command line over 64 KiB, an SFTP upload over the transfer limit.
+    #[non_exhaustive]
+    RequestTooLarge {
+        /// The limit in bytes.
+        limit: u64,
+        /// The request's size in bytes.
+        size: u64,
     },
     /// The server answered a WebSocket request with an error. The payload is kept as bytes with
     /// `text()` / `json()` helpers; `Debug` and `Display` never show it.
@@ -263,21 +274,20 @@ impl BackendError {
     }
 
     /// Whether the request never left the machine because it was invalid (invalid request,
-    /// insecure http, encode error).
+    /// insecure http, encode error, request too large).
     pub fn is_invalid_request(&self) -> bool {
-        matches!(self, BackendError::InvalidRequest(_) | BackendError::InsecureHttp { .. } | BackendError::Encode(_))
+        matches!(self, BackendError::InvalidRequest(_) | BackendError::InsecureHttp { .. } | BackendError::Encode(_) | BackendError::RequestTooLarge { .. })
     }
 
     /// What this answer says about whether the request reached the network: `Some(false)` never
-    /// sent (invalid, a `Timeout` whose text starts with `not sent:`, a `Disconnected` with
+    /// sent (invalid, `RequestTooLarge`, a `Timeout` whose text starts with `not sent:`, a `Disconnected` with
     /// `sent: Some(false)`, an SSH `HostKey` / `AuthFailed`), `Some(true)` the server answered (`Status`, `Decode`,
     /// `BodyTooLarge`, `Rejected`) or it went out before a loss (`Disconnected` with
-    /// `sent: Some(true)`), `None` unknown ("maybe"). Exception: an SFTP upload over its transfer
-    /// limit is `BodyTooLarge` but was refused before anything was sent (`SftpFinished::started`
-    /// says `Some(false)`).
+    /// `sent: Some(true)`), `None` unknown ("maybe"). `RequestTooLarge` is `Some(false)`,
+    /// `BodyTooLarge` (the answer was too big) `Some(true)`.
     pub fn was_sent(&self) -> Option<bool> {
         match self {
-            BackendError::InvalidRequest(_) | BackendError::InsecureHttp { .. } | BackendError::Encode(_) => Some(false),
+            BackendError::InvalidRequest(_) | BackendError::InsecureHttp { .. } | BackendError::Encode(_) | BackendError::RequestTooLarge { .. } => Some(false),
             BackendError::HostKey { .. } | BackendError::AuthFailed(_) => Some(false),
             BackendError::Timeout(why) if why.starts_with("not sent:") => Some(false),
             BackendError::Disconnected { sent, .. } => *sent,
@@ -299,6 +309,11 @@ impl BackendError {
         BackendError::HostKey { host: host.into(), fingerprint: fingerprint.into(), problem }
     }
 
+    /// A [`RequestTooLarge`](Self::RequestTooLarge) error (for custom transports and tests).
+    pub fn request_too_large(limit: u64, size: u64) -> Self {
+        BackendError::RequestTooLarge { limit, size }
+    }
+
     #[cfg(any(feature = "ws", feature = "ssh"))]
     pub(crate) fn disconnected(reason: impl Into<String>, sent: Option<bool>) -> Self {
         BackendError::Disconnected { reason: reason.into(), sent }
@@ -315,6 +330,7 @@ impl fmt::Debug for BackendError {
             BackendError::Tls(why) => f.debug_tuple("Tls").field(why).finish(),
             BackendError::Timeout(why) => f.debug_tuple("Timeout").field(why).finish(),
             BackendError::BodyTooLarge { limit } => f.debug_struct("BodyTooLarge").field("limit", limit).finish(),
+            BackendError::RequestTooLarge { limit, size } => f.debug_struct("RequestTooLarge").field("limit", limit).field("size", size).finish(),
             BackendError::Status(response) => f.debug_tuple("Status").field(response).finish(),
             BackendError::Decode { message, response } => f.debug_struct("Decode").field("message_len", &message.len()).field("response", response).finish(),
             BackendError::Cancelled => f.write_str("Cancelled"),
@@ -344,6 +360,7 @@ impl fmt::Display for BackendError {
             BackendError::Tls(why) => write!(f, "TLS error: {why}"),
             BackendError::Timeout(why) => write!(f, "timed out ({why})"),
             BackendError::BodyTooLarge { limit } => write!(f, "the answer is larger than the limit of {limit} bytes"),
+            BackendError::RequestTooLarge { limit, size } => write!(f, "the request ({size} bytes) is larger than the limit of {limit} bytes; not sent"),
             BackendError::Status(response) => write!(f, "HTTP status {}", response.status),
             // serde_json's message can quote the body: it stays in the field, out of Display.
             BackendError::Decode { response, .. } => write!(f, "the answer (HTTP {}) is not the expected JSON", response.status),

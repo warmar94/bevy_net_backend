@@ -468,6 +468,22 @@ fn a_cancel_nobody_owns_is_dropped_without_side_effects() {
 }
 
 #[test]
+fn a_request_over_the_message_limit_is_request_too_large_and_never_sent() {
+    let fake = FakeWsTransport::new();
+    let mut app = app(&fake);
+    ws(&app).connect("main", settings().with_max_message_bytes(1024));
+    app.step_n(2);
+    let link = fake.last_link().unwrap_or_else(|| panic!("no link"));
+    let payload = format!("\"{}\"", "x".repeat(2000));
+    let id = ws(&app).request_raw("main", WsOutgoing::new("echo", payload.into_bytes()));
+    app.step_n(2);
+    let error = one_error(&app, id);
+    assert!(matches!(error, BackendError::RequestTooLarge { limit: 1024, size, .. } if size > 2000), "{error:?}");
+    assert_eq!(error.was_sent(), Some(false));
+    assert!(fake.sent(link).is_empty());
+}
+
+#[test]
 fn requests_can_wait_for_the_auth_acknowledgement() {
     struct FirstMessage;
     impl Credentials for FirstMessage {
@@ -697,7 +713,7 @@ fn oversize_frames_and_requests_are_refused() {
     let big = ws(&app).request_raw("main", WsOutgoing::new("echo", format!("\"{}\"", "x".repeat(2000)).into_bytes()));
     app.step_n(2);
     assert!(fake.sent(link).is_empty());
-    assert!(matches!(one_error(&app, big), BackendError::InvalidRequest(_)));
+    assert!(matches!(one_error(&app, big), BackendError::RequestTooLarge { limit: 1024, .. }));
 }
 
 #[test]

@@ -425,7 +425,13 @@ fn deliver(mut answers: Vec<Answer>, limit: u64, raw: &mut MessageWriter<HttpRes
         });
         match &result {
             Ok(response) => tracing::debug!(">>> NET-BACKEND: {id} -> {}", response.status),
-            Err(error @ (BackendError::InvalidRequest(_) | BackendError::InsecureHttp { .. } | BackendError::Encode(_) | BackendError::NoTransport)) => {
+            Err(
+                error @ (BackendError::InvalidRequest(_)
+                | BackendError::InsecureHttp { .. }
+                | BackendError::Encode(_)
+                | BackendError::RequestTooLarge { .. }
+                | BackendError::NoTransport),
+            ) => {
                 tracing::warn!(">>> NET-BACKEND: {id} not sent: {error}")
             }
             Err(error) => tracing::debug!(">>> NET-BACKEND: {id} -> {error}"),

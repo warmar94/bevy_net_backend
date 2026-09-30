@@ -208,7 +208,8 @@ fn send_request(transport: &mut WsTransportRes, link: WsLinkId, conn: &mut Conn,
     match protocol.encode_request(request.id.wire(), &request.kind, &request.payload) {
         Ok(frame) if frame.len() > conn.settings.max_message_bytes => {
             let request = conn.requests.remove(index);
-            ready.push((request.id, name.clone(), request.route, Err(BackendError::InvalidRequest("the request is larger than the message limit".into()))));
+            let (limit, size) = (u64::try_from(conn.settings.max_message_bytes).unwrap_or(u64::MAX), u64::try_from(frame.len()).unwrap_or(u64::MAX));
+            ready.push((request.id, name.clone(), request.route, Err(BackendError::RequestTooLarge { limit, size })));
         }
         Ok(frame) => {
             request.sent = true;

@@ -808,7 +808,7 @@ impl SshCommand {
             return Err(BackendError::InvalidRequest("the SSH command contains a NUL byte".into()));
         }
         if self.command.len() > MAX_SSH_COMMAND_BYTES {
-            return Err(BackendError::InvalidRequest(format!("the SSH command is longer than {MAX_SSH_COMMAND_BYTES} bytes")));
+            return Err(BackendError::RequestTooLarge { limit: MAX_SSH_COMMAND_BYTES as u64, size: u64::try_from(self.command.len()).unwrap_or(u64::MAX) });
         }
         Ok(())
     }
@@ -953,7 +953,8 @@ pub struct SshFinished {
     /// came (it may have started).
     pub started: Option<bool>,
     /// The exit status, or the error: `Timeout`, `Cancelled`, `Shutdown`, `Disconnected`,
-    /// `BodyTooLarge` (output limit), `InvalidRequest`, `Ssh`, …
+    /// `BodyTooLarge` (output limit), `RequestTooLarge` (a command line over 64 KiB),
+    /// `InvalidRequest`, `Ssh`, …
     pub result: Result<SshExit, BackendError>,
 }
 
@@ -1108,8 +1109,9 @@ impl SshClient {
     /// Run a command on the connection `name` (it waits while the connection is still
     /// connecting). Output arrives as [`SshOutput`], then exactly one [`SshFinished`]: the exit
     /// status (a non-zero status is still `Ok`), or `Timeout`, `Cancelled`, `Shutdown`,
-    /// `Disconnected`, `BodyTooLarge`, `InvalidRequest` (unknown connection, bad command, SSH
-    /// disabled in a release build), …
+    /// `Disconnected`, `BodyTooLarge` (output limit), `RequestTooLarge` (a command line over
+    /// 64 KiB), `InvalidRequest` (unknown connection, bad command, SSH disabled in a release
+    /// build), …
     pub fn run(&self, name: impl Into<SshName>, command: impl Into<SshCommand>) -> RequestId {
         let id = RequestId::next();
         self.lock().push(SshQueued::Run { name: name.into(), id, command: command.into() });

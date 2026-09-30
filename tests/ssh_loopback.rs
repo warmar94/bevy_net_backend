@@ -645,13 +645,13 @@ mod sftp {
         // refused before anything is sent.
         let id = ssh(&app).upload("main", "too-big.bin", vec![0u8; 100_000]);
         let answer = op(&mut app, id);
-        assert!(matches!(answer.result, Err(BackendError::BodyTooLarge { limit: 65_536, .. })), "{:?}", answer.result);
+        assert!(matches!(answer.result, Err(BackendError::RequestTooLarge { limit: 65_536, size: 100_000, .. })), "{:?}", answer.result);
         assert_eq!(answer.started, Some(false));
         let big_local = setup.dir.join("too-big-local.bin");
         std::fs::write(&big_local, vec![0u8; 100_000]).unwrap_or_else(|e| panic!("{e}"));
         let id = ssh(&app).upload_file("main", &big_local, "too-big-file.bin");
         let answer = op(&mut app, id);
-        assert!(matches!(answer.result, Err(BackendError::BodyTooLarge { limit: 65_536, .. })), "{:?}", answer.result);
+        assert!(matches!(answer.result, Err(BackendError::RequestTooLarge { limit: 65_536, size: 100_000, .. })), "{:?}", answer.result);
         assert_eq!(answer.started, Some(false));
         assert_eq!(setup.mock.file("too-big.bin"), None);
         assert_eq!(setup.mock.file("too-big-file.bin"), None);

@@ -1,6 +1,6 @@
 //! [`UreqTransport`] (feature `http`): ureq 3 on a fixed pool of std worker threads.
 //!
-//! ureq is blocking, so requests run on our own threads (named `net-backend-N`), never on Bevy's
+//! ureq is blocking, so requests run on the crate's own threads (named `net-backend-N`), never on Bevy's
 //! task pools. The threads start on the first request, share one `ureq::Agent` (one connection
 //! pool, keep-alive) and hand `(id, result)` back over a channel that `poll` drains without
 //! blocking. The plugin owns every answer; a worker's late result is simply discarded there.
@@ -308,7 +308,7 @@ fn run<B: AsSendBody>(
     Ok(RawResponse { status: parts.status, headers: parts.headers, body: bytes })
 }
 
-/// ureq's error in our kinds, with ureq's own words.
+/// ureq's error in the crate's kinds, with ureq's own words.
 fn map_error(error: ureq::Error, limit: u64) -> BackendError {
     match error {
         // `timed out (global limit)`, `timed out (connect limit)`, …

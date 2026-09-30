@@ -15,6 +15,13 @@ pub(crate) fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
+/// Fill `bytes` from the operating system's secure random source, through the same ring provider
+/// (no extra dependency): for multipart boundaries.
+#[cfg(feature = "http")]
+pub(crate) fn random_bytes(bytes: &mut [u8]) -> Result<(), ()> {
+    rustls::crypto::ring::default_provider().secure_random.fill(bytes).map_err(|_| ())
+}
+
 /// The rustls client config for `wss://` (feature `ws`): ring, TLS 1.2 + 1.3, Mozilla's roots
 /// (webpki-roots, the same list ureq uses for `https://`).
 #[cfg(feature = "ws")]

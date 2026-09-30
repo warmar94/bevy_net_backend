@@ -114,6 +114,23 @@ impl HttpClient {
         self.send(OutgoingRequest::get(path))
     }
 
+    /// Upload `form` as `multipart/form-data` with `POST path`; the answer is a
+    /// [`HttpResponse`](crate::HttpResponse). See [`Multipart`](crate::Multipart) (feature `http`).
+    #[cfg(feature = "http")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http")))]
+    pub fn post_multipart(&self, path: &str, form: &crate::Multipart) -> RequestId {
+        self.send(OutgoingRequest::post(path).with_multipart(form))
+    }
+
+    /// Upload `form` with any method (`PUT`, `PATCH`, …); the answer is a
+    /// [`HttpResponse`](crate::HttpResponse). For more control (headers, query, timeout) use
+    /// [`OutgoingRequest::with_multipart`] and [`send`](Self::send).
+    #[cfg(feature = "http")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http")))]
+    pub fn send_multipart(&self, method: Method, path: &str, form: &crate::Multipart) -> RequestId {
+        self.send(OutgoingRequest::new(method, path).with_multipart(form))
+    }
+
     /// Cancel a request, HTTP or WebSocket alike (one shared path; `WsClient::cancel` is the same
     /// call). If it is still waiting, it is answered with [`BackendError::Cancelled`](crate::BackendError::Cancelled) in the next
     /// frame's `First` and nothing else is delivered for it (a request already on the wire may
@@ -163,6 +180,14 @@ impl HttpClient {
     #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
     pub fn post_json<T: serde::de::DeserializeOwned + Send + Sync + 'static>(&self, path: &str, body: &(impl serde::Serialize + ?Sized)) -> RequestId {
         self.send_json::<T>(OutgoingRequest::post(path).with_json(body))
+    }
+
+    /// Upload `form` with `POST path` and decode the answer as JSON `T` (see
+    /// [`send_json`](Self::send_json) and [`Multipart`](crate::Multipart)).
+    #[cfg(all(feature = "http", feature = "json"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "http", feature = "json"))))]
+    pub fn post_multipart_json<T: serde::de::DeserializeOwned + Send + Sync + 'static>(&self, path: &str, form: &crate::Multipart) -> RequestId {
+        self.send_json::<T>(OutgoingRequest::post(path).with_multipart(form))
     }
 
     /// Whether `JsonResponse<T>` is registered.

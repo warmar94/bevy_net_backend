@@ -386,3 +386,15 @@ fn each_protocol_replaces_only_its_own_in_flight_rows() {
     inflight.set_rows(Protocol::WebSocket, []);
     assert!(inflight.is_empty());
 }
+
+#[test]
+fn request_too_large_and_body_too_large_say_different_things_about_sending() {
+    let request = BackendError::request_too_large(1024, 5000);
+    assert_eq!(request.was_sent(), Some(false), "a refused request never left the machine");
+    assert!(request.is_invalid_request());
+    assert_eq!(request.to_string(), "the request (5000 bytes) is larger than the limit of 1024 bytes; not sent");
+    assert_eq!(format!("{request:?}"), "RequestTooLarge { limit: 1024, size: 5000 }");
+    let answer = BackendError::BodyTooLarge { limit: 1024 };
+    assert_eq!(answer.was_sent(), Some(true), "the server answered: the request went out");
+    assert!(!answer.is_invalid_request());
+}

@@ -1,24 +1,41 @@
-# bevy_net_backend
+<p align="center">
+  <img src="https://raw.githubusercontent.com/warmar94/bevy_net_backend/main/bevy_net_backend-cover.png"
+       alt="bevy_net_backend: HTTP, WebSocket and SSH/SFTP for Bevy" width="100%">
+</p>
 
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![CI](https://github.com/warmar94/bevy_net_backend/actions/workflows/ci.yml/badge.svg)](https://github.com/warmar94/bevy_net_backend/actions/workflows/ci.yml)
-[![Bevy 0.19.0](https://img.shields.io/badge/Bevy-0.19.0-informational)](https://bevyengine.org)
-[![ureq 3.4.2](https://img.shields.io/badge/ureq-3.4.2-orange)](https://crates.io/crates/ureq)
-[![tungstenite 0.30.0 (optional)](https://img.shields.io/badge/tungstenite-0.30.0%20(optional)-orange)](https://crates.io/crates/tungstenite)
-[![russh 0.63.3 (optional)](https://img.shields.io/badge/russh-0.63.3%20(optional)-orange)](https://crates.io/crates/russh)
+<p align="center">
+  <a href="#license"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg"></a>
+  <a href="https://github.com/warmar94/bevy_net_backend/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/warmar94/bevy_net_backend/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://bevyengine.org"><img alt="Bevy 0.19.0" src="https://img.shields.io/badge/Bevy-0.19.0-informational"></a>
+  <a href="https://crates.io/crates/ureq"><img alt="ureq 3.4.2" src="https://img.shields.io/badge/ureq-3.4.2-orange"></a>
+  <a href="https://crates.io/crates/tungstenite"><img alt="tungstenite 0.30.0 (optional)" src="https://img.shields.io/badge/tungstenite-0.30.0%20(optional)-orange"></a>
+  <a href="https://crates.io/crates/russh"><img alt="russh 0.63.3 (optional)" src="https://img.shields.io/badge/russh-0.63.3%20(optional)-orange"></a>
+</p>
 
-Call **your game's own HTTPS JSON API** from [Bevy](https://bevyengine.org): accounts, save
-games, leaderboards, inventories, matchmaking tickets, whatever your Laravel, Express, Go or
-Django backend serves. With feature `ws`, also **named WebSocket connections** to it: live
-chat, lobbies, match events and server pushes, with reconnect and heartbeat built in. With feature
-`ssh`, for **admin and developer tools only**, named SSH connections that run commands on your
-servers (and, with `sftp`, move files).
+<p align="center"><b>HTTP, WebSocket and SSH/SFTP for Bevy</b>: fire a request from a system, get exactly one typed answer back as a Bevy message.</p>
 
-A system fires a request and gets a `RequestId` back at once. A few frames later **exactly one
-answer** arrives as a Bevy message: the decoded value, or an error that says what happened
-(network, TLS, timeout, an HTTP status with the server's body, a decode error, cancelled, or
-shutdown when the app exits). The network never blocks a frame, nothing is dropped silently,
-nothing panics.
+---
+
+## What it is
+
+`bevy_net_backend` connects a [Bevy](https://bevyengine.org) game to **its own backend**: the
+servers behind accounts and logins, cloud saves, leaderboards, shops and inventories, friends
+lists, chat, matchmaking and the other MMO-style services a game runs itself. It also lets admin
+and developer tools reach those servers.
+
+Three parts share one pattern: **a system fires a request and gets a `RequestId` back at once; a
+few frames later exactly one typed answer arrives as a Bevy message.**
+
+- **HTTP** (default): calls to your HTTPS JSON API (Laravel, Express, Go, Django, FastAPI,
+  ASP.NET, …) with your serde types, and file uploads as `multipart/form-data`.
+- **WebSocket** (feature `ws`): named long-lived connections for chat, lobbies, match events and
+  server pushes, with reconnect and heartbeat built in.
+- **SSH and SFTP** (features `ssh`, `sftp`), **for admin and developer tools only**: run commands on
+  your servers and move files. Release builds refuse it unless the tool opts in.
+
+The answer is the decoded value or an error that says what happened (network, TLS, timeout, an
+HTTP status with the server's body, a decode error, cancelled, or shutdown when the app exits).
+The network never blocks a frame, nothing is dropped silently, and bad input never panics.
 
 ```rust,no_run
 use bevy::prelude::*;
@@ -52,8 +69,11 @@ fn main() {
 
 ## Contents
 
-- [Highlights](#highlights)
-- [Cargo features](#cargo-features)
+- [What it is](#what-it-is)
+- [Features at a glance](#features-at-a-glance)
+- [What it guarantees](#what-it-guarantees)
+- [Where it sits](#where-it-sits)
+- [Backend compatibility](#backend-compatibility)
 - [Install](#install)
 - [Quick start](#quick-start)
 - [How to use it](#how-to-use-it)
@@ -68,68 +88,114 @@ fn main() {
   - [9. Your own transport](#9-your-own-transport)
   - [10. WebSocket connections (feature `ws`)](#10-websocket-connections-feature-ws)
   - [11. SSH commands and SFTP (feature `ssh`, admin / dev builds only)](#11-ssh-commands-and-sftp-feature-ssh-admin--dev-builds-only)
-- [Backend compatibility](#backend-compatibility)
+  - [12. File uploads (multipart)](#12-file-uploads-multipart)
 - [How it works](#how-it-works)
 - [TLS exception: the default build is not pure Rust](#tls-exception-the-default-build-is-not-pure-rust)
 - [API reference](#api-reference)
 - [Limits and what it does not do](#limits-and-what-it-does-not-do)
-- [Compatibility](#compatibility)
+- [Versions](#versions)
 - [Examples](#examples)
-- [Testing](#testing)
+- [How it's tested](#how-its-tested)
 - [FAQ](#faq)
 - [License](#license)
 - [Contributing](#contributing)
 
-## Highlights
+## Features at a glance
 
-- **Typed JSON in, typed JSON out:** `get_json::<T>`, `post_json::<T>`, `send_json::<T>` with
-  your serde types; `JsonResponse<T>` messages out.
-- **Exactly one answer per request**, always: success, `Status` (4xx/5xx with the server's
-  status, headers and body), `Network`, `Tls`, `Timeout`, `Decode`, `Cancelled`, `Shutdown`,
-  `NoTransport`, `BodyTooLarge`, `InvalidRequest`, `InsecureHttp`, `Encode`. A late result from
-  the network after a cancel or timeout is discarded.
-- **Never blocks a frame:** requests run on a small fixed pool of worker threads (default 2), not
-  on Bevy's task pools. Answers are written in `First`, so `PreUpdate` and `Update` read them in
-  the frame they arrived.
-- **No ordering ceremony:** `HttpClient` is used through `Res<HttpClient>` (shared access),
-  so any number of systems in any schedule can fire requests without `.before()` / `.after()`.
-- **Game-controlled auth:** after your own login call, put a `BearerToken`, `ApiKeyHeader`,
-  `ApiKeyQuery` or `JsonBodyField` (or your own `Credentials`) into `BackendCredentials`. Secrets
-  are redacted from `Debug`, `Display` and the crate's logs.
-- **Safe defaults:** HTTPS only (plain `http://` only to `localhost` / `127.x.x.x` / `[::1]`
-  unless you allow it), a 15 s timeout, a 10 MiB response body limit, redirects not followed.
-- **Testable offline:** a `FakeHttpTransport` answers from scripted routes; your tests need no server.
-- **WebSocket (feature `ws`):** named connections (`connect("main", …)`), typed requests and
-  pushes over a JSON envelope, reconnect with backoff and jitter, heartbeat and dead-peer
-  detection, credentials on every handshake, one thread per connection.
-- **SSH for admin / dev tools (feature `ssh`):** named connections, commands with streamed
-  output and one answer each (exit status, timeout, cancel), strict known_hosts checking, key
-  files, ssh-agent and `~/.ssh/config`; SFTP with `sftp`. Refuses to run in release builds unless
-  you opt in.
-- **Small, and no tokio unless you enable `ssh`:** ureq 3 (blocking HTTP/1.1), tungstenite (sync)
-  + rustls; no hyper, no OpenSSL. Only `ssh` brings tokio, on one private thread of its own.
+| Feature | Default | For | What it adds |
+|---|---|---|---|
+| `http` | yes | your HTTPS API, file uploads | The real transport, `UreqTransport`: ureq 3.4 on a few worker threads, rustls with ring's crypto and the Mozilla root certificates (webpki-roots). `multipart/form-data` uploads with `Multipart` (no extra dependency). ring compiles C and assembly (see [TLS exception](#tls-exception-the-default-build-is-not-pure-rust)). |
+| `json` | yes | typed requests and answers | `get_json` / `post_json` / `send_json` / `post_multipart_json`, `JsonResponse<T>`, `OutgoingRequest::with_json`, `RawResponse::json`, `JsonBodyField` (serde + serde_json). |
+| `gzip` | no | compressed answers | Accept gzip-compressed responses (ureq's decoder, flate2). |
+| `ws` | no | live data: chat, lobbies, pushes | Named WebSocket connections: `WsClient`, `WsConnections`, the `Ws*` messages, `TungsteniteTransport` (tungstenite 0.30, sync, one thread per connection, rustls + ring, no permessage-deflate). With `json`: `JsonEnvelope`, `WsRequest`, `WsPushMessage`, `WsResponse<T>`, `WsPush<P>`. |
+| `ssh` | no | **admin / dev tools only** | Named SSH connections that run commands: `SshClient`, `SshConnections`, the `Ssh*` messages, `RusshTransport` (russh 0.63, ring for the AEAD ciphers and RustCrypto for the rest; tokio on one private thread), strict known_hosts, key files / ssh-agent / `~/.ssh/config`. |
+| `sftp` | no | admin / dev tools: files | SFTP on SSH connections (implies `ssh`): upload, download, list, create / remove directory, remove file, rename (russh-sftp). |
+| `ssh-rsa` | no | old RSA-only servers | RSA host keys and RSA key files for SSH (implies `ssh`; rsa-sha2-256/512, never SHA-1). Off by default: the `rsa` crate carries the unfixed Marvin timing advisory RUSTSEC-2023-0071. Without it, ed25519 and ECDSA keys work. |
 
-## Cargo features
+Crates in the build (normal and build dependencies, this crate excluded, measured with
+`cargo tree` on Windows; other platforms differ by a few platform crates):
 
-| Feature | Default | What it adds |
-|---|---|---|
-| `http` | yes | The real transport, `UreqTransport`: ureq 3.4 on worker threads, rustls with ring's crypto and the Mozilla root certificates (webpki-roots). ring compiles C and assembly (see [TLS exception](#tls-exception-the-default-build-is-not-pure-rust)). |
-| `json` | yes | `get_json` / `post_json` / `send_json`, `JsonResponse<T>`, `OutgoingRequest::with_json`, `RawResponse::json`, `JsonBodyField` (serde + serde_json). |
-| `gzip` | no | Accept gzip-compressed responses (ureq's decoder, flate2). |
-| `ws` | no | Named WebSocket connections: `WsClient`, `WsConnections`, the `Ws*` messages, `TungsteniteTransport` (tungstenite 0.30, sync, one thread per connection, rustls + ring, no permessage-deflate). With `json`: `JsonEnvelope`, `WsRequest`, `WsPushMessage`, `WsResponse<T>`, `WsPush<P>`. |
-| `ssh` | no | **Admin / dev builds only.** Named SSH connections that run commands: `SshClient`, `SshConnections`, the `Ssh*` messages, `RusshTransport` (russh 0.63, ring for the AEAD ciphers and RustCrypto for the rest; tokio on one private thread), strict known_hosts, key files / ssh-agent / `~/.ssh/config`. |
-| `sftp` | no | SFTP on SSH connections (implies `ssh`): upload, download, list, create / remove directory, remove file, rename (russh-sftp). |
-| `ssh-rsa` | no | RSA host keys and RSA key files for SSH (implies `ssh`; rsa-sha2-256/512, never SHA-1). Off by default: the `rsa` crate carries the unfixed Marvin timing advisory RUSTSEC-2023-0071. Without it, ed25519 and ECDSA keys work. |
-
-Crates in the build (normal + build dependencies, this crate excluded): default 90, `gzip` 95,
-`ws` 104, `ssh` 209, `ssh` + `sftp` 219, `ssh` + `ssh-rsa` 212, everything 228; `ssh` without
-default features 195.
+| Features | Crates |
+|---|---|
+| `default-features = false` (types and fake transports only) | 67 |
+| default (`http`, `json`) | 90 |
+| default + `gzip` | 95 |
+| default + `ws` | 104 |
+| default + `ssh` | 209 |
+| default + `ssh`, `sftp` | 219 |
+| default + `ssh`, `ssh-rsa` | 212 |
+| `ssh` without default features | 195 |
+| all features | 228 |
 
 Without `http` the crate still builds: every type, the `FakeHttpTransport` and your own
-`HttpTransport` work, and requests without a transport are answered with `NoTransport`.
+`HttpTransport` work, and requests without a transport are answered with `NoTransport`. The
+default set is deliberately not empty: the crate exists to call an HTTPS JSON API, and it should
+do that with no feature fiddling.
 
-The default set is deliberately not empty: the crate exists to call an HTTPS JSON API, and it
-should do that with no feature fiddling.
+## What it guarantees
+
+- **Every request gets exactly one answer:** success, or an error such as `Status` (the server's
+  status, headers and body), `Network`, `Tls`, `Timeout`, `Decode`, `Cancelled`, `Shutdown` (the
+  app exited), `NoTransport`, `RequestTooLarge` or `InvalidRequest`. HTTP requests, WebSocket
+  requests, SSH commands and SFTP operations alike. A late result from the network after a cancel
+  or a timeout is discarded, never delivered twice.
+- **An answered request is never sent afterwards.** A request cancelled, timed out or answered
+  `Shutdown` while it still waited (for a worker, a connection or a free channel) never goes out
+  later. Errors say honestly whether the request went out: `error.was_sent()` is `Some(false)`
+  (never sent), `Some(true)` (the server has it) or `None` (unknown), and SSH answers carry
+  `started`. Retry decisions can rely on it.
+- **Real deadlines, bounded buffers, size limits.** A timeout covers the whole call, waiting
+  included; a WebSocket or SSH connect is ONE deadline over TCP, TLS / key exchange and the
+  handshake, so a server that trickles bytes cannot stretch it. Answers are capped (HTTP body
+  10 MiB after gzip decoding, so a gzip bomb stops at the limit; WebSocket messages 1 MiB; SSH
+  output 8 MiB; SFTP transfers 256 MiB) and so are requests (uploads 32 MiB and 256 parts, checked
+  before anything is sent). Every default can be changed.
+- **Never blocks a frame, never panics on bad input.** Requests run on the crate's own threads,
+  not on Bevy's task pools; answers are written in `First`, so `PreUpdate` and `Update` read them
+  in the frame they arrived. An invalid path, header, name or form is an `InvalidRequest` answer.
+- **No ordering ceremony:** `HttpClient`, `WsClient` and `SshClient` are used through `Res<..>`
+  (shared access), so any number of systems in any schedule can fire requests.
+- **Secrets stay out of logs:** tokens and passwords are redacted from `Debug`, `Display` and the
+  crate's own log lines (a test captures every log event to prove it).
+- **Safe defaults:** HTTPS only (plain `http://` only to `localhost` / `127.x.x.x` / `[::1]` unless
+  you allow it), redirects not followed, a 15 s timeout, strict SSH host key checking with no
+  trust-on-first-use.
+- **No tokio unless you enable `ssh`**, and then only on one private thread. HTTPS uses rustls with
+  ring, **no OpenSSL**, native-tls or aws-lc in any feature set. ring compiles C and assembly: see
+  the [TLS exception](#tls-exception-the-default-build-is-not-pure-rust).
+- **Testable offline:** `FakeHttpTransport`, `FakeWsTransport` and `FakeSshTransport` answer from
+  scripts, so your game's systems can be tested headless without a server.
+
+## Where it sits
+
+This crate is the game talking to **your servers**, not players talking to each other.
+Real-time gameplay between players (inputs, positions, replication at 30–60 Hz) belongs to UDP
+netcode such as [bevy_replicon](https://crates.io/crates/bevy_replicon) with
+[renet](https://crates.io/crates/renet). `bevy_net_backend` sits next to it: a typical online game
+logs in, loads the save and joins matchmaking over HTTP, keeps a WebSocket open for chat and
+lobby updates, plays the match over replicon, and posts the result over HTTP again. Nothing here
+competes with the netcode for the frame or the socket.
+
+## Backend compatibility
+
+- **HTTP** works with any backend that speaks HTTPS and JSON (or raw bytes): Laravel / PHP,
+  Express / Node, Go, Rust, Django, FastAPI, Spring, Rails, ASP.NET, serverless functions. Nothing
+  is tailored to one framework. File uploads (`multipart/form-data`) were checked byte for byte
+  against real PHP, Express + multer, FastAPI, Go and Django; frameworks differ in their limits
+  and in how they read some file names, so read
+  [what real backends do with an upload](#what-real-backends-do-with-an-upload).
+- **WebSocket** (feature `ws`) works with any plain WebSocket server (RFC 6455), through the
+  default JSON envelope or your own `WsProtocol` for another message layout.
+- **Frameworks that run their own protocol on top of WebSocket** (Laravel Reverb / Pusher,
+  Socket.IO, SignalR, Phoenix Channels) need an adapter for that protocol. Adapters are planned
+  for a later version; until then use `WsProtocol` or raw frames if your server can also speak
+  plain WebSocket.
+- **SSH** (feature `ssh`, admin / dev tools) works with any standard SSH server: OpenSSH on Linux,
+  BSD, macOS or Windows, and other servers speaking SSH-2 with ed25519 or ECDSA host keys (RSA with
+  feature `ssh-rsa`). Servers without strict key exchange (OpenSSH before 9.6, unless the
+  distribution backported it) connect through AES-GCM, which the client prefers; only a server that
+  offers nothing but ChaCha20-Poly1305 or CBC + encrypt-then-MAC is refused (see Terrapin in the
+  SSH section). SFTP needs the server's `sftp` subsystem (OpenSSH's default).
 
 ## Install
 
@@ -181,7 +247,7 @@ struct Rank {
     rank: u32,
 }
 
-/// The request we wait for.
+/// The request being waited for.
 #[derive(Resource)]
 struct Submitting(RequestId);
 
@@ -379,7 +445,8 @@ fn on_save(mut answers: MessageReader<JsonResponse<Save>>) {
 | `Network(why)` | DNS, connect, reset, protocol error, worker threads not starting (ureq's words) | no for a DNS / connect / worker-start failure, else maybe |
 | `Tls(why)` | TLS failure: handshake, certificate (rustls' / ureq's words) | no for a handshake or certificate failure (before any request byte), else maybe |
 | `Timeout(why)` | the timeout ran out; it counts from hand-over to the transport, waiting for a free worker included | no if `why` starts with `not sent:`, else maybe |
-| `BodyTooLarge { limit }` | the response body is over the limit (SSH: the command's output or an SFTP transfer) | yes |
+| `BodyTooLarge { limit }` | the ANSWER is over its limit: the response body (SSH: the command's output or an SFTP download) | yes |
+| `RequestTooLarge { limit, size }` | the REQUEST is over its limit and was refused before anything was sent: a multipart form over `Multipart::with_max_bytes`, a WebSocket request over the message limit, an SSH command line over 64 KiB, an SFTP upload over the transfer limit | no |
 | `Status(response)` | a status outside 200–299, 3xx included (redirects are not followed) | yes |
 | `Decode { message, response }` | a 2xx body that is not the expected JSON | yes |
 | `Cancelled` | `HttpClient::cancel` | no if it was still waiting for a worker, else maybe |
@@ -528,15 +595,16 @@ fn spinner(in_flight: Res<InFlight>) {
 - **Cancel:** answered with `Cancelled` in the next frame's `First`. A request already on the
   wire keeps its worker thread until it finishes or times out (a blocking call cannot be
   interrupted); its result is discarded. Cancelling an answered id does nothing.
-- **InFlight** lists every request not answered yet, HTTP and WebSocket (feature `ws`) alike. An
+- **InFlight** lists every request not answered yet: HTTP, WebSocket (feature `ws`) and SSH /
+  SFTP (feature `ssh`) alike. An
   HTTP request enters it in `PostUpdate` of the frame it was made in; a WebSocket request there
   too, also while it waits for its connection. A request leaves it when it is answered; the answer
   message follows in `First` (of the same frame, or of the next one for answers decided in
   `PostUpdate`, such as a cancel). `describe(id)` returns a `RequestInfo`: `kind`
-  (`Http` or `WebSocket`), `method` (HTTP), `target` (the path without the query, or the
-  connection's name).
-- **One cancel for everything:** `HttpClient::cancel(id)` cancels HTTP and WebSocket requests
-  alike (`WsClient::cancel` is the same call).
+  (`Http`, `WebSocket`, `Ssh` or `Sftp`), `method` (HTTP), `target` (the path without the query,
+  or the connection's name; never an SSH command line).
+- **One cancel for everything:** `HttpClient::cancel(id)` cancels HTTP, WebSocket and SSH / SFTP
+  requests alike (`WsClient::cancel` and `SshClient::cancel` are the same call).
 - **App exit:** in the frame an `AppExit` message is written, nothing new is sent:
   `BackendSystems::Send` hands no request to the transport, and `BackendSystems::Exit` (in `Last`)
   answers every open request with `Shutdown` (results that already arrived are delivered as they
@@ -751,7 +819,8 @@ fn main() {
 | `Disconnected { sent, .. }` | the connection went away or was replaced / closed by the game; not connected when asked; too many waiting | as `sent` says |
 | `Cancelled` | `cancel` | maybe |
 | `Shutdown` | the app exited first | no, unless it went out before the exit frame |
-| `InvalidRequest` / `Encode` | unknown connection, no protocol, too large, unregistered type, bad payload | no |
+| `InvalidRequest` / `Encode` | unknown connection, no protocol, unregistered type, bad payload | no |
+| `RequestTooLarge { limit, size }` | the request is larger than the message limit | no |
 
 Requests made while a connection is opening or reconnecting wait for it (until their timeout,
 64 at most). A server close frame is `BackendError::Closed { code, reason }` in `WsStateChanged` /
@@ -915,7 +984,8 @@ fn main() {
 | `Disconnected { sent, .. }` | the connection went away / was closed / was replaced (also with reconnect on: a running command is never re-run); or not connected when asked | as `sent` |
 | `Shutdown` | the app exited first (a command of the exit frame is never sent) | as far as known |
 | `Ssh(…)` | the server refused the channel or the exec request | `Some(false)` |
-| `InvalidRequest` | unknown connection, bad command (empty, NUL, over 64 KiB), too many requests, SSH disabled in a release build | `Some(false)` |
+| `InvalidRequest` | unknown connection, bad command (empty, NUL), too many requests, SSH disabled in a release build | `Some(false)` |
+| `RequestTooLarge { limit, size }` | the command line is over 64 KiB, or (SFTP) an upload is over the transfer limit | `Some(false)` |
 
 Stopping a remote command is best effort: SSH has no reliable kill. The crate sends a `TERM`
 signal and closes the channel; a server may ignore the signal, and a process without a terminal
@@ -958,10 +1028,11 @@ overwritten; it is removed on failure, but a transfer killed after the 1 s grace
 of names in total), `create_dir`, `remove_file`, `remove_dir` (empty directories), `rename`, or any
 `SftpOp` with `sftp(name, op)`. Each gets exactly one `SftpFinished { id, name, started, result }`;
 transfers also report `SftpProgress` (about 10 per second). Relative remote paths start in the
-login directory. Transfers over `with_max_transfer_bytes` are `BodyTooLarge`; an upload over it
-(from memory or from a file) is refused before anything is sent (`started: Some(false)`); a whole
-operation is bounded by `with_sftp_timeout`. An
-interrupted upload can leave a partial remote file. Errors carry the server's SFTP status text
+login directory. A download over `with_max_transfer_bytes` is `BodyTooLarge`; an upload over it
+(from memory or from a file) is `RequestTooLarge`, refused before anything is sent
+(`started: Some(false)`); a whole operation is bounded by `with_sftp_timeout`. An
+interrupted upload can leave a partial remote file; so can a local file that grows or shrinks
+during `upload_file`, which is answered `Ssh("the local file changed size …")`. Errors carry the server's SFTP status text
 (`Ssh("SFTP: No such file")`). The SFTP channel is opened on first use and shared by the
 connection's operations. Local files are read and written on tokio's small blocking pool, never on
 the SSH thread itself.
@@ -972,22 +1043,144 @@ the SSH thread itself.
 > (`..`, separators, drive letters, control characters, Windows device names, …). The crate never
 > turns a listed name into a local path itself; `download_file` writes only where you tell it to.
 
-## Backend compatibility
+### 12. File uploads (multipart)
 
-- **HTTP** works with any backend that speaks HTTPS and JSON (or raw bytes): Laravel / PHP,
-  Express / Node, Go, Rust, Django, ASP.NET, serverless functions.
-- **WebSocket** (feature `ws`) works with any plain WebSocket server (RFC 6455), through the
-  default JSON envelope or your own `WsProtocol` for another message layout.
-- **Frameworks that run their own protocol on top of WebSocket** (Laravel Reverb / Pusher,
-  Socket.IO, SignalR, Phoenix Channels) need an adapter for that protocol. Adapters are planned
-  for a later version; until then use `WsProtocol` or raw frames if your server can also speak
-  plain WebSocket.
-- **SSH** (feature `ssh`, admin / dev tools) works with any standard SSH server: OpenSSH on Linux,
-  BSD, macOS or Windows, and other servers speaking SSH-2 with ed25519 or ECDSA host keys (RSA with
-  feature `ssh-rsa`). Servers without strict key exchange (OpenSSH before 9.6, unless the
-  distribution backported it) connect through AES-GCM, which the client prefers; only a server that
-  offers nothing but ChaCha20-Poly1305 or CBC + encrypt-then-MAC is refused (see Terrapin above).
-  SFTP needs the server's `sftp` subsystem (OpenSSH's default).
+Upload files the way a browser form does: `multipart/form-data` (RFC 7578). Part of `http`: no
+extra feature, no new dependency, nothing to configure app-wide. Avatars, screenshots, replays,
+bug reports and cloud saves go this way (SFTP is for admin tools only).
+
+```rust,no_run
+use bevy::prelude::*;
+use bevy_net_backend::prelude::*;
+use serde::Deserialize;
+
+#[derive(Deserialize, Clone, Debug)]
+struct AvatarSaved {
+    url: String,
+}
+
+fn upload_avatar(backend: Res<HttpClient>) {
+    # let png_bytes: Vec<u8> = Vec::new();
+    let form = Multipart::new()
+        .text("display_name", "Ayla")
+        .file("avatar", "avatar.png", "image/png", png_bytes); // bytes you already loaded
+    backend.post_multipart_json::<AvatarSaved>("/me/avatar", &form);
+}
+# fn main() { App::new().add_json_response::<AvatarSaved>().add_systems(Update, upload_avatar); }
+```
+
+- **Builder:** `Multipart::new()`, `.text(name, value)`, `.file(name, filename, content_type,
+  bytes)` (an empty content type means `application/octet-stream`; text parts have no content
+  type, as in a browser), repeated names allowed (`photos[]` twice), `.with_max_bytes(n)` (the
+  whole encoded body, part headers included, default 32 MiB: a single file of exactly 32 MiB is
+  just over it), `.with_max_parts(n)` (default 256, at most 10 000), `len()`, `is_empty()`,
+  `encoded_len()`.
+- **Sending:** `HttpClient::post_multipart(path, &form)` (raw `HttpResponse`),
+  `post_multipart_json::<T>(path, &form)` (typed, feature `json`), `send_multipart(method, path,
+  &form)` (`PUT`, `PATCH`, …), or `OutgoingRequest::with_multipart(&form)` for headers, query and
+  a longer timeout on a big upload (`with_timeout`). Everything else is as for any HTTP request:
+  one answer, the shared `cancel`, `InFlight`, the plain-http rule, and credentials applied as
+  headers or query (`BearerToken`, `ApiKeyHeader`, `ApiKeyQuery`). `JsonBodyField` cannot go into
+  a form: such a request is answered `InvalidRequest` and not sent (use a header credential, or add
+  the field to the form yourself). A form later replaced by `with_json`, `with_body` or
+  `set_body` is an ordinary request again.
+- **Refused before sending** (answered, never sent, `was_sent() == Some(false)`): a form over
+  `with_max_bytes` is `RequestTooLarge { limit, size }`; more parts than `with_max_parts`, an
+  empty field name, an invalid content type, and a name or file name that **ends with a
+  backslash** or contains a **control character** (NUL, TAB, …; CR and LF are escaped instead) are
+  `InvalidRequest`. A trailing backslash would turn the closing quote into an escaped one for most
+  parsers: in the live test every real framework lost such a part (dropped it, or turned the file
+  into a text field).
+- **Bytes only:** there is no "upload this path" helper, so no file is read on the main thread.
+  Load the bytes first (at startup, from an asset, in an async task). Encoding copies the bytes
+  once and scans them for the boundary on the calling thread (measured: about 4 ms per 10 MiB and
+  13 ms for 32 MiB in a release build on a desktop PC). **Memory:** while it is sent, the form and its encoded body both exist, so the
+  peak is about twice the form (three times if you also keep your own copy).
+- **Encoding details:** a fresh 128-bit random boundary per request (`bnb-` + 32 hex digits, from
+  the operating system through ring), checked not to occur in any part; CRLF line breaks; the
+  header `Content-Type: multipart/form-data; boundary=…`; a fixed `Content-Length` (never
+  chunked). In `Content-Disposition`, names and file names are escaped as browsers do (WHATWG
+  HTML): `"` → `%22`, CR → `%0D`, LF → `%0A`, everything else (backslashes, non-ASCII as UTF-8)
+  unchanged, no `filename*`. Text values are sent exactly as given (line breaks are not
+  rewritten). `Debug` of a form shows names and sizes only.
+
+**How backends read the same upload** (`display_name` text + `avatar` file):
+
+| Backend | Text field | File (name / type / size) | Repeated names |
+|---|---|---|---|
+| Laravel | `$request->input('display_name')` | `$request->file('avatar')`: `getClientOriginalName()`, `getClientMimeType()`, `getSize()` | name them `photos[]`: `$request->file('photos')` is an array |
+| Plain PHP | `$_POST['display_name']` | `$_FILES['avatar']['name']`, `['type']`, `['size']`, `['tmp_name']`, `['error']` | `photos[]` (without `[]` only the last one is kept) |
+| Express + multer | `req.body.display_name` | `upload.single('avatar')` → `req.file.originalname`, `.mimetype`, `.size`, `.buffer` | `upload.array('photos')`: the name must match exactly (`photos` or `photos[]`) |
+| Go (`net/http`) | `r.FormValue("display_name")` after `r.ParseMultipartForm(max)` | `f, h, _ := r.FormFile("avatar")`: `h.Filename`, `h.Header.Get("Content-Type")`, `h.Size` | `r.MultipartForm.File["photos"]` (same name, no brackets needed) |
+| Django | `request.POST['display_name']` | `request.FILES['avatar']`: `.name`, `.content_type`, `.size` | `request.FILES.getlist('photos')` |
+| FastAPI | `display_name: str = Form()` | `avatar: UploadFile`: `.filename`, `.content_type`, `await avatar.read()` (needs `python-multipart`) | `photos: list[UploadFile]` |
+| Spring | `@RequestParam("display_name") String` | `@RequestParam("avatar") MultipartFile`: `getOriginalFilename()`, `getContentType()`, `getSize()` | `@RequestParam("photos") List<MultipartFile>` |
+| Rails | `params[:display_name]` | `params[:avatar]`: `original_filename`, `content_type`, `size` | `photos[]`: `params[:photos]` is an array |
+| ASP.NET Core | `[FromForm] string display_name` | `IFormFile avatar`: `FileName`, `ContentType`, `Length` | `List<IFormFile> photos` |
+| axum | the `Multipart` extractor: `field.name()`, `field.text().await` | `field.file_name()`, `field.content_type()`, `field.bytes().await` | every part is its own field; group them yourself |
+
+Array naming: PHP, Laravel and Rails turn `photos[]` into an array (without brackets they keep
+only the last value); the others read repeated names as a list and see `photos[]` literally as
+the name. Use what your backend expects.
+
+#### What real backends do with an upload
+
+Measured by sending the same 38 upload scenarios from this crate to real servers with their
+default settings: PHP 8.3 (stock `php.ini`), Express 4.21 + multer 2.0.2, FastAPI 0.115
+(Starlette 0.46, python-multipart 0.0.20), Go 1.22 `net/http` and Django 5.2. **Every file that
+arrived had the right size and CRC-32.** What differed was limits, file names and parts a
+framework dropped:
+
+| | PHP 8.3 | Express + multer 2.0.2 | FastAPI / Starlette | Go 1.22 | Django 5.2 |
+|---|---|---|---|---|---|
+| **Over a size limit** | a file over `upload_max_filesize` (2 MB): **200**, the file has `error` 1 and no data; a body over `post_max_size` (8 MB): **200 with an empty form** | a text field over 1 MB (`fieldSize`): **500** (`MulterError`, Express's default handler); `limits.fileSize` likewise 500 | a text part over 1 MiB: **400** | **no default limit** (33 MB accepted): the handler must set one (`http.MaxBytesReader`) | text over 2.5 MiB (`DATA_UPLOAD_MAX_MEMORY_SIZE`): **400** |
+| **Many files** | keeps **20** (`max_file_uploads`) and **silently drops the rest** (200) | all 25 kept | all kept | all kept | more than 100 files: **400** |
+| **Repeated `photos` without `[]`** | **only the last** is kept | all kept | all kept | all kept | all kept |
+| **Non-ASCII names** (`mentés.json`, `😀`) | exact | **mojibake** in file names AND field names (read as latin1) | exact | exact | exact |
+| **Empty file name** `""` | a file with `error` 4 (no file), no data | **a text field** | a file named `""` | **a text field** | **a text field** |
+| **CSRF** | – | – | – | – | **403** without `@csrf_exempt`, whatever the body |
+
+- **multer mojibake:** convert each name back with `Buffer.from(name, 'latin1').toString('utf8')`
+  (checked exact). multer's `defParamCharset` option has no effect in multer 2.0.2.
+- **`"` in a file name** arrives as a literal `%22` on every one of them (nothing decodes it).
+- **Everything else was read the same everywhere:** text before and after files, `tags[]` twice,
+  an empty value, CRLF inside a value, a 0-byte file, binary data containing `--` and CRLF lines,
+  an empty form, 20 uploads in parallel.
+- **Paths and backslashes in file names** are read three different ways, so send a plain name:
+
+  | File name sent | PHP | multer | FastAPI | Go | Django |
+  |---|---|---|---|---|---|
+  | `a\b.png` | `b.png` | `b.png` | `a\b.png` | `a\b.png` | `b.png` |
+  | `C:\Users\me\a.png` | `a.png` | `a.png` | `a.png` | `C:\Users\me\a.png` | `a.png` |
+  | `dir/file.png` | `file.png` | `file.png` | `dir/file.png` | `file.png` | `file.png` |
+  | `x\` (the crate refuses it) | `x"` | file dropped | `x\` | file dropped | file dropped |
+
+**Documented, not live-tested** (from the frameworks' documentation):
+- **ASP.NET Core:** Kestrel's `MaxRequestBodySize` defaults to 30,000,000 bytes, **below this
+  crate's 32 MiB default**: lower `with_max_bytes` or raise the server limit. `FormOptions`
+  allows 1024 form values by default.
+- **Spring Boot:** `spring.servlet.multipart.max-file-size` 1 MB, `max-request-size` 10 MB.
+- **Laravel:** PHP's limits above apply (Laravel answers `413` for a body over `post_max_size`).
+- **Rails (Rack):** percent-decodes file names (`%22` becomes `"`) and accepts at most 128 files.
+- **nginx** `client_max_body_size` 1 MB and **axum** `DefaultBodyLimit` 2 MB answer `413`.
+- **CSRF protection** refuses a game's POST whatever its body: Laravel `web` routes (419), Rails
+  `protect_from_forgery` (422), like Django's measured 403 above. Use API routes (Laravel
+  `routes/api.php`), or exempt the endpoint, and authenticate with a token instead.
+
+**Advice:**
+- For PHP and Laravel, name repeated fields `photos[]`, and keep at most 20 files per form (or
+  raise `max_file_uploads`).
+- Keep file names ASCII-safe and plain: letters, digits, `-`, `_`, `.`; no path, no `\`, no `"`.
+  Keep the original name in a text field if you need it.
+- Set the server's limits explicitly (upload size, body size, file count, text field size) and
+  keep `with_max_bytes` at or below them. **Do not rely on a `413`:** only proxies with a body limit
+  (nginx's default 1 MB, Caddy's `request_body` when configured) and some frameworks send one. PHP answers **200 with missing data** (check
+  `$_FILES[..]['error']` and that the fields arrived), multer 500, FastAPI and Django 400, Go
+  whatever the handler decides. A `413` or any other status is a normal `Status` answer
+  (`error.status()`); a server that closes the connection mid-upload is a `Network` error.
+- Put text fields before files if the server streams files to disk: multer documents that its
+  disk storage only sees the fields sent before a file (not measured here; the live test used
+  memory storage, where the order did not matter).
 
 ## How it works
 
@@ -1092,15 +1285,17 @@ Everything is re-exported at the crate root; `prelude` holds the everyday items.
 | `BackendSystems` | system sets | `Receive` (`First`), `Send` (`PostUpdate`), `Exit` (`Last`, on `AppExit`). `#[non_exhaustive]`. |
 | `HttpConfig` | resource | base URL, timeout, default headers, workers, `allow_insecure_http`, body limit; `validate()`, getters, `set_base_url`, `set_timeout`. |
 | `ConfigError` | enum | `NoBaseUrl`, `BadBaseUrl`, `BadHeader`. |
-| `HttpClient` | resource | `send`, `request`, `get`, `cancel`; with `json`: `send_json`, `get_json`, `post_json`, `is_json_registered`. |
+| `HttpClient` | resource | `send`, `request`, `get`, `cancel`; `post_multipart`, `send_multipart` (feature `http`); with `json`: `send_json`, `get_json`, `post_json`, `post_multipart_json`, `is_json_registered`. |
+| `Multipart` | builder (`http`) | `new`, `text`, `file`, `with_max_bytes`, `with_max_parts`, `len`, `is_empty`, `encoded_len`. `Debug` shows names and sizes only. |
+| `DEFAULT_MULTIPART_MAX_BYTES`, `DEFAULT_MULTIPART_MAX_PARTS` | consts (`http`) | 32 MiB, 256. |
 | `BackendAppExt` | trait on `App` | `add_json_response::<T>()` (feature `json`); `add_ws_request::<R>()`, `add_ws_push::<P>()` (features `ws` + `json`). Sealed. |
 | `RequestId` | id | opaque, unique per process, `Copy + Eq + Hash + Ord + Display`. |
-| `OutgoingRequest` | request | constructors, `with_*` builders, accessors (`method`, `path`, `query`, `headers`, `body`, `timeout`, `purpose`, `uses_credentials`, `error`), `query_mut`, `headers_mut`, `set_body`, `reject`. |
+| `OutgoingRequest` | request | constructors, `with_*` builders, accessors (`method`, `path`, `query`, `headers`, `body`, `timeout`, `purpose`, `uses_credentials`, `is_multipart`, `error`), `query_mut`, `headers_mut`, `set_body`, `reject`; `with_multipart` (feature `http`). |
 | `RequestPurpose` | enum | `Http`, `WebSocketHandshake`. |
 | `HttpResponse` | message | `id`, `result: Result<RawResponse, BackendError>`. |
 | `JsonResponse<T>` | message | `id`, `result: Result<T, BackendError>` (feature `json`). |
 | `RawResponse` | struct | `status`, `headers`, `body`; `new`, `with_header`, `is_success`, `body()`, `text()`, `json()`. |
-| `BackendError` | enum | see [Reading answers and errors](#4-reading-answers-and-errors); `status()`, `response()`, `is_invalid_request()`, `was_sent()`, `close_code()`, `host_key(..)` (a constructor for fakes). |
+| `BackendError` | enum | see [Reading answers and errors](#4-reading-answers-and-errors); `status()`, `response()`, `is_invalid_request()`, `was_sent()`, `close_code()`, `host_key(..)`, `request_too_large(..)` (constructors for fakes). |
 | `Credentials` | trait | `apply(&self, &mut OutgoingRequest)`; `ws_auth_message()` (default none: a first frame for WebSocket auth). |
 | `BackendCredentials` | resource | `new`, `set`, `clear`, `is_set`. |
 | `BearerToken`, `ApiKeyHeader`, `ApiKeyQuery`, `JsonBodyField` | credentials | ready-made `Credentials` (`JsonBodyField`: feature `json`). |
@@ -1166,6 +1361,10 @@ Everything is re-exported at the crate root; `prelude` holds the everyday items.
   or a corporate TLS-inspecting proxy is not trusted.
 - **Cancel does not interrupt** a request already on the wire; it holds its worker thread until
   ureq's timeout at most.
+- **Uploads** are built in memory (the whole form, at most `with_max_bytes`, about twice that at
+  the peak while sending): no streaming from a file, no "upload this path" helper, no upload
+  progress messages. A text part cannot carry its own content type (e.g. a JSON part for
+  Spring's `@RequestPart`); `file(..)` always adds a file name.
 - **WebSocket (feature `ws`):** no permessage-deflate (a server that requires compression cannot
   be used), no subprotocol negotiation helper (set `Sec-WebSocket-Protocol` with `with_header`),
   one thread per connection (fine for a few connections, not for hundreds). A large message you
@@ -1187,7 +1386,7 @@ Everything is re-exported at the crate root; `prelude` holds the everyday items.
   disconnect report, backed by a once-a-second check of the session; a lost network without any
   reset is noticed by the keepalive (15 s, 3 misses).
 
-## Compatibility
+## Versions
 
 | bevy_net_backend | Bevy | ureq | tungstenite (`ws`) | russh (`ssh`) | rustls | Rust (MSRV) |
 |---|---|---|---|---|---|---|
@@ -1201,8 +1400,9 @@ from `examples/mock_server.rs` on 127.0.0.1 inside the example process.
 | Example | Shows |
 |---|---|
 | `fetch_json` | `get_json::<Character>`, matching the answer by id, error bodies. |
+| `upload` | a `multipart/form-data` avatar upload (a text field + an image) with `post_multipart_json`; the mock parses it and answers what it received. |
 | `post_with_token` | 401 before login, login `without_credentials`, `BearerToken`, a 422 validation error decoded from the error body, a successful authenticated `POST`. |
-| `mock_server` | the mock API on its own and its JSON contract: `--seconds N` (maximum runtime, default 60; it exits by itself), `--bind ADDR` (default `127.0.0.1:0`). |
+| `mock_server` | the mock API on its own and its JSON contract (including `POST /upload`, a real multipart parser that echoes what it received): `--seconds N` (maximum runtime, default 60; it exits by itself), `--bind ADDR` (default `127.0.0.1:0`). |
 | `chat_client` (features `ws`, `json`) | a named connection, a typed request and its answer, typed pushes, state changes, disconnect. Starts `mock_ws_server` unless `BACKEND_WS_URL` is set. |
 | `mock_ws_server` (features `ws`, `json`) | the mock WebSocket server and its envelope contract (echo, `chat.send` + push, `fail`, `close`, `drop`, `stall`, periodic `server.tick`, `/secure` needing a bearer token): `--seconds N`, `--bind ADDR` (default `127.0.0.1:0`), `--tick-ms N`. |
 | `ssh_console` (feature `ssh`; SFTP steps with `sftp`) | connect with a known_hosts file, run commands and print their output and exit, then upload, list, download and remove a file one step after the other, disconnect. Starts `mock_ssh_server` with a throwaway key (written to `target/ssh-example/`) unless `SSH_HOST`, `SSH_USER`, `SSH_KEY` and `SSH_KNOWN_HOSTS` are set. |
@@ -1211,6 +1411,7 @@ from `examples/mock_server.rs` on 127.0.0.1 inside the example process.
 ```text
 cargo run --example fetch_json
 cargo run --example post_with_token
+cargo run --example upload
 cargo run --example mock_server -- --seconds 120
 cargo run --example mock_server -- --seconds 1800 --bind 127.0.0.1:8080
 BACKEND_URL=http://127.0.0.1:8000/api cargo run --example fetch_json
@@ -1224,32 +1425,71 @@ Pointed at your own backend (`BACKEND_URL`), `fetch_json` expects `GET /characte
 `{"id":1,"name":"…","class":"…","level":7}`, and `post_with_token` expects the routes in its
 header comment (the login reads `BACKEND_USERNAME` / `BACKEND_PASSWORD`).
 
-## Testing
+## How it's tested
+
+- **271 tests with all features** (unit tests, integration tests and every Rust block of this
+  README), plus 11 live tests that are `#[ignore]`d by default. CI runs the tests for 15
+  feature combinations on Linux, Windows and macOS with Rust 1.96.0, clippy with `-D warnings` for
+  every combination, rustfmt, the docs with `-D warnings`, a build with the minimum Rust version
+  (1.95), dependency-tree checks (one ring, one rustls, no tokio without `ssh`, no OpenSSL /
+  native-tls / aws-lc / libssh2) and a RustSec advisory check (cargo-deny) on every pull request,
+  every push and weekly. RUSTSEC-2023-0071 (rsa, Marvin) is accepted in `deny.toml`: `rsa` is
+  compiled only with the opt-in `ssh-rsa` feature, but `Cargo.lock` always lists it, and no fixed
+  release exists.
+- **An adversarial review every round:** each part (core + HTTP, WebSocket, SSH / SFTP, uploads)
+  was reviewed line by line against its specification and this README before it was accepted,
+  and every finding was fixed or documented as a known limit.
+- **Hostile and slow servers are part of the regular suite:** the real transports run against
+  mock servers on 127.0.0.1 inside the test process: gzip bombs, bodies over the limit, servers
+  that answer too late, trickle a handshake or a TLS record byte by byte, stop reading while the
+  client sends 32 MiB, send a 2 MB SSH banner or never say anything. Tests never contact another
+  host.
+- **Live-tested against a real server:** an Ubuntu machine on the internet behind Caddy with a real
+  Let's Encrypt certificate.
+  - **HTTP:** the real certificate chain accepted, and a wrong-name and an untrusted certificate
+    rejected; every credential type; timeouts, including a request that waited for a worker;
+    body limits; redirects not followed; a gzip bomb stopped at the limit; 50 parallel requests,
+    each answered exactly once; cancel and exit mid-flight.
+  - **WebSocket over `wss://`:** typed requests and pushes, named connections, handshake
+    credentials, close codes, message limits; the server was stopped and restarted in the middle
+    of a session, and the client reconnected, authenticated again and answered the lost request
+    honestly as "sent".
+  - **SSH and SFTP against real OpenSSH:** strict key exchange and AES-GCM confirmed in the
+    server's own log; cancelled and timed-out commands gone from the server within 1.5 s; a 50 MB
+    upload; a reconnect that never re-ran a command; connection resets noticed within about half a
+    second.
+  - **Uploads:** byte for byte (CRC-32) against real PHP, Express + multer, FastAPI, Go and Django
+    (see [what real backends do with an upload](#what-real-backends-do-with-an-upload)); limits
+    refused before sending really never reached the server.
+
+Run it yourself:
 
 - `cargo test` runs the unit tests, the `FakeHttpTransport` tests (every answer kind, exactly one
   answer each, strict ambiguity detection), a log-capture test proving no secret is logged, the
   loopback tests (the real `UreqTransport` against the mock server on 127.0.0.1: statuses,
-  redirects, timeouts, body limit, TLS handshake failure, login flow, exit while busy). With
-  `--features ws` (and `--all-features`) also the WebSocket tests: every lifecycle path on a
-  `FakeWsTransport`, the real transport against `mock_ws_server` (large messages across many
-  short read timeouts, reconnect, heartbeat, 401, 1009, exit), and a TLS test with large messages
-  cut by read timeouts mid-record. With `--features ssh` (and `ssh,sftp`) also the SSH tests:
-  every lifecycle path on a `FakeSshTransport` (including one app with HTTP, WebSocket and SSH
-  cancelling each other's requests), the real `RusshTransport` against `mock_ssh_server` with
-  throwaway keys generated at runtime (commands, timeouts, cancel, output limit, strict host keys,
-  passphrases, ssh_config, SFTP) and hostile raw TCP peers (silent, trickling, huge banner) that
-  must not stretch the connect deadline. `cargo test --all-features` also compiles every Rust block
-  of this README.
-- Tests never contact another host. CI runs the feature combinations on Linux, Windows and macOS
-  with Rust 1.96.0, and a RustSec advisory check (cargo-deny) on every pull request, every push
-  and weekly. RUSTSEC-2023-0071 (rsa, Marvin) is accepted in `deny.toml`: `rsa` is compiled only
-  with the opt-in `ssh-rsa` feature, but `Cargo.lock` always lists it, and no fixed release exists.
+  redirects, timeouts, body limit, TLS handshake failure, login flow, exit while busy) and the
+  upload tests (the real transport against the mock's multipart parser). With `--features ws`
+  (and `--all-features`) also the WebSocket tests: every lifecycle path on a `FakeWsTransport`,
+  the real transport against `mock_ws_server` (large messages across many short read timeouts,
+  reconnect, heartbeat, 401, 1009, exit), and a TLS test with large messages cut by read timeouts
+  mid-record. With `--features ssh` (and `ssh,sftp`) also the SSH tests: every lifecycle path on a
+  `FakeSshTransport` (including one app with HTTP, WebSocket and SSH cancelling each other's
+  requests), the real `RusshTransport` against `mock_ssh_server` with throwaway keys generated at
+  runtime (commands, timeouts, cancel, output limit, strict host keys, passphrases, ssh_config,
+  SFTP) and hostile raw TCP peers (silent, trickling, huge banner) that must not stretch the
+  connect deadline. `cargo test --all-features` also compiles every Rust block of this README.
 - `tests/live.rs` holds live HTTPS checks, `#[ignore]`d: they run only with
   `cargo test --test live -- --ignored` and `BNB_TEST_HTTPS_URL` set to a server that serves the
   mock's contract over HTTPS (for example `mock_server` behind a TLS-terminating reverse proxy on
   a test machine).
 - `tests/live_ws.rs` does the same for WebSocket: `cargo test --features ws --test live_ws -- --ignored`
   with `BNB_TEST_WSS_URL` set to `mock_ws_server` behind a TLS proxy (for example `wss://…/ws`).
+- `tests/live_multipart.rs` uploads to the mock (`BNB_TEST_HTTPS_URL` + `/upload`) and to any echo
+  servers listed in `BNB_TEST_MULTIPART_URLS` (comma-separated upload URLs, e.g. small PHP /
+  Express / FastAPI / Go / Django servers that answer the mock's JSON echo shape, documented in
+  `examples/mock_server.rs`), and checks the names, values, content types, sizes and CRC-32 they
+  report, for a simple form and for the cases every tested framework reads the same way:
+  `cargo test --test live_multipart -- --ignored --test-threads 1`.
 - `tests/live_ssh.rs` checks a real OpenSSH server: `cargo test --features ssh,sftp --test live_ssh
   -- --ignored --test-threads 1` with `BNB_TEST_HOST`, `BNB_TEST_SSH_USER`, `BNB_TEST_SSH_KEY` (a key
   file) and `BNB_TEST_SSH_KNOWN_HOSTS` (a known_hosts file) set, optionally `BNB_TEST_SSH_PORT` and
@@ -1283,6 +1523,10 @@ sends what is in `BackendCredentials`.
 player build is shell access for anyone who extracts it. Use HTTP or WebSocket with per-player
 tokens for that. SSH is for your own admin and developer tools, and release builds refuse it
 unless the tool explicitly opts in (`SshSettings::allow_in_release`).
+
+**How do I upload a screenshot or a save file?** `HttpClient::post_multipart` with a
+`Multipart` form (see [File uploads](#12-file-uploads-multipart)); load the bytes first, the
+crate never reads files for an HTTP upload.
 
 **Can SSH log in with a password or a 2FA code?** Yes, opt-in: `SshAuth::password` and
 `SshAuth::keyboard_interactive` (see the SSH section). Keys stay the recommendation; the values are

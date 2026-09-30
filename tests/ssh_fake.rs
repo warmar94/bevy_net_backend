@@ -142,11 +142,14 @@ fn unknown_connections_and_bad_commands_are_invalid_and_never_sent() {
     let nul = ssh(&app).run("main", "echo \0");
     let long = ssh(&app).run("main", "x".repeat(MAX_SSH_COMMAND_BYTES + 1));
     app.step_n(2);
-    for id in [unknown, empty, nul, long] {
+    for id in [unknown, empty, nul] {
         let answer = one(&app, id);
         assert!(matches!(answer.result, Err(BackendError::InvalidRequest(_))), "{:?}", answer.result);
         assert_eq!(answer.started, Some(false));
     }
+    let answer = one(&app, long);
+    assert!(matches!(answer.result, Err(BackendError::RequestTooLarge { limit: 65_536, .. })), "{:?}", answer.result);
+    assert_eq!(answer.started, Some(false));
     assert!(fake.commands().is_empty());
 }
 
@@ -585,7 +588,8 @@ mod sftp {
         let nul = ssh(&app).create_dir("main", "a\0b");
         app.step_n(2);
         let answer = sftp_answer(&app, big);
-        assert!(matches!(answer.result, Err(BackendError::BodyTooLarge { limit: 1024, .. })), "{:?}", answer.result);
+        assert!(matches!(answer.result, Err(BackendError::RequestTooLarge { limit: 1024, size: 2048, .. })), "{:?}", answer.result);
+        assert_eq!(answer.result.as_ref().err().and_then(BackendError::was_sent), Some(false));
         assert_eq!(answer.started, Some(false));
         for id in [empty, nul] {
             let answer = sftp_answer(&app, id);

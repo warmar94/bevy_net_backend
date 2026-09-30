@@ -35,12 +35,20 @@
 //! | `GET /gzip` | `{"compressed":true}`, gzip-encoded when the client accepts gzip |
 //! | `GET /gzip-bomb?bytes=N` | always gzip-encoded: N zero bytes (default 1 MiB, at most 16 MiB); about 6.6 KB of gzip per MiB (16 MiB ≈ 106 KB) |
 //! | `POST /purchase` | `201 {"ok":true}` (counts hits, for "sent exactly once" tests) |
+//! | `POST /upload` (`multipart/form-data`) | `200` with what it parsed: `{"fields":[{"name":…,"value":…}],"files":[{"name":…,"filename":…,"content_type":…,"size":N,"crc32":"8 hex"}]}` in body order (counts hits); a body that is not valid multipart `400`, over 8 MiB `413` |
 //! | `GET /empty` | `204` with no body |
 //! | `GET /redirect` | `302` to `/characters/1` |
 //! | anything else | `404 {"message":"not found"}` |
 //!
-//! Request bodies: `Content-Length` or `Transfer-Encoding: chunked`, at most 1 MiB. A bigger body
-//! is answered `413` (never silently cut), a malformed length or chunk `400`.
+//! Request bodies: `Content-Length` or `Transfer-Encoding: chunked`, at most 1 MiB (8 MiB for
+//! `/upload`). A bigger body is answered `413` (never silently cut), a malformed length or chunk
+//! `400`. The multipart parser follows RFC 7578 (boundary from the `Content-Type` header, part
+//! headers, `name`, `filename`, `filename*` with RFC 5987 percent-decoding) and allows at most 1000
+//! parts; the `crc32` is the IEEE CRC-32 (zlib's) of the file's bytes. Names and file names are
+//! echoed exactly as sent (a backslash is an ordinary character, no path is stripped, `%22` stays
+//! `%22`): the mock shows what the client put on the wire, not how a given framework reads it.
+//! Every connection has a 15 s deadline in total, so an 8 MiB upload over a link slower than about
+//! 5 Mbit/s is cut (the client sees a `Network` error, not the `413`).
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -62,7 +70,7 @@ const MAX_GENERATED: usize = 16 * 1024 * 1024;
 /// How long one connection may take in total (reading, waiting, writing).
 const CONNECTION_DEADLINE: Duration = Duration::from_secs(15);
 /// The only paths whose hits are counted (a fixed set, so random paths cannot grow memory).
-const COUNTED: [&str; 4] = ["/purchase", "/slow", "/saves", "/login"];
+const COUNTED: [&str; 5] = ["/purchase", "/slow", "/saves", "/login", "/upload"];
 
 /// Requests seen per path.
 type Hits = Arc<Mutex<HashMap<String, usize>>>;
@@ -144,8 +152,28 @@ fn accept_loop(listener: &TcpListener, stop: &AtomicBool, hits: &Hits) {
     }
 }
 
-/// The largest request body accepted.
+/// The largest request body accepted (`/upload`: [`MAX_UPLOAD_BODY`]).
 const MAX_REQUEST_BODY: usize = 1024 * 1024;
+/// The largest `/upload` body accepted.
+const MAX_UPLOAD_BODY: usize = 8 * 1024 * 1024;
+/// The most parts `/upload` accepts.
+const MAX_UPLOAD_PARTS: usize = 1000;
+
+fn body_limit(path: &str) -> usize {
+    if path == "/upload" {
+        MAX_UPLOAD_BODY
+    } else {
+        MAX_REQUEST_BODY
+    }
+}
+
+fn too_large_message(path: &str) -> &'static str {
+    if path == "/upload" {
+        "request body larger than 8 MiB"
+    } else {
+        "request body larger than 1 MiB"
+    }
+}
 
 struct Request {
     method: String,
@@ -211,16 +239,17 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Request> {
         lines.filter_map(|line| line.split_once(':')).map(|(n, v)| (n.trim().to_ascii_lowercase(), v.trim().to_string())).collect();
     let rest = buf[head_end + 4..].to_vec();
     let header = |name: &str| headers.iter().find(|(n, _)| n == name).map(|(_, v)| v.to_ascii_lowercase());
+    let limit = body_limit(&path);
     let body = if header("transfer-encoding").is_some_and(|v| v.contains("chunked")) {
-        read_chunked(stream, rest, deadline)?
+        read_chunked(stream, rest, deadline, limit, too_large_message(&path))?
     } else {
         match header("content-length").map(|v| v.parse::<usize>()) {
             None => Ok(Vec::new()),
             Some(Err(_)) => Err((400, "bad Content-Length")),
-            Some(Ok(length)) if length > MAX_REQUEST_BODY => {
-                // Read (and drop) up to 4 MiB of it first, so the client sees the 413 instead of
-                // a reset while it is still writing.
-                let mut left = length.min(4 * MAX_REQUEST_BODY).saturating_sub(rest.len());
+            Some(Ok(length)) if length > limit => {
+                // Read (and drop) up to 4 times the limit first (bounded by the connection
+                // deadline), so the client sees the 413 instead of a reset while it is still writing.
+                let mut left = length.min(limit.saturating_mul(4)).saturating_sub(rest.len());
                 while left > 0 {
                     let n = read_before(stream, &mut chunk, deadline)?;
                     if n == 0 {
@@ -228,7 +257,7 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Request> {
                     }
                     left = left.saturating_sub(n);
                 }
-                Err((413, "request body larger than 1 MiB"))
+                Err((413, too_large_message(&path)))
             }
             Some(Ok(length)) => {
                 let mut body = rest;
@@ -253,7 +282,13 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Request> {
 
 /// A `Transfer-Encoding: chunked` body (`pending` holds what was already read after the head).
 /// `Err((status, why))` for a malformed or too large body.
-fn read_chunked(stream: &mut TcpStream, mut pending: Vec<u8>, deadline: Instant) -> std::io::Result<Result<Vec<u8>, (u16, &'static str)>> {
+fn read_chunked(
+    stream: &mut TcpStream,
+    mut pending: Vec<u8>,
+    deadline: Instant,
+    limit: usize,
+    too_large: &'static str,
+) -> std::io::Result<Result<Vec<u8>, (u16, &'static str)>> {
     let mut chunk = [0u8; 4096];
     let mut body = Vec::new();
     // Make `pending` hold at least `n` bytes.
@@ -307,8 +342,8 @@ fn read_chunked(stream: &mut TcpStream, mut pending: Vec<u8>, deadline: Instant)
                 }
             }
         }
-        if body.len().saturating_add(size) > MAX_REQUEST_BODY {
-            return Ok(Err((413, "request body larger than 1 MiB")));
+        if body.len().saturating_add(size) > limit {
+            return Ok(Err((413, too_large)));
         }
         if !fill(&mut pending, size + 2)? {
             return Ok(Err((400, "chunked body cut short")));
@@ -391,6 +426,10 @@ fn handle(mut stream: TcpStream, hits: &Hits) -> std::io::Result<()> {
             (200, gzip_zeros(n))
         }
         ("POST", "/purchase") => (201, br#"{"ok":true}"#.to_vec()),
+        ("POST", "/upload") => match multipart::parse(request.header("content-type").unwrap_or(""), &request.body) {
+            Ok(parts) => (200, multipart::echo(&parts).into_bytes()),
+            Err(why) => (400, format!(r#"{{"message":{}}}"#, json_string(why)).into_bytes()),
+        },
         ("GET", "/empty") => (204, Vec::new()),
         ("GET", "/redirect") => {
             extra.push(("Location", "/characters/1".into()));
@@ -403,6 +442,7 @@ fn handle(mut stream: TcpStream, hits: &Hits) -> std::io::Result<()> {
         201 => "Created",
         204 => "No Content",
         302 => "Found",
+        400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
         422 => "Unprocessable Content",
@@ -416,6 +456,167 @@ fn handle(mut stream: TcpStream, hits: &Hits) -> std::io::Result<()> {
     stream.write_all(head.as_bytes())?;
     stream.write_all(&body)?;
     stream.flush()
+}
+
+/// A std-only `multipart/form-data` parser (RFC 7578 / RFC 2046) for `/upload`.
+mod multipart {
+    use super::{crc32, json_string, MAX_UPLOAD_PARTS};
+
+    /// One part; its data borrows the request body (no second copy of an 8 MiB upload).
+    pub struct Part<'a> {
+        pub name: String,
+        pub filename: Option<String>,
+        pub content_type: Option<String>,
+        pub data: &'a [u8],
+    }
+
+    /// The boundary parameter of a `multipart/form-data` content type.
+    fn boundary(content_type: &str) -> Result<String, &'static str> {
+        let mut params = content_type.split(';');
+        let kind = params.next().unwrap_or("").trim().to_ascii_lowercase();
+        if kind != "multipart/form-data" {
+            return Err("not multipart/form-data");
+        }
+        for param in params {
+            if let Some((key, value)) = param.split_once('=') {
+                if key.trim().eq_ignore_ascii_case("boundary") {
+                    let value = value.trim().trim_matches('"').to_string();
+                    if value.is_empty() || value.len() > 70 {
+                        return Err("bad boundary");
+                    }
+                    return Ok(value);
+                }
+            }
+        }
+        Err("no boundary")
+    }
+
+    fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+        haystack.get(from..)?.windows(needle.len()).position(|w| w == needle).map(|i| i + from)
+    }
+
+    /// `key="value"` / `key=value` parameters of a header, quotes removed. Read the way browsers
+    /// write them (WHATWG: `"` is sent as `%22`, never as `\"`): a quoted value ends at the next
+    /// `"`, and a backslash is an ordinary character. So the echo shows the name exactly as the
+    /// client sent it (`C:\Users\me\a.png` stays whole; nothing is path-stripped or decoded), which
+    /// is what the crate's tests compare. Real frameworks differ here (see the README).
+    fn params(value: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut rest = value;
+        while let Some((key, after)) = rest.split_once('=') {
+            let key = key.rsplit(';').next().unwrap_or("").trim().to_ascii_lowercase();
+            let after = after.trim_start();
+            let (value, next) = if let Some(quoted) = after.strip_prefix('"') {
+                let end = quoted.find('"').unwrap_or(quoted.len());
+                (quoted[..end].to_string(), quoted.get(end + 1..).unwrap_or(""))
+            } else {
+                let end = after.find(';').unwrap_or(after.len());
+                (after[..end].trim().to_string(), &after[end..])
+            };
+            out.push((key, value));
+            rest = next;
+        }
+        out
+    }
+
+    /// RFC 5987 `UTF-8''percent-encoded`.
+    fn ext_value(value: &str) -> Option<String> {
+        let (charset, rest) = value.split_once('\'')?;
+        let (_, encoded) = rest.split_once('\'')?;
+        if !charset.eq_ignore_ascii_case("utf-8") {
+            return None;
+        }
+        let bytes = encoded.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).ok()
+    }
+
+    pub fn parse<'a>(content_type: &str, body: &'a [u8]) -> Result<Vec<Part<'a>>, &'static str> {
+        let boundary = boundary(content_type)?;
+        let delimiter = format!("--{boundary}");
+        let delimiter = delimiter.as_bytes();
+        // Skip a preamble, then expect the first delimiter.
+        let mut at = find(body, delimiter, 0).ok_or("no opening boundary")?;
+        let mut parts = Vec::new();
+        loop {
+            at += delimiter.len();
+            let tail = body.get(at..at + 2).ok_or("cut short after a boundary")?;
+            if tail == b"--" {
+                return Ok(parts);
+            }
+            if tail != b"\r\n" {
+                return Err("a boundary is not followed by CRLF or --");
+            }
+            at += 2;
+            let head_end = find(body, b"\r\n\r\n", at).ok_or("part headers not terminated")?;
+            let head = std::str::from_utf8(&body[at..head_end]).map_err(|_| "part headers are not UTF-8")?;
+            let mut name = None;
+            let mut filename = None;
+            let mut filename_ext = None;
+            let mut content_type = None;
+            for line in head.split("\r\n") {
+                let (key, value) = line.split_once(':').ok_or("bad part header")?;
+                match key.trim().to_ascii_lowercase().as_str() {
+                    "content-disposition" => {
+                        if !value.trim().to_ascii_lowercase().starts_with("form-data") {
+                            return Err("a part is not form-data");
+                        }
+                        for (key, value) in params(value) {
+                            match key.as_str() {
+                                "name" => name = Some(value),
+                                "filename" => filename = Some(value),
+                                "filename*" => filename_ext = ext_value(&value),
+                                _ => {}
+                            }
+                        }
+                    }
+                    "content-type" => content_type = Some(value.trim().to_string()),
+                    _ => {}
+                }
+            }
+            let data_start = head_end + 4;
+            let mut end_marker = b"\r\n".to_vec();
+            end_marker.extend_from_slice(delimiter);
+            let data_end = find(body, &end_marker, data_start).ok_or("a part is not closed by a boundary")?;
+            let name = name.ok_or("a part has no name")?;
+            parts.push(Part { name, filename: filename_ext.or(filename), content_type, data: &body[data_start..data_end] });
+            if parts.len() > MAX_UPLOAD_PARTS {
+                return Err("too many parts");
+            }
+            at = data_end + 2;
+        }
+    }
+
+    /// `{"fields":[…],"files":[…]}`, both in body order.
+    pub fn echo(parts: &[Part]) -> String {
+        let mut fields = Vec::new();
+        let mut files = Vec::new();
+        for part in parts {
+            match &part.filename {
+                None => fields.push(format!(r#"{{"name":{},"value":{}}}"#, json_string(&part.name), json_string(&String::from_utf8_lossy(part.data)))),
+                Some(filename) => files.push(format!(
+                    r#"{{"name":{},"filename":{},"content_type":{},"size":{},"crc32":"{:08x}"}}"#,
+                    json_string(&part.name),
+                    json_string(filename),
+                    part.content_type.as_deref().map_or_else(|| "null".to_string(), json_string),
+                    part.data.len(),
+                    crc32(part.data)
+                )),
+            }
+        }
+        format!(r#"{{"fields":[{}],"files":[{}]}}"#, fields.join(","), files.join(","))
+    }
 }
 
 fn json_string(s: &str) -> String {

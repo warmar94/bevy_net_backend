@@ -3,7 +3,7 @@
 //!
 //! `Include` is expanded HERE, before ssh2-config sees the text (ssh2-config follows includes
 //! recursively without any limit: a file that includes itself overflows the stack and aborts the
-//! process). Our expansion: depth at most 16 (OpenSSH's limit), at most 64 files, 1 MiB for all
+//! process). The crate's expansion: depth at most 16 (OpenSSH's limit), at most 64 files, 1 MiB for all
 //! files together, `~` and relative paths as OpenSSH (relative to `~/.ssh`), glob patterns. The
 //! text handed to ssh2-config contains no `Include` line.
 

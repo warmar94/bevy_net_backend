@@ -11,7 +11,7 @@ readme = "README.md"
 keywords = ["bevy", "http", "websocket", "ssh", "json"]
 categories = ["game-development", "network-programming", "web-programming::http-client"]
 # Not part of the published package.
-exclude = ["NOTES.md", "docs/", "/target"]
+exclude = ["NOTES.md", "docs/", "/target", "bevy_net_backend-cover.png"]
 
 [features]
 # Deliberately NOT empty: the crate exists to call an HTTPS JSON API, so the default build does
@@ -72,7 +72,7 @@ russh = { version = "=0.63.3", default-features = false, features = ["ring"], op
 tokio = { version = "1.44", default-features = false, features = ["rt", "net", "time", "sync", "macros", "io-util"], optional = true }
 # `~/.ssh/config` host aliases (HostName, Port, User, IdentityFile).
 ssh2-config = { version = "=0.8.1", optional = true }
-# `Include` patterns of ssh_config, expanded by us with limits (the same glob ssh2-config uses).
+# `Include` patterns of ssh_config, expanded by the crate with limits (the same glob ssh2-config uses).
 glob = { version = "0.3", optional = true }
 # Hashed known_hosts entries (`|1|salt|hash` = HMAC-SHA1); the same versions russh uses.
 hmac = { version = "0.13", optional = true }
@@ -165,6 +165,20 @@ name = "redaction"
 [[test]]
 name = "loopback"
 required-features = ["http"]
+
+[[test]]
+name = "multipart"
+required-features = ["http", "json"]
+
+# Live multipart checks against the mock behind a TLS proxy and against real frameworks' echo
+# servers. `#[ignore]`d: BNB_TEST_HTTPS_URL and / or BNB_TEST_MULTIPART_URLS.
+[[test]]
+name = "live_multipart"
+required-features = ["http", "json"]
+
+[[example]]
+name = "upload"
+required-features = ["http", "json"]
 
 # Live HTTPS checks against a test server (the mock behind a TLS proxy). `#[ignore]`d: run only on
 # request, with BNB_TEST_HTTPS_URL set.
