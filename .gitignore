@@ -1,0 +1,29 @@
+# Build output (also holds throwaway research probes and test scratch: target/tmp)
+/target
+**/*.rs.bk
+*.pdb
+
+# Editors / OS
+.vs/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Secrets — never in the repo (API tokens, keys, a real backend's URL + credentials)
+.env
+.env.*
+*.pem
+*.key
+credentials.toml
+.cargo/credentials*
+
+# Scratch
+/tmp
+
+# Private notes — local only
+NOTES.md
+
+# Private design docs — local only
+/docs/

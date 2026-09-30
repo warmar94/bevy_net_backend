@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+
+# Rust is pinned to our dev version (never @stable): a newer Rust's new clippy lints must not turn CI red on
+# unchanged code. Upgrading Rust = bump this in every job, run clippy, fix. Users are unaffected (rust-version).
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  # Every feature combination must compile cleanly on its own (features are additive).
+  clippy:
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "--no-default-features"
+          - ""
+          - "--features gzip"
+          - "--no-default-features --features http"
+          - "--no-default-features --features json"
+          - "--all-features"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked --all-targets ${{ matrix.features }} -- -D warnings
+
+  # Tests use the fake transport and a mock server on 127.0.0.1 inside the test process: no outside network.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --no-default-features
+      - run: cargo test --locked
+      - run: cargo test --locked --features gzip
+      - run: cargo test --locked --no-default-features --features http
+      - run: cargo test --locked --no-default-features --features json
+      - run: cargo test --locked --all-features
+
+  doc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --locked --no-deps --all-features
+      - run: cargo doc --locked --no-deps --no-default-features
+
+  # The minimum supported Rust version (Cargo.toml `rust-version`) really builds.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --all-features
+      - run: cargo build --locked --no-default-features
+
+  # The dependency rules: no async runtime, no OpenSSL / native-tls / aws-lc, no second TLS provider.
+  deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - run: |
+          for f in "" "--all-features"; do
+            if cargo tree --locked --target all -e normal,build $f --prefix none | grep -E '^(tokio|openssl-sys|native-tls|aws-lc-sys|aws-lc-rs|reqwest|hyper|rustls-rustcrypto) '; then
+              echo "forbidden dependency with [$f]"; exit 1
+            fi
+          done
+      - run: |
+          if grep -A1 'name = "bevy' Cargo.lock | grep -q 'version = "0.19.1"'; then
+            echo "a Bevy 0.19.1 crate is in Cargo.lock"; exit 1
+          fi

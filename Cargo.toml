@@ -1,0 +1,87 @@
+[package]
+name = "bevy_net_backend"
+version = "0.1.0"
+edition = "2021"
+# Bevy 0.19's own minimum.
+rust-version = "1.95"
+description = "Call your game's own HTTPS JSON API from Bevy: typed requests and answers as Bevy messages, exactly one answer per request (success, HTTP status, network, timeout, cancel or shutdown), game-supplied credentials with redacted secrets, a small worker-thread pool over ureq, and a fake transport for tests."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/warmar94/bevy_net_backend"
+readme = "README.md"
+keywords = ["bevy", "http", "json", "api", "client"]
+categories = ["game-development", "network-programming", "web-programming::http-client"]
+# Not part of the published package.
+exclude = ["NOTES.md", "docs/", "/target"]
+
+[features]
+# Deliberately NOT empty: the crate exists to call an HTTPS JSON API, so the default build does
+# exactly that with no feature fiddling. `--no-default-features` still builds the core types and
+# the fake transport.
+default = ["http", "json"]
+# The real transport: ureq 3 (blocking HTTP/1.1) on a small pool of worker threads, rustls for TLS
+# with ring's crypto (compiles C and assembly: a C compiler is needed at build time) and the Mozilla
+# root certificates (webpki-roots).
+http = ["dep:ureq", "dep:rustls"]
+# Typed JSON requests and answers (`get_json`, `post_json`, `JsonResponse<T>`) over serde_json.
+json = ["dep:serde", "dep:serde_json"]
+# Accept gzip-compressed responses (ureq's gzip decoder, flate2).
+gzip = ["http", "ureq/gzip"]
+
+# Bevy is pinned EXACTLY and only its sub-crates are used, without default features: the crate adds
+# no Bevy feature a game did not ask for, and a game on Bevy 0.19.0 ends up with ONE Bevy.
+[dependencies]
+bevy_app = { version = "=0.19.0", default-features = false, features = ["std"] }
+bevy_ecs = { version = "=0.19.0", default-features = false, features = ["std"] }
+# `Time<Real>` for the request deadlines.
+bevy_time = { version = "=0.19.0", default-features = false, features = ["std"] }
+# Bevy's logging goes through `tracing`; its subscriber (LogPlugin) picks these messages up.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+# The public vocabulary: `Method`, `StatusCode`, `HeaderMap`, `HeaderName`, `HeaderValue`, `Uri`.
+# ureq uses the same crate, so it costs nothing extra. Caret, not `=`: a shared vocabulary crate
+# (like serde_json below) must be able to move with the game's other dependencies.
+http = { version = "1.5" }
+serde = { version = "1", default-features = false, features = ["std"], optional = true }
+serde_json = { version = "1.0.140", optional = true }
+# The ring provider is always handed to ureq explicitly (never a process-wide default), so a game
+# that also links another rustls provider (e.g. aws-lc-rs) cannot trigger rustls' provider panic.
+ureq = { version = "=3.4.2", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"], optional = true }
+rustls = { version = "=0.23.45", default-features = false, features = ["std", "tls12", "ring"], optional = true }
+
+[dev-dependencies]
+# Tests + examples: MinimalPlugins, headless.
+bevy = { version = "=0.19.0", default-features = false, features = ["std", "bevy_log"] }
+bevy_headless_test = { version = "0.1.0", default-features = false }
+serde = { version = "1", features = ["derive"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+# Examples run against a mock server they start on 127.0.0.1 (or against `BACKEND_URL`).
+[[example]]
+name = "mock_server"
+
+[[example]]
+name = "fetch_json"
+required-features = ["http", "json"]
+
+[[example]]
+name = "post_with_token"
+required-features = ["http", "json"]
+
+[[test]]
+name = "fake"
+
+[[test]]
+name = "redaction"
+
+[[test]]
+name = "loopback"
+required-features = ["http"]
+
+# Live HTTPS checks against a test server (the mock behind a TLS proxy). `#[ignore]`d: run only on
+# request, with BNB_TEST_HTTPS_URL set.
+[[test]]
+name = "live"
+required-features = ["http", "json"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

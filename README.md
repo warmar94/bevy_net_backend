@@ -12,7 +12,8 @@ Django backend serves.
 A system fires a request and gets a `RequestId` back at once. A few frames later **exactly one
 answer** arrives as a Bevy message: the decoded value, or an error that says what happened
 (network, TLS, timeout, an HTTP status with the server's body, a decode error, cancelled, or
-shutdown when the app exits). Nothing blocks a frame, nothing is dropped silently, nothing panics.
+shutdown when the app exits). The network never blocks a frame, nothing is dropped silently,
+nothing panics.
 
 ```rust,no_run
 use bevy::prelude::*;
@@ -266,7 +267,7 @@ app.add_plugins(BackendPlugin::new(HttpConfig::new("https://api.example.com")))
 - A 2xx body is decoded into `T`. An empty body decodes as JSON `null`, so `()` and `Option<T>`
   accept a `204 No Content`.
 - A type that was never registered is not sent: the request is answered on `HttpResponse`
-  with `InvalidRequest` (naming the missing `add_json_response`) and a warning is logged.
+  with `InvalidRequest` (naming the missing `add_json_response`) and an error is logged.
 - A body that cannot be serialized is answered with `Encode` and never sent.
 
 ### 3. Raw requests and full control
@@ -295,9 +296,14 @@ fn raw(backend: Res<HttpClient>) {
 `OutgoingRequest` has `new(method, path)` and `get` / `post` / `put` / `patch` / `delete`, plus
 `with_query`, `with_header`, `with_body`, `with_json`, `with_timeout`, `without_credentials`.
 Paths start with `/` and are appended to the base URL; absolute URLs and a `?` in the path are
-refused (use `with_query`, which percent-encodes names and values). A path is sent as written:
-percent-encode user text you put into it. An invalid header does not panic: the request is
-answered with `InvalidRequest` and never sent.
+refused (use `with_query`, which percent-encodes names and values). So is anything a server
+could resolve outside the base URL's path, at every level of percent-decoding: `.` / `..`
+segments (split on `/` and `\`, `..;` included), backslashes, encoded separators (`%2F`, `%5C`)
+and control characters (`%00` included). A path is sent as
+written: percent-encode user text you put into it. The methods sent are the standard ones except
+`CONNECT` (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD` without a body, `OPTIONS`, `TRACE`).
+An invalid header, method or path does not panic: the request is answered with `InvalidRequest`
+and never sent.
 
 ### 4. Reading answers and errors
 
@@ -338,22 +344,28 @@ fn on_save(mut answers: MessageReader<JsonResponse<Save>>) {
 | Error | When | Sent? |
 |---|---|---|
 | `InvalidRequest(why)` | bad path, header, base URL, unregistered JSON type, credentials that cannot apply | no |
-| `InsecureHttp { host }` | plain `http://` to a non-loopback host without `allow_insecure_http` | no |
+| `InsecureHttp { host }` | plain text (`http://`) to a non-loopback host without `allow_insecure_http` | no |
 | `Encode(why)` | the JSON body cannot be serialized | no |
-| `Network(why)` | DNS, connect, reset, protocol error (ureq's words) | yes |
-| `Tls(why)` | TLS failure: handshake, certificate (rustls' / ureq's words) | yes |
-| `Timeout(why)` | ureq's timeout, or the plugin's deadline (timeout + 5 s) | yes |
+| `Network(why)` | DNS, connect, reset, protocol error, worker threads not starting (ureq's words) | no for a DNS / connect / worker-start failure, else maybe |
+| `Tls(why)` | TLS failure: handshake, certificate (rustls' / ureq's words) | no for a handshake or certificate failure (before any request byte), else maybe |
+| `Timeout(why)` | the timeout ran out; it counts from hand-over to the transport, waiting for a free worker included | no if `why` starts with `not sent:`, else maybe |
 | `BodyTooLarge { limit }` | the response body is over the limit | yes |
 | `Status(response)` | a status outside 200–299, 3xx included (redirects are not followed) | yes |
 | `Decode { message, response }` | a 2xx body that is not the expected JSON | yes |
-| `Cancelled` | `HttpClient::cancel` | maybe |
-| `Shutdown` | the app exited (`AppExit`) first | maybe |
-| `NoTransport` | no `HttpTransportRes`, or it was removed / replaced first | no / maybe |
+| `Cancelled` | `HttpClient::cancel` | no if it was still waiting for a worker, else maybe |
+| `Shutdown` | the app exited (`AppExit`) first | no, unless it was already on the wire before the exit frame |
+| `NoTransport` | no `HttpTransportRes`, or it was removed / replaced first | no if it was still waiting for a worker, else maybe |
+
+"Waiting for a worker" is the `UreqTransport` queue: a request answered while it waits there is
+never sent afterwards. One already on the wire may still reach the server; its result is
+discarded.
 
 `BackendError` is `#[non_exhaustive]`: keep a catch-all arm. `error.status()` and
 `error.response()` give the server's answer for `Status` and `Decode`; `RawResponse` has
-`status`, `headers`, `body`, `text()` and `json::<E>()`. The `Decode` message is serde_json's and
-may quote part of the body; the crate itself never logs it.
+`status`, `headers`, `body`, `text()` and `json::<E>()`. `Display` of every error is safe to log:
+it never shows a body, a header value or a query. The `message` field of `Decode` is serde_json's
+text and may quote part of the body (a token, say); the crate never logs it, and neither should a
+release build.
 
 ### 5. Logging in: credentials
 
@@ -437,8 +449,13 @@ impl Credentials for Session {
   show the secret in `Debug`; `OutgoingRequest` and `PreparedRequest` print header names but no
   header values, no query values and no body; `RawResponse` prints the body's length only.
 - The crate's own log lines never contain a header value, a query string or a body.
-- A query key ends up in server access logs, and ureq logs full paths and queries at `trace`
-  level: prefer a header where your API allows it.
+- **Dependency logs at `trace` contain secrets.** At `trace` level the HTTP client logs raw request
+  and response bytes (`ureq_proto`) and full paths with queries (`ureq`): `Authorization` headers,
+  login bodies, tokens in answers. Keep those targets below `trace`, e.g.
+  `RUST_LOG=trace,ureq=debug,ureq_proto=debug`, or in Bevy
+  `LogPlugin { filter: "wgpu=error,naga=warn,ureq=debug,ureq_proto=debug".into(), ..default() }`.
+  Bevy's default level (`info`) is safe.
+- A query key also ends up in server access logs: prefer a header where your API allows it.
 - Methods added to `Credentials` later always come with a default implementation.
 - Storing the token between sessions (keyring, file) and refreshing it are the game's job.
 
@@ -470,11 +487,21 @@ fn spinner(in_flight: Res<InFlight>) {
   wire keeps its worker thread until it finishes or times out (a blocking call cannot be
   interrupted); its result is discarded. Cancelling an answered id does nothing.
 - **InFlight** lists requests handed to the transport and not answered yet. A request enters it
-  in `PostUpdate` of the frame it was made in.
-- **App exit:** in the frame an `AppExit` message is written, `BackendSystems::Exit` (in `Last`)
+  in `PostUpdate` of the frame it was made in. `describe(id)` returns a `RequestInfo` (kind,
+  method, target path without the query).
+- **App exit:** in the frame an `AppExit` message is written, nothing new is sent:
+  `BackendSystems::Send` hands no request to the transport, and `BackendSystems::Exit` (in `Last`)
   answers every open request with `Shutdown` (results that already arrived are delivered as they
-  are) and stops the worker threads without waiting for busy ones. Systems ordered after
-  `BackendSystems::Exit` in `Last` can read those answers.
+  are) and stops the worker threads without waiting for busy ones. **A request answered `Shutdown`
+  was never sent**, except one that was already on the wire before that frame (it may still reach
+  the server). Systems ordered after `BackendSystems::Exit` in `Last` can read those answers.
+  Write `AppExit` before `BackendSystems::Send` (anywhere in `Update` or earlier is fine; a
+  `PostUpdate` writer must be ordered `.before(BackendSystems::Send)`): written later, requests
+  of that frame may still go out, and written after `Exit` in `Last` it is seen by nobody in this
+  crate.
+- **Save on quit:** send the save, wait for its answer (`Ok` or an error), and only then write
+  `AppExit`. A save fired in the same frame as `AppExit` is answered `Shutdown` and never sent.
+  (Flushing pending requests on exit is not a feature of 0.1.0.)
 
 ### 7. Plain http:// for local development
 
@@ -563,22 +590,35 @@ implementation.
 - **Scheduling.** `BackendSystems::Receive` runs in `First`, after Bevy's `TimeSystems` and
   before `MessageUpdateSystems`, so answers are readable in `PreUpdate` / `Update` of the frame
   they arrive. `BackendSystems::Send` runs in `PostUpdate`, so a request made in `Update` goes
-  out the same frame (one made after it goes out next frame). `BackendSystems::Exit` runs in
+  out the same frame (one made after it goes out next frame). A game system in `PostUpdate` that
+  fires requests should be ordered `.before(BackendSystems::Send)` if the frame matters: both only
+  read `HttpClient`, so the strict ambiguity check cannot flag the race. `BackendSystems::Exit` runs in
   `Last` only in a frame with `AppExit`. The sets are `#[non_exhaustive]` and phase-named, so a
   later kind of connection can use the same three.
 - **Threads.** ureq is blocking. `UreqTransport` starts its worker threads (named
   `net-backend-N`) on the first request and shares one `ureq::Agent` (keep-alive connection
-  pool) between them. At most `workers` requests are on the wire; the rest wait in a queue.
-  Worker results come back over a channel that `poll` drains without blocking. A panic inside
-  the HTTP client is caught and answered as `Network`.
-- **Timeouts.** ureq's global timeout (per request) ends the call. As a backstop the plugin
-  answers `Timeout` itself when a request is still waiting after its timeout + 5 s
-  (`DEADLINE_GRACE`, measured on `Time<Real>`, or a monotonic clock without `TimePlugin`).
+  pool) between them. At most `workers` requests are on the wire; the rest wait in a queue, and
+  that wait counts against their timeout. A request answered while it waits (cancel, timeout,
+  exit, transport removed or replaced) is dropped from the queue, never sent. Worker results come
+  back over a channel that `poll` drains without blocking. A panic inside the HTTP client is
+  caught and answered as `Network` (with the usual unwinding panics; a game built with
+  `panic = "abort"` aborts instead).
+- **Timeouts.** A request's timeout counts from the moment it is handed to the transport. The
+  worker gives ureq what is left of it (a request that waited its whole timeout in the queue is
+  answered `Timeout("not sent: …")`). As a backstop the plugin answers `Timeout` itself when a
+  request is still waiting after its timeout + 5 s (`DEADLINE_GRACE`, measured on `Time<Real>`,
+  or a monotonic clock without `TimePlugin`). `Time<Real>` follows Bevy's
+  `TimeUpdateStrategy`: with a `Manual*` strategy (replays, some headless servers) the backstop
+  fires on that clock, early or late; ureq's own timeout always uses the wall clock.
 - **Status codes.** The transport returns every status; the plugin turns anything outside
   200–299 into `Status`. Redirects are not followed (ureq `max_redirects(0)`), so a redirect can
   never downgrade `https://` to `http://` or carry credentials to another host.
-- **Body limit.** The response body is read with a cap (`max_body_bytes`); the plugin checks it
-  again for any transport.
+- **Body limit.** The response body is read with a cap (`max_body_bytes`) on the bytes on the
+  wire AND on the bytes after gzip decoding (feature `gzip`), so a gzip bomb stops at the limit;
+  the plugin checks it again for any transport.
+- **JSON decoding** runs on the main thread in `Receive`, in the frame the answer arrives. A
+  multi-megabyte answer can cost that frame a few milliseconds; keep big payloads raw
+  (`HttpResponse`) or small.
 - **TLS.** rustls with ring's crypto and the Mozilla root certificates (webpki-roots; the OS
   certificate store is not used). The ring provider is always handed to ureq explicitly and never
   installed process-wide, so a game that also links another rustls provider (for example
@@ -617,8 +657,9 @@ Everything is re-exported at the crate root; `prelude` holds the everyday items.
 | `Credentials` | trait | `apply(&self, &mut OutgoingRequest)`. |
 | `BackendCredentials` | resource | `new`, `set`, `clear`, `is_set`. |
 | `BearerToken`, `ApiKeyHeader`, `ApiKeyQuery`, `JsonBodyField` | credentials | ready-made `Credentials` (`JsonBodyField`: feature `json`). |
-| `Secret` | string | redacted in `Debug` / `Display`; `new`, `expose`, `is_empty`. |
-| `InFlight` | resource | `contains`, `len`, `is_empty`, `ids`, `describe`. |
+| `Secret` | string | redacted in `Debug` / `Display`; `new`, `expose`, `is_empty`. No comparison, no zeroing on drop. |
+| `InFlight` | resource | `contains`, `len`, `is_empty`, `ids`, `describe` (→ `RequestInfo`). |
+| `RequestInfo` (struct), `RequestKind` (enum) | types | what a pending request is: `kind` (`Http`), `method`, `target`; `#[non_exhaustive]`. |
 | `HttpTransport` | trait | `submit`, `poll`, `cancel`, `shutdown`. |
 | `HttpTransportResult` | type | `Result<RawResponse, BackendError>`. |
 | `HttpTransportRes` | resource | `new(transport)`. |
@@ -635,10 +676,16 @@ Everything is re-exported at the crate root; `prelude` holds the everyday items.
   body limit) before it is delivered.
 - **No redirects followed**: a 3xx arrives as `Status` with its `Location` header.
 - **No retries, no offline queue, no caching, no cookies.** Retry in your game if a request
-  matters; the error kind tells you whether it was sent.
+  matters; the error kind and the "Sent?" column in
+  [Reading answers and errors](#4-reading-answers-and-errors) tell you whether it may have been sent.
 - **No token refresh, no keyring:** credentials are whatever the game puts into
   `BackendCredentials`.
 - **One base URL** per app. Paths are relative to it; absolute URLs are refused.
+- **A reverse proxy in front of your API must pass responses through unchanged**: no
+  decompressing or recompressing on its own (Caddy: no `encode` directive for these routes; nginx:
+  `gzip off`). The body limit and gzip handling assume the client sees exactly what your
+  application sent; a proxy that re-encodes can turn a body under the limit into one over it, or
+  add a `Content-Encoding` the client (without feature `gzip`) cannot read.
 - **Root certificates** come from webpki-roots (Mozilla's list), not the OS store: a private CA
   or a corporate TLS-inspecting proxy is not trusted.
 - **Cancel does not interrupt** a request already on the wire; it holds its worker thread until
@@ -660,13 +707,13 @@ from `examples/mock_server.rs` on 127.0.0.1 inside the example process.
 |---|---|
 | `fetch_json` | `get_json::<Character>`, matching the answer by id, error bodies. |
 | `post_with_token` | 401 before login, login `without_credentials`, `BearerToken`, a 422 validation error decoded from the error body, a successful authenticated `POST`. |
-| `mock_server` | the mock API on its own (60 s or the seconds given; 127.0.0.1 and a free port, or the address given), and its JSON contract. |
+| `mock_server` | the mock API on its own and its JSON contract: `--seconds N` (maximum runtime, default 60; it exits by itself), `--bind ADDR` (default `127.0.0.1:0`). |
 
 ```text
 cargo run --example fetch_json
 cargo run --example post_with_token
-cargo run --example mock_server -- 120
-cargo run --example mock_server -- 3600 127.0.0.1:8080
+cargo run --example mock_server -- --seconds 120
+cargo run --example mock_server -- --seconds 1800 --bind 127.0.0.1:8080
 BACKEND_URL=http://127.0.0.1:8000/api cargo run --example fetch_json
 ```
 
@@ -699,8 +746,14 @@ request would stall asset IO; a dedicated pool cannot.
 
 **Can I call two different APIs?** Not in 0.1.0: one base URL per app.
 
-**Is the answer delivered if my reader runs in `PostUpdate`?** Yes: messages stay readable for
-two frames; `PreUpdate` and `Update` just see them first.
+**Is the answer delivered if my reader runs in `PostUpdate`?** Yes. Answers are written in
+`First` before Bevy's message update, so they are readable in every schedule of that frame (and
+in the next frame's `First` before the update), then dropped. A reader that runs only every
+other frame can miss them.
+
+**Can I build a `JsonResponse<T>` myself for a unit test?** No (it is `#[non_exhaustive]` and
+`RequestId` has no public constructor). Drive your systems through the plugin with a
+`FakeHttpTransport` instead (see [Testing your game](#8-testing-your-game-without-a-server)).
 
 **Where does the token live between sessions?** Wherever your game keeps it; this crate only
 sends what is in `BackendCredentials`.
