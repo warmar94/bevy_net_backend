@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2021"
 # Bevy 0.19's own minimum.
 rust-version = "1.95"
-description = "Call your game's own HTTPS JSON API from Bevy: typed requests and answers as Bevy messages, exactly one answer per request (success, HTTP status, network, timeout, cancel or shutdown), game-supplied credentials with redacted secrets, a small worker-thread pool over ureq, and a fake transport for tests."
+description = "Talk to your game's own backend from Bevy: HTTPS JSON requests and (feature `ws`) named WebSocket connections, typed answers as Bevy messages, exactly one answer per request, reconnect with backoff, game-supplied credentials with redacted secrets, no async runtime, and fake transports for tests."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/warmar94/bevy_net_backend"
 readme = "README.md"
-keywords = ["bevy", "http", "json", "api", "client"]
+keywords = ["bevy", "http", "websocket", "json", "client"]
 categories = ["game-development", "network-programming", "web-programming::http-client"]
 # Not part of the published package.
 exclude = ["NOTES.md", "docs/", "/target"]
@@ -26,6 +26,9 @@ http = ["dep:ureq", "dep:rustls"]
 json = ["dep:serde", "dep:serde_json"]
 # Accept gzip-compressed responses (ureq's gzip decoder, flate2).
 gzip = ["http", "ureq/gzip"]
+# Named WebSocket connections: tungstenite (sync, no async runtime) on one dedicated thread per
+# connection, TLS through the same rustls + ring setup as `http`. No permessage-deflate.
+ws = ["dep:tungstenite", "dep:rustls", "dep:webpki-roots"]
 
 # Bevy is pinned EXACTLY and only its sub-crates are used, without default features: the crate adds
 # no Bevy feature a game did not ask for, and a game on Bevy 0.19.0 ends up with ONE Bevy.
@@ -46,6 +49,12 @@ serde_json = { version = "1.0.140", optional = true }
 # that also links another rustls provider (e.g. aws-lc-rs) cannot trigger rustls' provider panic.
 ureq = { version = "=3.4.2", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"], optional = true }
 rustls = { version = "=0.23.45", default-features = false, features = ["std", "tls12", "ring"], optional = true }
+# The WebSocket protocol engine (feature `ws`): only its `handshake` feature, none of its TLS
+# features (they would call `ClientConfig::builder()` and bring a second webpki-roots).
+tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"], optional = true }
+# Mozilla's root certificates for `wss://` (the same crate ureq uses for `https://`). Caret: the root
+# list must be able to move forward.
+webpki-roots = { version = "1.0.9", optional = true }
 
 [dev-dependencies]
 # Tests + examples: MinimalPlugins, headless.
@@ -53,6 +62,9 @@ bevy = { version = "=0.19.0", default-features = false, features = ["std", "bevy
 bevy_headless_test = { version = "0.1.0", default-features = false }
 serde = { version = "1", features = ["derive"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+# A throwaway test CA + localhost certificate generated in memory for the TLS tests (ring backend,
+# no aws-lc). Tests only: nothing key-shaped is in the repository or the package.
+rcgen = { version = "=0.14.10", default-features = false, features = ["ring"] }
 
 # Examples run against a mock server they start on 127.0.0.1 (or against `BACKEND_URL`).
 [[example]]
@@ -65,6 +77,33 @@ required-features = ["http", "json"]
 [[example]]
 name = "post_with_token"
 required-features = ["http", "json"]
+
+[[example]]
+name = "mock_ws_server"
+required-features = ["ws", "json"]
+
+[[example]]
+name = "chat_client"
+required-features = ["ws", "json"]
+
+[[test]]
+name = "ws_fake"
+required-features = ["ws", "json"]
+
+# The `ws` feature without `json`: raw frames only.
+[[test]]
+name = "ws_raw"
+required-features = ["ws"]
+
+[[test]]
+name = "ws_loopback"
+required-features = ["ws", "json"]
+
+# Live WSS checks against a test server (the WS mock behind a TLS proxy). `#[ignore]`d: run only
+# on request, with BNB_TEST_WSS_URL set.
+[[test]]
+name = "live_ws"
+required-features = ["ws", "json"]
 
 [[test]]
 name = "fake"

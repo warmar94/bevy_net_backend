@@ -4,10 +4,12 @@
 [![CI](https://github.com/warmar94/bevy_net_backend/actions/workflows/ci.yml/badge.svg)](https://github.com/warmar94/bevy_net_backend/actions/workflows/ci.yml)
 [![Bevy 0.19.0](https://img.shields.io/badge/Bevy-0.19.0-informational)](https://bevyengine.org)
 [![ureq 3.4.2](https://img.shields.io/badge/ureq-3.4.2-orange)](https://crates.io/crates/ureq)
+[![tungstenite 0.30.0 (optional)](https://img.shields.io/badge/tungstenite-0.30.0%20(optional)-orange)](https://crates.io/crates/tungstenite)
 
 Call **your game's own HTTPS JSON API** from [Bevy](https://bevyengine.org): accounts, save
 games, leaderboards, inventories, matchmaking tickets, whatever your Laravel, Express, Go or
-Django backend serves.
+Django backend serves. With feature `ws`, also **named WebSocket connections** to it: live
+chat, lobbies, match events and server pushes, with reconnect and heartbeat built in.
 
 A system fires a request and gets a `RequestId` back at once. A few frames later **exactly one
 answer** arrives as a Bevy message: the decoded value, or an error that says what happened
@@ -61,6 +63,8 @@ fn main() {
   - [7. Plain http:// for local development](#7-plain-http-for-local-development)
   - [8. Testing your game without a server](#8-testing-your-game-without-a-server)
   - [9. Your own transport](#9-your-own-transport)
+  - [10. WebSocket connections (feature `ws`)](#10-websocket-connections-feature-ws)
+- [Backend compatibility](#backend-compatibility)
 - [How it works](#how-it-works)
 - [TLS exception: the default build is not pure Rust](#tls-exception-the-default-build-is-not-pure-rust)
 - [API reference](#api-reference)
@@ -91,7 +95,11 @@ fn main() {
 - **Safe defaults:** HTTPS only (plain `http://` only to `localhost` / `127.x.x.x` / `[::1]`
   unless you allow it), a 15 s timeout, a 10 MiB response body limit, redirects not followed.
 - **Testable offline:** a `FakeHttpTransport` answers from scripted routes; your tests need no server.
-- **Small and runtime-free:** ureq 3 (blocking HTTP/1.1) + rustls; no tokio, no hyper, no OpenSSL.
+- **WebSocket (feature `ws`):** named connections (`connect("main", …)`), typed requests and
+  pushes over a JSON envelope, reconnect with backoff and jitter, heartbeat and dead-peer
+  detection, credentials on every handshake, one thread per connection.
+- **Small and runtime-free:** ureq 3 (blocking HTTP/1.1), tungstenite (sync) + rustls; no tokio, no
+  hyper, no OpenSSL.
 
 ## Cargo features
 
@@ -100,6 +108,7 @@ fn main() {
 | `http` | yes | The real transport, `UreqTransport`: ureq 3.4 on worker threads, rustls with ring's crypto and the Mozilla root certificates (webpki-roots). ring compiles C and assembly (see [TLS exception](#tls-exception-the-default-build-is-not-pure-rust)). |
 | `json` | yes | `get_json` / `post_json` / `send_json`, `JsonResponse<T>`, `OutgoingRequest::with_json`, `RawResponse::json`, `JsonBodyField` (serde + serde_json). |
 | `gzip` | no | Accept gzip-compressed responses (ureq's decoder, flate2). |
+| `ws` | no | Named WebSocket connections: `WsClient`, `WsConnections`, the `Ws*` messages, `TungsteniteTransport` (tungstenite 0.30, sync, one thread per connection, rustls + ring, no permessage-deflate). With `json`: `JsonEnvelope`, `WsRequest`, `WsPushMessage`, `WsResponse<T>`, `WsPush<P>`. |
 
 Without `http` the crate still builds: every type, the `FakeHttpTransport` and your own
 `HttpTransport` work, and requests without a transport are answered with `NoTransport`.
@@ -119,6 +128,9 @@ Other sets:
 ```toml
 # Also accept gzip-compressed answers.
 bevy_net_backend = { version = "0.1.0", features = ["gzip"] }
+
+# HTTP + WebSocket.
+bevy_net_backend = { version = "0.1.0", features = ["ws"] }
 
 # Only the types and the fake transport (e.g. a crate that brings its own transport).
 bevy_net_backend = { version = "0.1.0", default-features = false }
@@ -355,6 +367,12 @@ fn on_save(mut answers: MessageReader<JsonResponse<Save>>) {
 | `Cancelled` | `HttpClient::cancel` | no if it was still waiting for a worker, else maybe |
 | `Shutdown` | the app exited (`AppExit`) first | no, unless it was already on the wire before the exit frame |
 | `NoTransport` | no `HttpTransportRes`, or it was removed / replaced first | no if it was still waiting for a worker, else maybe |
+| `Disconnected { reason, sent }` | WebSocket only: the connection went away, was closed by the game, or never opened (see [WebSocket](#10-websocket-connections-feature-ws)) | as `sent` says: `Some(true)` it went out before, `Some(false)` never |
+| `Closed { code, reason }` | WebSocket only, on `WsStateChanged` / `WsConnectionInfo`: the server closed with a close frame | – |
+| `Rejected(rejection)` | WebSocket only: the server answered the request with an error; `rejection.bytes()` / `text()` / `json()` (`Debug` / `Display` do not show it) | yes |
+
+`error.was_sent()` sums the column up: `Some(false)` never sent, `Some(true)` the server has it
+(or had it before a loss), `None` maybe.
 
 "Waiting for a worker" is the `UreqTransport` queue: a request answered while it waits there is
 never sent afterwards. One already on the wire may still reach the server; its result is
@@ -455,7 +473,10 @@ impl Credentials for Session {
   `RUST_LOG=trace,ureq=debug,ureq_proto=debug`, or in Bevy
   `LogPlugin { filter: "wgpu=error,naga=warn,ureq=debug,ureq_proto=debug".into(), ..default() }`.
   Bevy's default level (`info`) is safe.
-- A query key also ends up in server access logs: prefer a header where your API allows it.
+- **`ApiKeyQuery` secrets end up in access logs.** A query key is part of the URL, so reverse
+  proxies and servers log it: in testing Caddy's access log showed `api_key=…` (and an
+  `X-Api-Key` header) in plain text while it masked `Authorization`. Prefer `BearerToken` (or a
+  header your proxy redacts) wherever your API allows it.
 - Methods added to `Credentials` later always come with a default implementation.
 - Storing the token between sessions (keyring, file) and refreshing it are the game's job.
 
@@ -486,9 +507,15 @@ fn spinner(in_flight: Res<InFlight>) {
 - **Cancel:** answered with `Cancelled` in the next frame's `First`. A request already on the
   wire keeps its worker thread until it finishes or times out (a blocking call cannot be
   interrupted); its result is discarded. Cancelling an answered id does nothing.
-- **InFlight** lists requests handed to the transport and not answered yet. A request enters it
-  in `PostUpdate` of the frame it was made in. `describe(id)` returns a `RequestInfo` (kind,
-  method, target path without the query).
+- **InFlight** lists every request not answered yet, HTTP and WebSocket (feature `ws`) alike. An
+  HTTP request enters it in `PostUpdate` of the frame it was made in; a WebSocket request there
+  too, also while it waits for its connection. A request leaves it when it is answered; the answer
+  message follows in `First` (of the same frame, or of the next one for answers decided in
+  `PostUpdate`, such as a cancel). `describe(id)` returns a `RequestInfo`: `kind`
+  (`Http` or `WebSocket`), `method` (HTTP), `target` (the path without the query, or the
+  connection's name).
+- **One cancel for everything:** `HttpClient::cancel(id)` cancels HTTP and WebSocket requests
+  alike (`WsClient::cancel` is the same call).
 - **App exit:** in the frame an `AppExit` message is written, nothing new is sent:
   `BackendSystems::Send` hands no request to the transport, and `BackendSystems::Exit` (in `Last`)
   answers every open request with `Shutdown` (results that already arrived are delivered as they
@@ -569,6 +596,162 @@ cancel, exit, status and body-limit rules). Report each request at most once; a 
 result is discarded. Methods added to `HttpTransport` later always come with a default
 implementation.
 
+### 10. WebSocket connections (feature `ws`)
+
+For live data (chat, lobbies, match events, server pushes) open a **named** WebSocket
+connection. Most games open one, `"main"`; a game that needs more simply opens another name.
+Everything is keyed by that name: the state in `WsConnections`, the messages, the requests.
+
+```toml
+bevy_net_backend = { version = "0.1.0", features = ["ws"] }
+```
+
+```rust,no_run
+use bevy::prelude::*;
+use bevy_net_backend::prelude::*;
+use serde::{Deserialize, Serialize};
+
+/// A request: `{"id":7,"type":"chat.send","data":{"text":…}}` → `{"id":7,"ok":true,"data":{…}}`.
+#[derive(Serialize)]
+struct ChatSend {
+    text: String,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+struct ChatAck {
+    accepted: bool,
+}
+
+impl WsRequest for ChatSend {
+    type Response = ChatAck;
+    const KIND: &'static str = "chat.send";
+}
+
+/// A server push: `{"type":"chat.message","data":{"from":…,"text":…}}`.
+#[derive(Deserialize, Clone, Debug)]
+struct ChatMessage {
+    from: String,
+    text: String,
+}
+
+impl WsPushMessage for ChatMessage {
+    const KIND: &'static str = "chat.message";
+}
+
+fn connect(ws: Res<WsClient>) {
+    ws.connect("main", WsSettings::new("wss://game.example.com/ws"));
+}
+
+fn on_state(mut changes: MessageReader<WsStateChanged>, ws: Res<WsClient>) {
+    for change in changes.read() {
+        if change.state == WsState::Connected {
+            ws.request(&change.name, &ChatSend { text: "hello".into() });
+        }
+    }
+}
+
+fn on_chat(mut pushes: MessageReader<WsPush<ChatMessage>>, mut acks: MessageReader<WsResponse<ChatAck>>) {
+    for push in pushes.read() {
+        info!("[{}] {}: {}", push.name, push.data.from, push.data.text);
+    }
+    for ack in acks.read() {
+        if let Err(error) = &ack.result {
+            warn!("chat.send failed: {error}");
+        }
+    }
+}
+
+fn main() {
+    App::new()
+        .add_plugins((MinimalPlugins, BackendPlugin::default()))
+        .add_ws_request::<ChatSend>()
+        .add_ws_push::<ChatMessage>()
+        .add_systems(Startup, connect)
+        .add_systems(Update, (on_state, on_chat))
+        .run();
+}
+```
+
+- **`WsClient`** (a resource, `Res<WsClient>`, no ordering needed): `connect(name, settings)`,
+  `disconnect(name)`, `send_text` / `send_binary` / `send` (fire and forget), `request::<R>`
+  (typed, feature `json`), `request_raw(name, WsOutgoing)`, `cancel(id)`. Applied in
+  `PostUpdate` (`BackendSystems::Send`).
+- **Messages out**, all written in `First` of the frame they arrive and all carrying the
+  connection's `name`: `WsStateChanged { name, state, error }`, `WsMessage { name, frame }` (every
+  data frame the server sends, text or binary), `WsResponse<T>` / `WsRawResponse` (answers), and
+  `WsPush<P>` (typed pushes).
+- **State:** `WsConnections` (resource): `state(name)`, `is_connected(name)`, `get(name)` →
+  `WsConnectionInfo` (state, failed attempts, last error, pending requests, queued frames).
+  `WsState` is `Connecting`, `Connected`, `Reconnecting { attempt, retry_in }` or `Disconnected`
+  (`#[non_exhaustive]`). Not Bevy `States`: a game maps it to its own states if it wants.
+- **`WsSettings`** (builder): read timeout (default 20 ms, 5–250 ms; it is also roughly the
+  latency added to every frame you send, because the thread sends between reads: measured median
+  request round trips through a TLS proxy were 30 ms at 5 ms, 43 ms at the default 20 ms and
+  118 ms at 100 ms, against about 20 ms for HTTP), connect timeout (10 s, ONE
+  deadline for TCP + TLS + handshake, at most 1 h), heartbeat (ping every 15 s, dead after 45 s
+  without a single byte, at most 1 h), request timeout (10 s), message limit (1 MiB, incoming and
+  outgoing), reconnect policy, handshake headers, `allow_insecure_ws`, `without_credentials`, the
+  protocol, outbox (64 frames), resend (32) and waiting (64 requests) limits, `with_auth_ack`.
+- **Reconnect:** exponential backoff with full jitter (`WsReconnect`: base 500 ms, cap 30 s,
+  optional `with_max_attempts`, reset after 10 s connected, `never()`). Each attempt is a
+  `WsStateChanged` with `Reconnecting { attempt, retry_in }` and the error that caused it.
+  **Permanent (not retried, the connection goes `Disconnected` with the error):** a `401` / `403`
+  handshake, a TLS / certificate error (unless `WsReconnect::with_tls_retry(true)`), a close code
+  4000–4099, a refused first-message auth, a missing auth acknowledgement (`with_auth_ack`),
+  invalid settings or a refused plain `ws://` URL, `disconnect`, exhausted attempts. Everything
+  else (connect failures, drops, timeouts, dead peers, 5xx) is retried.
+- **Credentials** from `BackendCredentials` go on **every** handshake (headers and query; the
+  request's purpose is `RequestPurpose::WebSocketHandshake`). A token changed while connected is
+  used on the next reconnect (no forced reconnect). `JsonBodyField` cannot authenticate a
+  handshake (it has no body): that is a clear `InvalidRequest`; use first-message auth instead:
+  `Credentials::ws_auth_message()` returns a text frame sent first on every connection. Requests
+  follow it at once (frames on one socket stay in order); a server that authenticates
+  asynchronously can opt in to `WsSettings::with_auth_ack(timeout)`: then nothing else goes out
+  until the protocol reports `WsIncoming::AuthOk` (`{"type":"auth.ok"}` with `JsonEnvelope`); without
+  it in time the waiting requests are answered `Timeout` (honest about an earlier send), the link
+  closes with 1008 and the connection goes `Disconnected` with that error.
+- **Protocol:** with feature `json` the default is `JsonEnvelope`: requests
+  `{"id":…,"type":…,"data":…}`, answers `{"id":…,"ok":true,"data":…}` or `{"id":…,"ok":false,"error":…}`
+  (answered `BackendError::Rejected`), pushes `{"type":…,"data":…}` (a push may carry its own
+  `id` as long as it has no `ok`), auth `{"type":"auth.ok"}` / `{"type":"auth.failed",…}`.
+  Implement `WsProtocol` for another layout (payloads are bytes, so binary formats work);
+  `without_protocol()` for raw frames only.
+- **Plain `ws://`** only to loopback hosts unless `allow_insecure_ws(true)`, as for HTTP. TLS is
+  the same rustls + ring setup as HTTP. No permessage-deflate compression.
+
+**WebSocket answers ("Sent?" as for HTTP):**
+
+| Answer | When | Sent? |
+|---|---|---|
+| response / `Rejected` | the server answered | yes |
+| `Timeout("not sent: …")` | the connection (or the auth acknowledgement) did not come in time | no |
+| `Timeout("no answer …")` | sent, no answer within the request timeout | yes |
+| `Timeout("sent before the connection was lost, …")` | a resend request that went out, then the link dropped and it timed out waiting | yes (on the earlier link) |
+| `Disconnected { sent, .. }` | the connection went away or was replaced / closed by the game; not connected when asked; too many waiting | as `sent` says |
+| `Cancelled` | `cancel` | maybe |
+| `Shutdown` | the app exited first | no, unless it went out before the exit frame |
+| `InvalidRequest` / `Encode` | unknown connection, no protocol, too large, unregistered type, bad payload | no |
+
+Requests made while a connection is opening or reconnecting wait for it (until their timeout,
+64 at most). A server close frame is `BackendError::Closed { code, reason }` in `WsStateChanged` /
+`WsConnectionInfo::last_error` (`error.close_code()`).
+When a connection drops, requests already sent are answered `Disconnected`, except those marked
+`resend_on_reconnect` (a `WsOutgoing` option, or `WsRequest::resend_on_reconnect`), which are sent
+again after the reconnect; the default is off. Frames sent while not connected wait in an outbox
+(64 by default) and go out when the connection opens.
+
+## Backend compatibility
+
+- **HTTP** works with any backend that speaks HTTPS and JSON (or raw bytes): Laravel / PHP,
+  Express / Node, Go, Rust, Django, ASP.NET, serverless functions.
+- **WebSocket** (feature `ws`) works with any plain WebSocket server (RFC 6455), through the
+  default JSON envelope or your own `WsProtocol` for another message layout.
+- **Frameworks that run their own protocol on top of WebSocket** (Laravel Reverb / Pusher,
+  Socket.IO, SignalR, Phoenix Channels) need an adapter for that protocol. Adapters are planned
+  for a later version; until then use `WsProtocol` or raw frames if your server can also speak
+  plain WebSocket.
+- **SSH** access (for admin and developer tools) is planned for a later version.
+
 ## How it works
 
 ```text
@@ -619,6 +802,19 @@ implementation.
 - **JSON decoding** runs on the main thread in `Receive`, in the frame the answer arrives. A
   multi-megabyte answer can cost that frame a few milliseconds; keep big payloads raw
   (`HttpResponse`) or small.
+- **WebSocket threads (feature `ws`).** Each connection attempt runs on its own std thread
+  (`net-backend-ws-link#N`): TCP, then rustls for `wss://`, then the tungstenite handshake, then a
+  loop: send what the game queued, ping when due, flush, one read whose socket reads together
+  stop after one read timeout (Windows reports a read timeout as `TimedOut`, Unix as
+  `WouldBlock`; both mean "no data"), check for a dead peer (no byte for `dead_after`). The
+  handshake (TCP + TLS + upgrade) runs under ONE deadline. Both limits sit under rustls and
+  tungstenite, so a peer that trickles bytes can neither stretch the handshake nor starve
+  outgoing frames and pings. An idle connection wakes about 50 times a second, and a frame you
+  send goes out within about one read timeout, plus the time the socket needs for earlier
+  outgoing data. The heartbeat runs in the thread, so it keeps going while the game does not
+  tick. Reconnects, backoff, credentials and every answer live on the ECS side; a reconnect is a
+  new thread. On exit a close (1001) is queued to every link and no thread is joined (a process
+  that exits right away usually wins that race).
 - **TLS.** rustls with ring's crypto and the Mozilla root certificates (webpki-roots; the OS
   certificate store is not used). The ring provider is always handed to ureq explicitly and never
   installed process-wide, so a game that also links another rustls provider (for example
@@ -646,20 +842,21 @@ Everything is re-exported at the crate root; `prelude` holds the everyday items.
 | `HttpConfig` | resource | base URL, timeout, default headers, workers, `allow_insecure_http`, body limit; `validate()`, getters, `set_base_url`, `set_timeout`. |
 | `ConfigError` | enum | `NoBaseUrl`, `BadBaseUrl`, `BadHeader`. |
 | `HttpClient` | resource | `send`, `request`, `get`, `cancel`; with `json`: `send_json`, `get_json`, `post_json`, `is_json_registered`. |
-| `BackendAppExt` | trait on `App` | `add_json_response::<T>()` (feature `json`). |
+| `BackendAppExt` | trait on `App` | `add_json_response::<T>()` (feature `json`); `add_ws_request::<R>()`, `add_ws_push::<P>()` (features `ws` + `json`). Sealed. |
 | `RequestId` | id | opaque, unique per process, `Copy + Eq + Hash + Ord + Display`. |
 | `OutgoingRequest` | request | constructors, `with_*` builders, accessors (`method`, `path`, `query`, `headers`, `body`, `timeout`, `purpose`, `uses_credentials`, `error`), `query_mut`, `headers_mut`, `set_body`, `reject`. |
-| `RequestPurpose` | enum | `Http` (and `WebSocketHandshake`, reserved). |
+| `RequestPurpose` | enum | `Http`, `WebSocketHandshake`. |
 | `HttpResponse` | message | `id`, `result: Result<RawResponse, BackendError>`. |
 | `JsonResponse<T>` | message | `id`, `result: Result<T, BackendError>` (feature `json`). |
 | `RawResponse` | struct | `status`, `headers`, `body`; `new`, `with_header`, `is_success`, `body()`, `text()`, `json()`. |
-| `BackendError` | enum | see [Reading answers and errors](#4-reading-answers-and-errors); `status()`, `response()`, `is_invalid_request()`. |
-| `Credentials` | trait | `apply(&self, &mut OutgoingRequest)`. |
+| `BackendError` | enum | see [Reading answers and errors](#4-reading-answers-and-errors); `status()`, `response()`, `is_invalid_request()`, `was_sent()`, `close_code()`. |
+| `Credentials` | trait | `apply(&self, &mut OutgoingRequest)`; `ws_auth_message()` (default none: a first frame for WebSocket auth). |
 | `BackendCredentials` | resource | `new`, `set`, `clear`, `is_set`. |
 | `BearerToken`, `ApiKeyHeader`, `ApiKeyQuery`, `JsonBodyField` | credentials | ready-made `Credentials` (`JsonBodyField`: feature `json`). |
 | `Secret` | string | redacted in `Debug` / `Display`; `new`, `expose`, `is_empty`. No comparison, no zeroing on drop. |
-| `InFlight` | resource | `contains`, `len`, `is_empty`, `ids`, `describe` (→ `RequestInfo`). |
-| `RequestInfo` (struct), `RequestKind` (enum) | types | what a pending request is: `kind` (`Http`), `method`, `target`; `#[non_exhaustive]`. |
+| `InFlight` | resource | HTTP and WebSocket: `contains`, `len`, `is_empty`, `ids`, `describe` (→ `RequestInfo`). |
+| `RequestInfo` (struct), `RequestKind` (enum) | types | what a pending request is: `kind` (`Http`, `WebSocket`), `method`, `target`; `#[non_exhaustive]`. |
+| `Rejection` | struct | the payload of `BackendError::Rejected`: `new`, `bytes`, `text`, `json` (json). |
 | `HttpTransport` | trait | `submit`, `poll`, `cancel`, `shutdown`. |
 | `HttpTransportResult` | type | `Result<RawResponse, BackendError>`. |
 | `HttpTransportRes` | resource | `new(transport)`. |
@@ -668,6 +865,19 @@ Everything is re-exported at the crate root; `prelude` holds the everyday items.
 | `UreqTransport` | transport | feature `http`: `new(&config)`, `workers()`. |
 | `http` | crate | the `http` 1.x crate, re-exported (`Method`, `StatusCode`, `HeaderMap`, …). |
 | `DEFAULT_TIMEOUT`, `MAX_TIMEOUT`, `DEFAULT_WORKERS`, `MAX_WORKERS`, `DEFAULT_MAX_BODY_BYTES`, `DEADLINE_GRACE` | consts | 15 s, 1 h, 2, 8, 10 MiB, 5 s. |
+| `WsClient` | resource (`ws`) | `connect`, `disconnect`, `send`, `send_text`, `send_binary`, `request_raw`, `request` (json), `cancel` (the shared one). |
+| `WsConnections`, `WsConnectionInfo` | resource / struct (`ws`) | `get`, `state`, `is_connected`, `iter`; info: `state`, `attempt`, `last_error`, `pending_requests`, `queued_frames`. |
+| `WsName` | name (`ws`) | a connection's name; `From<&str>` / `From<String>`, `as_str`, compares with `&str`. |
+| `WsState` | enum (`ws`) | `Connecting`, `Connected`, `Reconnecting { attempt, retry_in }`, `Disconnected`; `#[non_exhaustive]`. |
+| `WsSettings`, `WsReconnect` | builders (`ws`) | per connection: timeouts, heartbeat, limits, reconnect, headers, `allow_insecure_ws`, `without_credentials`, protocol; backoff: base, cap, max attempts, stable-after, jitter, `never()`, `delay_bound`. |
+| `WsFrame`, `WsOutgoing` | types (`ws`) | a text / binary frame (`Debug` shows the length only); a raw request (`kind`, payload, `resend_on_reconnect`, `with_timeout`). |
+| `WsStateChanged`, `WsMessage`, `WsRawResponse` | messages (`ws`) | state changes (with the error), every data frame, raw answers; all with `name`. |
+| `WsRequest`, `WsPushMessage`, `WsResponse<T>`, `WsPush<P>`, `JsonEnvelope` | (`ws` + `json`) | typed requests (`Response`, `KIND`, `resend_on_reconnect`), typed pushes (`KIND`), their messages, the default protocol. |
+| `WsProtocol`, `WsIncoming` | trait / enum (`ws`) | `encode_request`, `decode`, `retry_after_close`; `Response { wire_id, result: Result<bytes, bytes> }`, `Push`, `AuthOk`, `AuthFailed`, `Ignore`. |
+| `DEFAULT_WS_READ_TIMEOUT`, `DEFAULT_WS_MAX_MESSAGE_BYTES` | consts (`ws`) | 20 ms, 1 MiB. |
+| `WsTransport`, `WsTransportRes`, `WsLinkId`, `WsLinkEvent`, `WsHandshake` | seam (`ws`) | `open`, `send`, `close`, `poll`, `shutdown`; one link = one connection attempt. |
+| `FakeWsTransport` | transport (`ws`) | `manual_accept`, `accept`, `reject_next`, `echo_envelope`, `push`, `drop_link`, `fail_link`, `opened`, `last_link`, `live_links`, `sent`, `all_sent`, `closed`, `shutdown_count`. |
+| `TungsteniteTransport` | transport (`ws`) | the real one; `new()`. |
 
 ## Limits and what it does not do
 
@@ -690,13 +900,21 @@ Everything is re-exported at the crate root; `prelude` holds the everyday items.
   or a corporate TLS-inspecting proxy is not trusted.
 - **Cancel does not interrupt** a request already on the wire; it holds its worker thread until
   ureq's timeout at most.
-- **No WebSocket** in this version.
+- **WebSocket (feature `ws`):** no permessage-deflate (a server that requires compression cannot
+  be used), no subprotocol negotiation helper (set `Sec-WebSocket-Protocol` with `with_header`),
+  one thread per connection (fine for a few connections, not for hundreds). A large message you
+  send occupies its connection thread until the socket takes it (that time does not count as the
+  server's silence); if the server accepts no data for 30 s (or `dead_after`, if longer), the
+  connection ends with a `Timeout` saying so. At `trace` level tungstenite
+  prints the whole handshake request, `Authorization` and query included: keep `tungstenite`
+  below `trace` like `ureq`. Received frames the game does not take are limited to 32 times the
+  message limit per connection (then it closes with 1008).
 
 ## Compatibility
 
-| bevy_net_backend | Bevy | ureq | rustls | Rust (MSRV) |
-|---|---|---|---|---|
-| 0.1.0 | 0.19.0 | 3.4.2 | 0.23.45 | 1.95 |
+| bevy_net_backend | Bevy | ureq | tungstenite (`ws`) | rustls | Rust (MSRV) |
+|---|---|---|---|---|---|
+| 0.1.0 | 0.19.0 | 3.4.2 | 0.30.0 | 0.23.45 | 1.95 |
 
 ## Examples
 
@@ -708,6 +926,8 @@ from `examples/mock_server.rs` on 127.0.0.1 inside the example process.
 | `fetch_json` | `get_json::<Character>`, matching the answer by id, error bodies. |
 | `post_with_token` | 401 before login, login `without_credentials`, `BearerToken`, a 422 validation error decoded from the error body, a successful authenticated `POST`. |
 | `mock_server` | the mock API on its own and its JSON contract: `--seconds N` (maximum runtime, default 60; it exits by itself), `--bind ADDR` (default `127.0.0.1:0`). |
+| `chat_client` (features `ws`, `json`) | a named connection, a typed request and its answer, typed pushes, state changes, disconnect. Starts `mock_ws_server` unless `BACKEND_WS_URL` is set. |
+| `mock_ws_server` (features `ws`, `json`) | the mock WebSocket server and its envelope contract (echo, `chat.send` + push, `fail`, `close`, `drop`, `stall`, periodic `server.tick`, `/secure` needing a bearer token): `--seconds N`, `--bind ADDR` (default `127.0.0.1:0`), `--tick-ms N`. |
 
 ```text
 cargo run --example fetch_json
@@ -715,6 +935,8 @@ cargo run --example post_with_token
 cargo run --example mock_server -- --seconds 120
 cargo run --example mock_server -- --seconds 1800 --bind 127.0.0.1:8080
 BACKEND_URL=http://127.0.0.1:8000/api cargo run --example fetch_json
+cargo run --example chat_client --features ws,json
+cargo run --example mock_ws_server --features ws,json -- --seconds 1800 --bind 127.0.0.1:9001
 ```
 
 Pointed at your own backend (`BACKEND_URL`), `fetch_json` expects `GET /characters/1` →
@@ -726,14 +948,20 @@ header comment (the login reads `BACKEND_USERNAME` / `BACKEND_PASSWORD`).
 - `cargo test` runs the unit tests, the `FakeHttpTransport` tests (every answer kind, exactly one
   answer each, strict ambiguity detection), a log-capture test proving no secret is logged, the
   loopback tests (the real `UreqTransport` against the mock server on 127.0.0.1: statuses,
-  redirects, timeouts, body limit, TLS handshake failure, login flow, exit while busy) and every
-  Rust block of this README.
+  redirects, timeouts, body limit, TLS handshake failure, login flow, exit while busy). With
+  `--features ws` (and `--all-features`) also the WebSocket tests: every lifecycle path on a
+  `FakeWsTransport`, the real transport against `mock_ws_server` (large messages across many
+  short read timeouts, reconnect, heartbeat, 401, 1009, exit), and a TLS test with large messages
+  cut by read timeouts mid-record. `cargo test --all-features` also compiles every Rust block of
+  this README.
 - Tests never contact another host. CI runs the feature combinations on Linux, Windows and macOS
   with Rust 1.96.0.
 - `tests/live.rs` holds live HTTPS checks, `#[ignore]`d: they run only with
   `cargo test --test live -- --ignored` and `BNB_TEST_HTTPS_URL` set to a server that serves the
   mock's contract over HTTPS (for example `mock_server` behind a TLS-terminating reverse proxy on
   a test machine).
+- `tests/live_ws.rs` does the same for WebSocket: `cargo test --features ws --test live_ws -- --ignored`
+  with `BNB_TEST_WSS_URL` set to `mock_ws_server` behind a TLS proxy (for example `wss://…/ws`).
 - Against your real API, run the examples with `BACKEND_URL` (see [Examples](#examples)).
 
 ## FAQ

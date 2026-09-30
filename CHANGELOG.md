@@ -30,4 +30,26 @@ change or a Bevy / key dependency bump).
   responses with feature `gzip`.
 - Examples `fetch_json`, `post_with_token` and `mock_server` (a std-only mock API on 127.0.0.1,
   or a given address).
-- Features: `http` and `json` (default), `gzip`.
+- Feature `ws`: named WebSocket connections. `WsClient` (`connect(name, WsSettings)`,
+  `disconnect`, `send_text` / `send_binary`, `request_raw`, typed `request` with `json`, `cancel`),
+  `WsConnections` / `WsState`, the messages `WsStateChanged`, `WsMessage`, `WsRawResponse`,
+  `WsResponse<T>` and `WsPush<P>`, the `WsProtocol` trait and the default `JsonEnvelope`,
+  `WsRequest` / `WsPushMessage` with `App::add_ws_request` / `add_ws_push`, reconnect with
+  exponential backoff and jitter (`WsReconnect`), heartbeat and dead-peer detection, message size
+  limits, credentials on every handshake plus `Credentials::ws_auth_message` for first-message
+  auth, the `WsTransport` seam with `FakeWsTransport` and the real `TungsteniteTransport`
+  (tungstenite 0.30.0, sync, one thread per connection, rustls + ring, no permessage-deflate).
+- `BackendError::Disconnected { reason, sent }`, `BackendError::Closed { code, reason }` and
+  `BackendError::Rejected(Box<Rejection>)` (bytes, `text()`, `json()`), plus
+  `BackendError::was_sent()` and `close_code()`.
+- WebSocket requests appear in `InFlight` (`RequestKind::WebSocket`), and one shared `cancel`
+  (`HttpClient::cancel` = `WsClient::cancel`) works for HTTP and WebSocket requests.
+- `WsSettings::with_auth_ack`: hold requests and frames until the server acknowledges the
+  first-message auth (`WsIncoming::AuthOk`); without the acknowledgement in time the waiting
+  requests are answered `Timeout` and the connection goes `Disconnected` (closed with 1008).
+- WebSocket reconnect policy: TLS / certificate errors are permanent by default
+  (`WsReconnect::with_tls_retry(true)` to retry them).
+- WebSocket I/O deadlines: one deadline for TCP + TLS + handshake, a read budget per loop turn,
+  dead-peer detection that does not count time blocked on our own writes.
+- Examples `chat_client` and `mock_ws_server` (features `ws`, `json`).
+- Features: `http` and `json` (default), `gzip`, `ws`.

@@ -28,6 +28,13 @@ impl RequestId {
     pub(crate) fn next() -> Self {
         RequestId(NEXT_ID.fetch_add(1, Ordering::Relaxed))
     }
+
+    /// The number for a wire protocol (unique per process). Not public: the protocol sees it as a
+    /// plain `u64`.
+    #[cfg(feature = "ws")]
+    pub(crate) fn wire(self) -> u64 {
+        self.0
+    }
 }
 
 impl fmt::Display for RequestId {
@@ -43,8 +50,8 @@ impl fmt::Display for RequestId {
 pub enum RequestPurpose {
     /// A normal HTTP request / response.
     Http,
-    /// The opening handshake of a WebSocket connection: no body. Reserved for a later version;
-    /// nothing in this version creates one.
+    /// The opening handshake of a WebSocket connection (feature `ws`): no body; credentials may
+    /// add headers or query parameters.
     WebSocketHandshake,
 }
 
@@ -269,6 +276,11 @@ impl OutgoingRequest {
     /// The error recorded by a builder or [`reject`](Self::reject), if any.
     pub fn error(&self) -> Option<&BackendError> {
         self.error.as_ref()
+    }
+
+    #[cfg(feature = "ws")]
+    pub(crate) fn set_purpose(&mut self, purpose: RequestPurpose) {
+        self.purpose = purpose;
     }
 
     pub(crate) fn take_error(&mut self) -> Option<BackendError> {

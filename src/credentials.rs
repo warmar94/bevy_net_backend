@@ -100,6 +100,13 @@ pub trait Credentials: Send + Sync + 'static {
     /// Edit the request: add a header, a query parameter or a body field. Look at
     /// [`OutgoingRequest::purpose`] if a kind of request needs different handling.
     fn apply(&self, request: &mut OutgoingRequest);
+
+    /// First-message authentication for WebSocket connections (feature `ws`): a text frame sent
+    /// as the very first frame on every (re)connection, for backends that read the token from the
+    /// first message instead of the handshake. Default: none. Never log what it returns.
+    fn ws_auth_message(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The game's current credentials, applied to every request (except those made
@@ -143,6 +150,11 @@ impl BackendCredentials {
         if let Some(credentials) = &self.inner {
             credentials.apply(request);
         }
+    }
+
+    #[cfg(feature = "ws")]
+    pub(crate) fn ws_auth_message(&self) -> Option<String> {
+        self.inner.as_ref().and_then(|c| c.ws_auth_message())
     }
 }
 
@@ -266,6 +278,10 @@ impl JsonBodyField {
 #[cfg(feature = "json")]
 impl Credentials for JsonBodyField {
     fn apply(&self, request: &mut OutgoingRequest) {
+        if request.purpose() == crate::RequestPurpose::WebSocketHandshake {
+            request.reject("JsonBodyField cannot authenticate a WebSocket handshake (it has no body); use first-message auth (Credentials::ws_auth_message)");
+            return;
+        }
         if request.purpose() != crate::RequestPurpose::Http {
             return;
         }

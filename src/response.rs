@@ -135,6 +135,68 @@ pub enum BackendError {
     Shutdown,
     /// No transport is installed, or the transport was removed or replaced before it answered.
     NoTransport,
+    /// A WebSocket connection went away (or never came up, or was closed by the game) before the
+    /// request was answered.
+    #[non_exhaustive]
+    Disconnected {
+        /// Why.
+        reason: String,
+        /// For a request: whether it had gone out on a connection before (`Some(true)`: it may
+        /// have reached the server) or never went out (`Some(false)`). `None` when the error is
+        /// about the connection itself (in `WsStateChanged` / `WsConnectionInfo`). `Some(true)` errs
+        /// on the safe side: a request handed to a link that had just received the server's close
+        /// frame counts as sent although the link dropped it.
+        sent: Option<bool>,
+    },
+    /// The server closed the WebSocket connection with a close frame: its code and reason, as
+    /// structured data (4001 "logged in elsewhere" and 4003 "banned" need different reactions).
+    #[non_exhaustive]
+    Closed {
+        /// The close code.
+        code: u16,
+        /// The close reason (may be empty).
+        reason: String,
+    },
+    /// The server answered a WebSocket request with an error. The payload is kept as bytes with
+    /// `text()` / `json()` helpers; `Debug` and `Display` never show it.
+    Rejected(Box<Rejection>),
+}
+
+/// The error payload of a [`BackendError::Rejected`] answer (with the default JSON envelope: the
+/// JSON of `error` in `{"id":…,"ok":false,"error":…}`).
+#[derive(Clone, PartialEq, Eq)]
+pub struct Rejection {
+    payload: Vec<u8>,
+}
+
+impl fmt::Debug for Rejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Rejection").field("payload_bytes", &self.payload.len()).finish()
+    }
+}
+
+impl Rejection {
+    /// A rejection with this payload (for custom protocols and tests).
+    pub fn new(payload: impl Into<Vec<u8>>) -> Self {
+        Self { payload: payload.into() }
+    }
+
+    /// The payload bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.payload
+    }
+
+    /// The payload as text (invalid UTF-8 replaced by `U+FFFD`).
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.payload).into_owned()
+    }
+
+    /// Decode the payload as JSON (e.g. `{"code":"banned","message":…}`).
+    #[cfg(feature = "json")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
+    pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
+        serde_json::from_slice(&self.payload)
+    }
 }
 
 impl BackendError {
@@ -156,6 +218,34 @@ impl BackendError {
     pub fn is_invalid_request(&self) -> bool {
         matches!(self, BackendError::InvalidRequest(_) | BackendError::InsecureHttp { .. } | BackendError::Encode(_))
     }
+
+    /// What this answer says about whether the request reached the network: `Some(false)` never
+    /// sent (invalid, a `Timeout` whose text starts with `not sent:`, a `Disconnected` with
+    /// `sent: Some(false)`), `Some(true)` the server answered (`Status`, `Decode`,
+    /// `BodyTooLarge`, `Rejected`) or it went out before a loss (`Disconnected` with
+    /// `sent: Some(true)`), `None` unknown ("maybe").
+    pub fn was_sent(&self) -> Option<bool> {
+        match self {
+            BackendError::InvalidRequest(_) | BackendError::InsecureHttp { .. } | BackendError::Encode(_) => Some(false),
+            BackendError::Timeout(why) if why.starts_with("not sent:") => Some(false),
+            BackendError::Disconnected { sent, .. } => *sent,
+            BackendError::Status(_) | BackendError::Decode { .. } | BackendError::BodyTooLarge { .. } | BackendError::Rejected(_) => Some(true),
+            _ => None,
+        }
+    }
+
+    /// The close code, for [`Closed`](Self::Closed).
+    pub fn close_code(&self) -> Option<u16> {
+        match self {
+            BackendError::Closed { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "ws")]
+    pub(crate) fn disconnected(reason: impl Into<String>, sent: Option<bool>) -> Self {
+        BackendError::Disconnected { reason: reason.into(), sent }
+    }
 }
 
 impl fmt::Debug for BackendError {
@@ -173,6 +263,9 @@ impl fmt::Debug for BackendError {
             BackendError::Cancelled => f.write_str("Cancelled"),
             BackendError::Shutdown => f.write_str("Shutdown"),
             BackendError::NoTransport => f.write_str("NoTransport"),
+            BackendError::Disconnected { reason, sent } => f.debug_struct("Disconnected").field("reason", reason).field("sent", sent).finish(),
+            BackendError::Closed { code, reason } => f.debug_struct("Closed").field("code", code).field("reason", reason).finish(),
+            BackendError::Rejected(rejection) => f.debug_tuple("Rejected").field(rejection).finish(),
         }
     }
 }
@@ -195,6 +288,12 @@ impl fmt::Display for BackendError {
             BackendError::Cancelled => f.write_str("cancelled"),
             BackendError::Shutdown => f.write_str("the app is shutting down"),
             BackendError::NoTransport => f.write_str("no transport is installed (or it was replaced before it answered)"),
+            BackendError::Disconnected { reason, sent: Some(true) } => write!(f, "disconnected after the request was sent: {reason}"),
+            BackendError::Disconnected { reason, sent: Some(false) } => write!(f, "disconnected, the request was never sent: {reason}"),
+            BackendError::Disconnected { reason, sent: None } => write!(f, "disconnected: {reason}"),
+            BackendError::Closed { code, reason } if reason.is_empty() => write!(f, "closed by the server (code {code})"),
+            BackendError::Closed { code, reason } => write!(f, "closed by the server (code {code}: {reason})"),
+            BackendError::Rejected(_) => f.write_str("the server rejected the request"),
         }
     }
 }

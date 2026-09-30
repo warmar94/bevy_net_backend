@@ -7,7 +7,8 @@
 //! error, cancelled, or shutdown on `AppExit`. Nothing is ever dropped silently.
 //!
 //! Features: `http` (the real transport: ureq on a few worker threads, rustls with ring), `json`
-//! (typed requests), `gzip`. Default: `http`, `json`. Without `http` the crate still builds, and the
+//! (typed requests), `gzip`, `ws` (named WebSocket connections: `WsClient` and friends). Default: `http`,
+//! `json`. Without `http` the crate still builds, and the
 //! [`FakeHttpTransport`] drives everything in tests. The README is the full manual.
 #![cfg_attr(
     feature = "json",
@@ -54,15 +55,17 @@ mod credentials;
 mod inflight;
 mod request;
 mod response;
-#[cfg(feature = "http")]
+#[cfg(any(feature = "http", feature = "ws"))]
 mod tls;
 mod transport;
+#[cfg(feature = "ws")]
+mod ws;
 
 #[cfg(test)]
 mod tests;
 
-/// Every Rust example in the README compiles (checked by `cargo test` with the default features).
-#[cfg(all(doctest, feature = "http", feature = "json"))]
+/// Every Rust example in the README compiles (checked by `cargo test --all-features`).
+#[cfg(all(doctest, feature = "http", feature = "json", feature = "ws"))]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
@@ -78,11 +81,19 @@ pub use inflight::{InFlight, RequestInfo, RequestKind, DEADLINE_GRACE};
 pub use request::{OutgoingRequest, PreparedRequest, RequestId, RequestPurpose};
 #[cfg(feature = "json")]
 pub use response::JsonResponse;
-pub use response::{BackendError, HttpResponse, RawResponse};
+pub use response::{BackendError, HttpResponse, RawResponse, Rejection};
 pub use transport::fake::FakeHttpTransport;
 #[cfg(feature = "http")]
 pub use transport::http_pool::UreqTransport;
 pub use transport::{HttpTransport, HttpTransportRes, HttpTransportResult};
+#[cfg(feature = "ws")]
+pub use ws::{
+    FakeWsTransport, TungsteniteTransport, WsClient, WsConnectionInfo, WsConnections, WsFrame, WsHandshake, WsIncoming, WsLinkEvent, WsLinkId, WsMessage,
+    WsName, WsOutgoing, WsProtocol, WsRawResponse, WsReconnect, WsSettings, WsState, WsStateChanged, WsTransport, WsTransportRes, DEFAULT_WS_MAX_MESSAGE_BYTES,
+    DEFAULT_WS_READ_TIMEOUT,
+};
+#[cfg(all(feature = "ws", feature = "json"))]
+pub use ws::{JsonEnvelope, WsPush, WsPushMessage, WsRequest, WsResponse};
 
 /// Everything a game usually needs: `use bevy_net_backend::prelude::*;`.
 pub mod prelude {
@@ -92,6 +103,10 @@ pub mod prelude {
         BackendAppExt, BackendCredentials, BackendError, BackendPlugin, BackendSystems, BearerToken, HttpClient, HttpConfig, HttpResponse, InFlight,
         OutgoingRequest, RequestId,
     };
+    #[cfg(feature = "ws")]
+    pub use crate::{WsClient, WsConnections, WsFrame, WsMessage, WsSettings, WsState, WsStateChanged};
+    #[cfg(all(feature = "ws", feature = "json"))]
+    pub use crate::{WsPush, WsPushMessage, WsRequest, WsResponse};
 }
 
 use bevy_app::{App, AppExit, First, Last, Plugin, PostUpdate};
@@ -106,7 +121,9 @@ use bevy_time::TimeSystems;
 /// It inserts the [`HttpConfig`] it was given, [`HttpClient`], [`InFlight`], an empty
 /// [`BackendCredentials`] (unless one exists), the [`HttpResponse`] message, and with feature
 /// `http` a `UreqTransport` as the [`HttpTransportRes`] (unless one exists; replacing it
-/// later is fine, its threads only start on the first request).
+/// later is fine, its threads only start on the first request). With feature `ws` it also adds
+/// the WebSocket side (`WsClient`, `WsConnections`, the `Ws*` messages and a
+/// `TungsteniteTransport` unless a `WsTransportRes` exists).
 ///
 /// ```
 /// use std::time::Duration;
@@ -134,8 +151,9 @@ impl BackendPlugin {
     }
 }
 
-/// The plugin's system sets, named after phases so every kind of connection a later version
-/// adds uses the same three. `#[non_exhaustive]`: a later version may add a set.
+/// The plugin's system sets, named after phases: HTTP and WebSocket (feature `ws`) systems both
+/// run in them, and a later kind of connection will too. `#[non_exhaustive]`: a later version may
+/// add a set.
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum BackendSystems {
@@ -157,13 +175,20 @@ impl Plugin for BackendPlugin {
     fn build(&self, app: &mut App) {
         match self.config.validate() {
             Ok(()) => tracing::info!(">>> NET-BACKEND: base URL {}", self.config.base_url()),
+            Err(ConfigError::NoBaseUrl) if cfg!(feature = "ws") => {
+                tracing::debug!(">>> NET-BACKEND: no HTTP base URL set; HTTP requests are answered with an error until one is")
+            }
+            Err(ConfigError::NoBaseUrl) => tracing::info!(">>> NET-BACKEND: no HTTP base URL set; HTTP requests are answered with an error until one is"),
             // The error text never quotes the URL (it may hold a secret by mistake).
             Err(e) => tracing::warn!(">>> NET-BACKEND: {e}; every request is answered with an error until the config is fixed"),
         }
-        app.insert_resource(self.config.clone())
-            .init_resource::<HttpClient>()
-            .init_resource::<InFlight>()
-            .init_resource::<BackendCredentials>()
+        app.insert_resource(self.config.clone()).init_resource::<HttpClient>().init_resource::<InFlight>();
+        // One cancel list for every client.
+        let cancels = app.world().resource::<InFlight>().cancel_list();
+        if let Some(mut client) = app.world_mut().get_resource_mut::<HttpClient>() {
+            client.share_cancels(cancels);
+        }
+        app.init_resource::<BackendCredentials>()
             .add_message::<HttpResponse>()
             .configure_sets(First, BackendSystems::Receive.after(TimeSystems).before(MessageUpdateSystems))
             .configure_sets(PostUpdate, BackendSystems::Send)
@@ -178,9 +203,15 @@ impl Plugin for BackendPlugin {
             tracing::info!(">>> NET-BACKEND: HTTP transport, up to {} worker threads", transport.workers());
             app.insert_resource(HttpTransportRes::new(transport));
         }
+        #[cfg(feature = "ws")]
+        ws::build(app);
         #[cfg(not(feature = "http"))]
         if !app.world().contains_resource::<HttpTransportRes>() {
-            tracing::info!(">>> NET-BACKEND: no transport compiled in (feature `http` is off); insert an `HttpTransportRes`");
+            if cfg!(feature = "ws") {
+                tracing::debug!(">>> NET-BACKEND: no HTTP transport compiled in (feature `http` is off)");
+            } else {
+                tracing::info!(">>> NET-BACKEND: no transport compiled in (feature `http` is off); insert an `HttpTransportRes`");
+            }
         }
     }
 }

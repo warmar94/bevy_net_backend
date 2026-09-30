@@ -55,7 +55,6 @@ impl<T: serde::de::DeserializeOwned + Send + Sync + 'static> JsonRoute for JsonR
 /// Something game systems asked for, drained by the plugin's systems.
 pub(crate) enum Queued {
     Send { id: RequestId, request: Box<OutgoingRequest>, route: Route },
-    Cancel(RequestId),
 }
 
 /// Makes requests. A resource with shared access only (`Res<HttpClient>`), so any number of
@@ -72,6 +71,7 @@ pub(crate) enum Queued {
 #[derive(Resource, Default)]
 pub struct HttpClient {
     queue: Mutex<Vec<Queued>>,
+    cancels: crate::inflight::CancelList,
     json_types: HashSet<TypeId>,
 }
 
@@ -114,12 +114,17 @@ impl HttpClient {
         self.send(OutgoingRequest::get(path))
     }
 
-    /// Cancel a request. If it is still waiting, it is answered with
-    /// [`BackendError::Cancelled`](crate::BackendError::Cancelled) in the next frame's `First` and nothing else is delivered for
-    /// it (a request already on the wire runs to its end on its worker; its result is discarded).
-    /// Cancelling an id that was already answered does nothing.
+    /// Cancel a request, HTTP or WebSocket alike (one shared path; `WsClient::cancel` is the same
+    /// call). If it is still waiting, it is answered with [`BackendError::Cancelled`](crate::BackendError::Cancelled) in the next
+    /// frame's `First` and nothing else is delivered for it (a request already on the wire may
+    /// still reach the server; its result is discarded). Cancelling an id that was already
+    /// answered does nothing.
     pub fn cancel(&self, id: RequestId) {
-        self.lock().push(Queued::Cancel(id));
+        self.cancels.lock().unwrap_or_else(PoisonError::into_inner).push(id);
+    }
+
+    pub(crate) fn share_cancels(&mut self, cancels: crate::inflight::CancelList) {
+        self.cancels = cancels;
     }
 
     /// Send a request you built and decode the 2xx body as JSON `T` (register `T` first with
@@ -183,6 +188,19 @@ pub trait BackendAppExt: sealed::Sealed {
     #[cfg(feature = "json")]
     #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
     fn add_json_response<T: serde::de::DeserializeOwned + Send + Sync + 'static>(&mut self) -> &mut Self;
+
+    /// Register a WebSocket request type (features `ws` + `json`): its answers arrive as
+    /// [`WsResponse<R::Response>`](crate::WsResponse). Call once per type, before or after adding
+    /// the plugin.
+    #[cfg(all(feature = "ws", feature = "json"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "ws", feature = "json"))))]
+    fn add_ws_request<R: crate::WsRequest>(&mut self) -> &mut Self;
+
+    /// Register a WebSocket server-push type (features `ws` + `json`): pushes of kind `P::KIND`
+    /// arrive as [`WsPush<P>`](crate::WsPush).
+    #[cfg(all(feature = "ws", feature = "json"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "ws", feature = "json"))))]
+    fn add_ws_push<P: crate::WsPushMessage>(&mut self) -> &mut Self;
 }
 
 impl BackendAppExt for App {
@@ -193,6 +211,18 @@ impl BackendAppExt for App {
         if let Some(mut client) = self.world_mut().get_resource_mut::<HttpClient>() {
             client.json_types.insert(TypeId::of::<T>());
         }
+        self
+    }
+
+    #[cfg(all(feature = "ws", feature = "json"))]
+    fn add_ws_request<R: crate::WsRequest>(&mut self) -> &mut Self {
+        crate::ws::register_request::<R>(self);
+        self
+    }
+
+    #[cfg(all(feature = "ws", feature = "json"))]
+    fn add_ws_push<P: crate::WsPushMessage>(&mut self) -> &mut Self {
+        crate::ws::register_push::<P>(self);
         self
     }
 }

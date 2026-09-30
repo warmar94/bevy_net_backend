@@ -14,3 +14,16 @@ use rustls::crypto::CryptoProvider;
 pub(crate) fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
+
+/// The rustls client config for `wss://` (feature `ws`): ring, TLS 1.2 + 1.3, Mozilla's roots
+/// (webpki-roots, the same list ureq uses for `https://`).
+#[cfg(feature = "ws")]
+pub(crate) fn client_config() -> Result<Arc<rustls::ClientConfig>, String> {
+    let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+    let config = rustls::ClientConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(Arc::new(config))
+}

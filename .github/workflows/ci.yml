@@ -34,6 +34,10 @@ jobs:
           - "--features gzip"
           - "--no-default-features --features http"
           - "--no-default-features --features json"
+          - "--no-default-features --features ws"
+          - "--no-default-features --features ws,json"
+          - "--features ws"
+          - "--features ws,gzip"
           - "--all-features"
     runs-on: ubuntu-latest
     steps:
@@ -63,6 +67,10 @@ jobs:
       - run: cargo test --locked --features gzip
       - run: cargo test --locked --no-default-features --features http
       - run: cargo test --locked --no-default-features --features json
+      - run: cargo test --locked --no-default-features --features ws
+      - run: cargo test --locked --no-default-features --features ws,json
+      - run: cargo test --locked --features ws
+      - run: cargo test --locked --features ws,gzip
       - run: cargo test --locked --all-features
 
   doc:
@@ -88,7 +96,8 @@ jobs:
       - run: cargo build --locked --all-features
       - run: cargo build --locked --no-default-features
 
-  # The dependency rules: no async runtime, no OpenSSL / native-tls / aws-lc, no second TLS provider.
+  # The dependency rules: no async runtime (also with `ws`), no OpenSSL / native-tls / aws-lc, no
+  # second TLS provider, no second webpki-roots.
   deps:
     runs-on: ubuntu-latest
     steps:
@@ -97,11 +106,26 @@ jobs:
         with:
           toolchain: "1.96.0"
       - run: |
-          for f in "" "--all-features"; do
+          for f in "" "--features ws" "--no-default-features --features ws" "--all-features"; do
             if cargo tree --locked --target all -e normal,build $f --prefix none | grep -E '^(tokio|openssl-sys|native-tls|aws-lc-sys|aws-lc-rs|reqwest|hyper|rustls-rustcrypto) '; then
               echo "forbidden dependency with [$f]"; exit 1
             fi
           done
+      # No aws-lc anywhere, dev-dependencies included (rcgen is built with ring only). Note: tokio
+      # does appear in the dev tree through bevy's wasm-only dependencies; the tokio rule above is
+      # checked on normal + build dependencies only.
+      - run: |
+          if grep -q 'name = "aws-lc' Cargo.lock; then echo "aws-lc in Cargo.lock"; exit 1; fi
+          if cargo tree --locked --all-features --target all -e normal,dev,build --prefix none | grep -E '^(aws-lc|openssl-sys|native-tls) '; then
+            echo "forbidden crate in the dev tree"; exit 1
+          fi
+      # No key material in the repository (test certificates are generated in memory).
+      - run: |
+          if grep -rlE "BEGIN ([A-Z]+ )?PRIVATE KEY" --exclude-dir=target --exclude-dir=.git .; then echo "key material in the repository"; exit 1; fi
+      - run: |
+          if [ "$(cargo tree --locked --all-features -e normal,build -i webpki-roots --depth 0 --prefix none | wc -l)" != "1" ]; then
+            echo "more than one webpki-roots"; exit 1
+          fi
       - run: |
           if grep -A1 'name = "bevy' Cargo.lock | grep -q 'version = "0.19.1"'; then
             echo "a Bevy 0.19.1 crate is in Cargo.lock"; exit 1
