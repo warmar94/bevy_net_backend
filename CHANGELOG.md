@@ -41,8 +41,18 @@ change or a Bevy / key dependency bump).
   at least that long before the next reconnect attempt (`WsState::Reconnecting::retry_in` shows it;
   above the backoff cap too, at most `MAX_TIMEOUT`). The attempt limit is unchanged.
 - `mock_ws_server`: a path ending in `/busy` refuses the handshake with `503` and `Retry-After: 2`.
+- WebSocket connections (feature `ws`) use the proxy from the `HTTPS_PROXY` / `HTTP_PROXY` /
+  `ALL_PROXY` environment variables with the same `NO_PROXY` rules as HTTP requests (read when
+  `TungsteniteTransport::new` runs; loopback hosts always direct): a `CONNECT` tunnel through an
+  `http://` proxy, `Proxy-Authorization: Basic` from a user and password in its URL. A refused or
+  unreachable proxy is a `Network` error; with an `https://` or SOCKS proxy set, a connection that
+  would use it fails with `InvalidRequest`.
+- `WsTransport::send_auth(link, text)`: sends the first-message authentication (default: `send`
+  with `WsFrame::Text`).
 - The mock server's `/upload` echo names the content type of a field part that has one; the mock
-  SSH server's `MockOptions` can answer SFTP reads short, slowly or with an error from an offset.
+  SSH server's `MockOptions` can answer SFTP reads short, slowly or with an error from an offset,
+  close the SFTP channel from an offset, or report another size (or none) for open files, and
+  `MockSshServer::drop_connections` closes every open connection.
 
 ### Changed
 
@@ -56,6 +66,17 @@ change or a Bevy / key dependency bump).
 - `Secret` overwrites its whole allocation with zeros when it is dropped, and `BearerToken` wipes
   its temporary `Bearer …` text (copies that become part of a request are not wiped) (`zeroize`, now a dependency of every feature set; rustls already
   used it, so the default build has the same 90 crates, `default-features = false` one more).
+- `TungsteniteTransport` writes the WebSocket handshake request and the first-message
+  authentication frame itself (from buffers it wipes after the write) and hands the stream to
+  tungstenite after the `101` answer, which it checks as tungstenite does. Credential headers, an
+  `ApiKeyQuery` key in the URL and the first-message authentication no longer appear in
+  tungstenite's `trace` log lines. The log-capture test also records `log` records at `trace`.
+- An SFTP operation whose connection or SFTP channel is lost while it runs is answered
+  `Disconnected` (`sent: Some(true)` once it had started, `Some(false)` when it never went out)
+  instead of `Ssh("SFTP: sender dropped")`; the next operation opens a new SFTP channel.
+- An SFTP download whose remote file ends before the size the server reported when it was opened
+  is an error (`Ssh`, naming both sizes) instead of a shorter success; no final file is written and
+  the part file is removed. Files that report size 0 or no size are read to their end as before.
 - Documentation states what the crate does, without plans.
 
 ## [0.1.0] - 2026-10-01

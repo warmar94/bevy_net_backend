@@ -544,6 +544,7 @@ dependencies = [
  "glob",
  "hmac",
  "http",
+ "log",
  "rcgen",
  "russh",
  "russh-sftp",

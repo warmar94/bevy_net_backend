@@ -1,9 +1,12 @@
-//! Secrets never reach the logs: every `tracing` event of this crate (at every level, TRACE
-//! included) is captured while requests with every kind of credential run, succeed, fail and are
-//! cancelled; none contains a secret. With feature `ssh` also a real SSH connection to the mock
-//! (encrypted key + passphrase, a wrong passphrase, a command line, stdin and output holding
-//! secrets). (Debug / Display redaction is unit-tested in the crate.) Own test binary: it
-//! installs a process-wide subscriber.
+//! Secrets never reach the logs: every `tracing` event (at every level, TRACE included) and every
+//! `log` record at TRACE (the crate the WebSocket and SSH libraries log through) is captured while
+//! requests with every kind of credential run, succeed, fail and are cancelled; none contains a
+//! secret. With feature `ssh` also a real SSH connection to the mock (encrypted key + passphrase, a
+//! wrong passphrase, a command line, stdin and output holding secrets); with `ws` + `json` also
+//! real WebSocket connections to the mock with a bearer token, an API key header, an API key in
+//! the URL and a first-message authentication. Records written on the in-process mock servers'
+//! threads (`mock-*`) are left out: they are the server side. (Debug / Display redaction is
+//! unit-tested in the crate.) Own test binary: it installs a process-wide subscriber and logger.
 
 use std::fmt::{self, Write as _};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -22,11 +25,18 @@ const SECRETS: [&str; 4] = ["fake-bearer-7f3a", "fake-header-9c2e", "fake-query-
 const SSH_SECRETS: [&str; 4] = ["fake-ssh-pass-5e1f", "fake-ssh-cmd-77aa", "fake-ssh-stdin-9b9b", "fake-ssh-wrong-0a0a"];
 #[cfg(feature = "ws")]
 const WS_SECRETS: [&str; 2] = ["fake-ws-old-3c3c", "fake-ws-new-4d4d"];
+#[cfg(all(feature = "ws", feature = "json"))]
+const WS_LINK_SECRETS: [&str; 4] = ["fake-ws-bearer-6e6e", "fake-ws-header-7f7f", "fake-ws-query-8a8a", "fake-ws-first-9b9b"];
 
 #[cfg(feature = "ssh")]
 #[allow(dead_code)]
 #[path = "../examples/mock_ssh_server.rs"]
 mod mock_ssh_server;
+
+#[cfg(all(feature = "ws", feature = "json"))]
+#[allow(dead_code)]
+#[path = "../examples/mock_ws_server.rs"]
+mod mock_ws_server;
 
 /// Puts one kind of credentials into the resource.
 type SetCredentials = dyn Fn(&mut BackendCredentials);
@@ -64,10 +74,40 @@ impl Subscriber for Capture {
     fn exit(&self, _: &Id) {}
 }
 
+/// Every `log` record at every level, with its thread (records of the mock servers' threads are
+/// kept apart: they are the server side).
+#[derive(Clone, Default)]
+struct LogCapture {
+    client: Arc<Mutex<String>>,
+    mock: Arc<Mutex<String>>,
+}
+
+impl log::Log for LogCapture {
+    fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+        true
+    }
+    fn log(&self, record: &log::Record<'_>) {
+        let thread = std::thread::current();
+        let line = format!("{}: {}\n", record.target(), record.args());
+        let into = if thread.name().is_some_and(|n| n.starts_with("mock-")) { &self.mock } else { &self.client };
+        into.lock().unwrap_or_else(PoisonError::into_inner).push_str(&line);
+    }
+    fn flush(&self) {}
+}
+
+/// `secret` in `logs`: as text, or as the hex dump tungstenite prints frame payloads with.
+fn leaked(logs: &str, secret: &str) -> bool {
+    let hex: String = secret.bytes().map(|b| format!("{b:02x}")).collect();
+    logs.contains(secret) || logs.to_ascii_lowercase().contains(&hex)
+}
+
 #[test]
 fn no_secret_is_ever_logged() {
     let capture = Capture::default();
     tracing::subscriber::set_global_default(capture.clone()).unwrap_or_else(|e| panic!("{e}"));
+    let records = LogCapture::default();
+    log::set_boxed_logger(Box::new(records.clone())).unwrap_or_else(|e| panic!("{e}"));
+    log::set_max_level(log::LevelFilter::Trace);
 
     let fake = FakeHttpTransport::new();
     fake.route(Method::GET, "/ok", Ok(RawResponse::new(StatusCode::OK, format!(r#"{{"token":"{}"}}"#, SECRETS[0]))));
@@ -103,8 +143,38 @@ fn no_secret_is_ever_logged() {
     ssh_part();
     #[cfg(feature = "ws")]
     ws_part();
+    #[cfg(all(feature = "ws", feature = "json"))]
+    ws_link_part();
 
     let logs = capture.0.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    let log_records = records.client.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    #[cfg_attr(not(any(feature = "ws", feature = "ssh")), allow(unused_mut))]
+    let mut every_secret: Vec<&str> = SECRETS.to_vec();
+    #[cfg(feature = "ws")]
+    every_secret.extend(WS_SECRETS);
+    #[cfg(all(feature = "ws", feature = "json"))]
+    every_secret.extend(WS_LINK_SECRETS);
+    #[cfg(feature = "ssh")]
+    every_secret.extend(SSH_SECRETS);
+    for secret in &every_secret {
+        assert!(!leaked(&log_records, secret), "`{secret}` was in a `log` record:\n{log_records}");
+    }
+    let lower = log_records.to_ascii_lowercase();
+    assert!(
+        !lower.contains("bearer ") && !lower.contains("authorization") && !lower.contains("x-key"),
+        "a credential header was in a `log` record:\n{log_records}"
+    );
+    #[cfg(all(feature = "ws", feature = "json"))]
+    {
+        // The capture works: tungstenite's TRACE records of the client's connections are there.
+        assert!(log_records.contains("tungstenite::protocol"), "no tungstenite record captured:\n{log_records}");
+        // The server side (tungstenite on the mock's threads) did see the secrets: proof that they
+        // went over the wire, and that only the client's records are clean.
+        let mock = records.mock.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        assert!(leaked(&mock, WS_LINK_SECRETS[3]), "the mock never received the first-message token");
+    }
+    #[cfg(feature = "ssh")]
+    assert!(log_records.contains("russh"), "no russh record captured:\n{log_records}");
     assert!(logs.contains(">>> NET-BACKEND"), "nothing captured:\n{logs}");
     assert!(logs.contains("not sent"), "the refused request is logged:\n{logs}");
     for secret in SECRETS {
@@ -190,6 +260,51 @@ fn ws_part() {
         app.world_mut().resource_mut::<BackendCredentials>().set(FirstMessage);
         app.step_n(2);
     }
+    app.world_mut().write_message(AppExit::Success);
+    app.step();
+}
+
+/// Real WebSocket connections (to the mock, on 127.0.0.1) with each kind of credentials: a bearer
+/// token and an API key in handshake headers, an API key in the URL, and a first-message
+/// authentication; each also sends a frame and receives one.
+#[cfg(all(feature = "ws", feature = "json"))]
+fn ws_link_part() {
+    struct FirstMessage;
+    impl Credentials for FirstMessage {
+        fn apply(&self, _request: &mut OutgoingRequest) {}
+        fn ws_auth_message(&self) -> Option<String> {
+            // An envelope request: the mock answers it ("unknown") instead of echoing it back.
+            Some(format!(r#"{{"id":0,"type":"auth","data":{{"token":"{}"}}}}"#, WS_LINK_SECRETS[3]))
+        }
+    }
+    let server = mock_ws_server::MockWsServer::start(0).unwrap_or_else(|e| panic!("mock: {e}"));
+    let mut app = TestApp::builder().frame_duration(Duration::from_millis(1)).real_pause(Duration::from_millis(2)).build();
+    app.add_plugins(BackendPlugin::default());
+    app.watch::<WsMessage>();
+    let credentials: Vec<Box<SetCredentials>> = vec![
+        Box::new(|c| c.set(BearerToken::new(WS_LINK_SECRETS[0]))),
+        Box::new(|c| c.set(ApiKeyHeader::new("X-Key", WS_LINK_SECRETS[1]))),
+        Box::new(|c| c.set(ApiKeyQuery::new("key", WS_LINK_SECRETS[2]))),
+        Box::new(|c| c.set(FirstMessage)),
+    ];
+    for (n, set) in credentials.into_iter().enumerate() {
+        set(&mut app.world_mut().resource_mut::<BackendCredentials>());
+        let name = format!("link{n}");
+        app.world().resource::<WsClient>().connect(name.as_str(), WsSettings::new(format!("{}/plain", server.url())));
+        app.step();
+        app.run_until(|world| world.resource::<WsConnections>().state(&name) == Some(WsState::Connected), 4000);
+        app.world().resource::<WsClient>().send_text(name.as_str(), "plain text");
+        let before = app.all_messages::<WsMessage>().len();
+        for _ in 0..2000 {
+            if app.all_messages::<WsMessage>().len() > before {
+                break;
+            }
+            app.step();
+        }
+        app.world().resource::<WsClient>().disconnect(name.as_str());
+        app.step_n(5);
+    }
+    assert_eq!(server.accepted(), 4, "every connection was made");
     app.world_mut().write_message(AppExit::Success);
     app.step();
 }

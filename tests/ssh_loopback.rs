@@ -846,4 +846,119 @@ mod sftp {
         let id = ssh(&app).download("main", "after.bin");
         assert_eq!(op_within(&mut app, id, Duration::from_secs(30)).result, Ok(SftpOutcome::Data(b"after the cancel".to_vec())));
     }
+
+    /// Starts a slow download of `remote` (8 MiB, 15 ms per read on the mock) to `local` and
+    /// returns once its first bytes arrived.
+    fn download_until_progress(app: &mut TestApp, remote: &str, local: &Path) -> RequestId {
+        let id = ssh(app).download_file("main", remote, local);
+        app.step();
+        let start = Instant::now();
+        while !app.all_messages::<SftpProgress>().iter().any(|p| p.id == id && p.done > 0) && start.elapsed() < Duration::from_secs(30) {
+            app.step();
+        }
+        assert!(app.all_messages::<SftpProgress>().iter().any(|p| p.id == id && p.done > 0), "no progress within 30 s");
+        id
+    }
+
+    #[test]
+    fn a_connection_lost_midway_ends_a_transfer_disconnected_and_leaves_no_file() {
+        let options = MockOptions { sftp_read_delay: Some(Duration::from_millis(15)), ..MockOptions::default() };
+        let setup = Setup::with(None, options);
+        let mut app = app();
+        connected(&mut app, setup.target().with_sftp_timeout(Duration::from_secs(120)));
+        setup.mock.put_file("slow.bin", &content(8 * 1024 * 1024));
+        let local = setup.dir.join("slow.bin");
+        let id = download_until_progress(&mut app, "slow.bin", &local);
+        // The server goes away (TCP closed, no SSH disconnect message).
+        setup.mock.drop_connections();
+        let answer = op_within(&mut app, id, Duration::from_secs(30));
+        assert!(matches!(&answer.result, Err(BackendError::Disconnected { sent: Some(true), .. })), "{:?}", answer.result);
+        assert_eq!(answer.result.as_ref().err().and_then(BackendError::was_sent), Some(true));
+        assert_eq!(answer.started, Some(true));
+        assert!(!local.exists(), "no file under the final name");
+        assert!(wait_until(|| part_files(&setup.dir).is_empty(), Duration::from_secs(5)), "{:?}", part_files(&setup.dir));
+        // The connection is gone (no reconnect asked for): a new operation is never sent.
+        app.run_until(|world| world.resource::<SshConnections>().state("main") == Some(SshState::Disconnected), 5000);
+        let id = ssh(&app).list_dir("main", ".");
+        let answer = op_within(&mut app, id, Duration::from_secs(10));
+        assert!(matches!(&answer.result, Err(BackendError::Disconnected { sent: Some(false), .. })), "{:?}", answer.result);
+        assert_eq!(answer.started, Some(false));
+    }
+
+    /// Only the SFTP channel ends (the connection stays): the transfer is answered by the
+    /// transport itself, `Disconnected` with `sent: Some(true)` (not the SFTP library's internal
+    /// "sender dropped"), and the next operation opens a new SFTP channel.
+    #[test]
+    fn an_sftp_channel_that_ends_midway_is_a_disconnect_and_the_next_operation_opens_a_new_one() {
+        let options = MockOptions { sftp_close_channel_at: Some(1024 * 1024), ..MockOptions::default() };
+        let setup = Setup::with(None, options);
+        let mut app = app();
+        connected(&mut app, setup.target());
+        setup.mock.put_file("big.bin", &content(4 * 1024 * 1024));
+        let local = setup.dir.join("big.bin");
+        let id = ssh(&app).download_file("main", "big.bin", &local);
+        let answer = op_within(&mut app, id, Duration::from_secs(30));
+        assert!(
+            matches!(&answer.result, Err(BackendError::Disconnected { reason, sent: Some(true), .. }) if reason.contains("SFTP channel ended")),
+            "{:?}",
+            answer.result
+        );
+        assert_eq!(answer.started, Some(true));
+        assert!(!local.exists(), "no file under the final name");
+        assert!(wait_until(|| part_files(&setup.dir).is_empty(), Duration::from_secs(5)), "{:?}", part_files(&setup.dir));
+        assert_eq!(app.world().resource::<SshConnections>().state("main"), Some(SshState::Connected));
+        setup.mock.put_file("small.bin", b"a new channel");
+        let id = ssh(&app).download("main", "small.bin");
+        assert_eq!(op_within(&mut app, id, Duration::from_secs(30)).result, Ok(SftpOutcome::Data(b"a new channel".to_vec())));
+    }
+
+    #[test]
+    fn a_remote_file_cut_short_during_a_download_is_an_error_and_leaves_no_file() {
+        let options = MockOptions { sftp_read_delay: Some(Duration::from_millis(15)), ..MockOptions::default() };
+        let setup = Setup::with(None, options);
+        let mut app = app();
+        connected(&mut app, setup.target().with_sftp_timeout(Duration::from_secs(120)));
+        let data = content(8 * 1024 * 1024);
+        setup.mock.put_file("cut.bin", &data);
+        let local = setup.dir.join("cut.bin");
+        let id = download_until_progress(&mut app, "cut.bin", &local);
+        // Truncated on the server while it is read (the handle stays open).
+        setup.mock.put_file("cut.bin", &data[..1024 * 1024]);
+        let answer = op_within(&mut app, id, Duration::from_secs(60));
+        let expected = format!("had {} bytes when it was opened", data.len());
+        assert!(matches!(&answer.result, Err(BackendError::Ssh(why)) if why.contains(&expected) && why.contains("cut short")), "{:?}", answer.result);
+        assert_eq!(answer.started, Some(true));
+        assert!(!local.exists(), "no file under the final name");
+        assert!(wait_until(|| part_files(&setup.dir).is_empty(), Duration::from_secs(5)), "{:?}", part_files(&setup.dir));
+        assert!(wait_until(|| open_handles(&setup) == 0, Duration::from_secs(5)), "the remote handle stayed open");
+        // Into memory: the same answer for a file that is shorter than its size at open.
+        setup.mock.put_file("cut2.bin", &data);
+        let id = ssh(&app).download("main", "cut2.bin");
+        app.step();
+        let start = Instant::now();
+        while !app.all_messages::<SftpProgress>().iter().any(|p| p.id == id && p.done > 0) && start.elapsed() < Duration::from_secs(30) {
+            app.step();
+        }
+        setup.mock.put_file("cut2.bin", b"short");
+        let answer = op_within(&mut app, id, Duration::from_secs(60));
+        assert!(matches!(&answer.result, Err(BackendError::Ssh(why)) if why.contains("cut short")), "{:?}", answer.result);
+    }
+
+    #[test]
+    fn files_that_report_size_zero_or_no_size_are_read_to_the_end() {
+        let data = content(300_000);
+        for reported in [Some(0), None] {
+            let options = MockOptions { sftp_fstat_size: Some(reported), ..MockOptions::default() };
+            let setup = Setup::with(None, options);
+            let mut app = app();
+            connected(&mut app, setup.target());
+            setup.mock.put_file("special.bin", &data);
+            let id = ssh(&app).download("main", "special.bin");
+            assert_eq!(op(&mut app, id).result, Ok(SftpOutcome::Data(data.clone())), "size reported: {reported:?}");
+            let local = setup.dir.join("special.bin");
+            let id = ssh(&app).download_file("main", "special.bin", &local);
+            assert_eq!(op(&mut app, id).result, Ok(SftpOutcome::Downloaded { bytes: data.len() as u64 }), "size reported: {reported:?}");
+            assert_eq!(std::fs::read(&local).ok(), Some(data.clone()));
+        }
+    }
 }

@@ -20,8 +20,9 @@
 //! `--password PW` also accepts that password, `--kbd PW:CODE` a keyboard-interactive login
 //! (`Password:` then `Verification code:`): throwaway test values only (they are visible in the
 //! process list). In tests it can also skip strict key exchange, restrict its ciphers, offer
-//! several host key types, and answer SFTP reads short, slowly or with an error from an offset on
-//! ([`MockOptions`]).
+//! several host key types, answer SFTP reads short, slowly or with an error from an offset on (or
+//! close the SFTP channel there), and report another size (or none) for open files
+//! ([`MockOptions`]); `drop_connections` closes every open connection at once.
 //!
 //! Limits: 16 connections at once (more are dropped), 10 minutes per connection, 60 s without any
 //! traffic, 10 channels per connection; `flood` at most 64 MiB, `sleep` at most 60 s, stdin at most
@@ -140,6 +141,12 @@ pub struct MockOptions {
     pub sftp_fail_reads_at: Option<u64>,
     /// Every SFTP read waits this long first (a slow server).
     pub sftp_read_delay: Option<Duration>,
+    /// What `fstat` reports as a file's size: `Some(None)` no size at all, `Some(Some(n))` always
+    /// `n` (e.g. 0, like special files). `None`: the real size.
+    pub sftp_fstat_size: Option<Option<u64>>,
+    /// A read at or after this offset closes the SFTP channel instead of answering (the SSH
+    /// connection stays up): the SFTP session ends under a running transfer.
+    pub sftp_close_channel_at: Option<u64>,
 }
 
 /// A running mock SSH server; stops when dropped.
@@ -151,6 +158,7 @@ pub struct MockSshServer {
     #[cfg(feature = "sftp")]
     files: Arc<Mutex<sftp::Fs>>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
+    kill: Arc<tokio::sync::Notify>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -183,6 +191,7 @@ impl MockSshServer {
         let host_keys: Vec<PublicKey> = keys.iter().map(|k| k.public_key().clone()).collect();
         let host_key = host_keys.first().cloned().ok_or_else(|| std::io::Error::other("no host key"))?;
         let stats = Arc::new(Stats::default());
+        let kill = Arc::new(tokio::sync::Notify::new());
         #[cfg(feature = "sftp")]
         let files = Arc::new(Mutex::new(sftp::Fs::new(user)));
         let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -195,7 +204,14 @@ impl MockSshServer {
             #[cfg(feature = "sftp")]
             files: Arc::clone(&files),
             #[cfg(feature = "sftp")]
-            sftp: sftp::Behaviour { short_reads: options.sftp_short_reads, fail_reads_at: options.sftp_fail_reads_at, read_delay: options.sftp_read_delay },
+            sftp: sftp::Behaviour {
+                short_reads: options.sftp_short_reads,
+                fail_reads_at: options.sftp_fail_reads_at,
+                read_delay: options.sftp_read_delay,
+                fstat_size: options.sftp_fstat_size,
+                close_channel_at: options.sftp_close_channel_at,
+            },
+            kill: Arc::clone(&kill),
         };
         let mut preferred = russh::Preferred::default();
         if options.no_strict_kex {
@@ -227,6 +243,7 @@ impl MockSshServer {
             #[cfg(feature = "sftp")]
             files,
             stop: Some(stop),
+            kill,
             thread: Some(thread),
         })
     }
@@ -271,6 +288,12 @@ impl MockSshServer {
         &self.stats
     }
 
+    /// Drop every open connection at once, without an SSH disconnect message (the TCP connections
+    /// just close, like a server that died). New connections are accepted as before.
+    pub fn drop_connections(&self) {
+        self.kill.notify_waiters();
+    }
+
     /// The content of an in-memory SFTP file (feature `sftp`).
     #[cfg(feature = "sftp")]
     pub fn file(&self, path: &str) -> Option<Vec<u8>> {
@@ -306,6 +329,7 @@ struct Shared {
     files: Arc<Mutex<sftp::Fs>>,
     #[cfg(feature = "sftp")]
     sftp: sftp::Behaviour,
+    kill: Arc<tokio::sync::Notify>,
 }
 
 async fn accept_loop(listener: std::net::TcpListener, config: Arc<russh::server::Config>, shared: Shared, mut stopped: tokio::sync::oneshot::Receiver<()>) {
@@ -324,11 +348,29 @@ async fn accept_loop(listener: std::net::TcpListener, config: Arc<russh::server:
         shared.stats.connections.fetch_add(1, Ordering::SeqCst);
         let (config, handler, slot) =
             (Arc::clone(&config), Handler { shared: shared.clone(), channels: HashMap::new(), stdin: HashMap::new() }, Arc::clone(&active));
+        let kill = Arc::clone(&shared.kill);
+        // A second handle on the socket: `drop_connections` shuts it down under the session.
+        let Ok((stream, socket)) = stream.into_std().and_then(|std| {
+            let socket = std.try_clone()?;
+            Ok((tokio::net::TcpStream::from_std(std)?, socket))
+        }) else {
+            slot.fetch_sub(1, Ordering::SeqCst);
+            continue;
+        };
         tokio::spawn(async move {
             let _ = stream.set_nodelay(true);
+            // `notified()` is created before the session runs, so a drop request is never missed.
+            let killed = kill.notified();
             let _ = tokio::time::timeout(CONNECTION_LIFETIME, async move {
-                if let Ok(session) = russh::server::run_stream(config, stream, handler).await {
-                    let _ = session.await;
+                tokio::select! {
+                    () = killed => {
+                        let _ = socket.shutdown(std::net::Shutdown::Both);
+                    }
+                    () = async {
+                        if let Ok(session) = russh::server::run_stream(config, stream, handler).await {
+                            let _ = session.await;
+                        }
+                    } => {}
                 }
             })
             .await;
@@ -536,7 +578,7 @@ impl russh::server::Handler for Handler {
                 session.channel_success(channel)?;
                 russh_sftp::server::run(
                     open.into_stream(),
-                    sftp::Session::new(Arc::clone(&self.shared.files), self.shared.sftp, Arc::clone(&self.shared.stats)),
+                    sftp::Session::new(Arc::clone(&self.shared.files), self.shared.sftp, Arc::clone(&self.shared.stats), (session.handle(), channel)),
                 )
                 .await;
                 return Ok(());
@@ -623,6 +665,8 @@ mod sftp {
         pub short_reads: bool,
         pub fail_reads_at: Option<u64>,
         pub read_delay: Option<std::time::Duration>,
+        pub fstat_size: Option<Option<u64>>,
+        pub close_channel_at: Option<u64>,
     }
 
     pub struct Session {
@@ -631,6 +675,8 @@ mod sftp {
         next: u64,
         behaviour: Behaviour,
         stats: Arc<super::Stats>,
+        /// The SSH channel this session runs on (to close it, see `Behaviour::close_channel_at`).
+        channel: (russh::server::Handle, russh::ChannelId),
     }
 
     impl Drop for Session {
@@ -641,8 +687,8 @@ mod sftp {
     }
 
     impl Session {
-        pub fn new(fs: Arc<Mutex<Fs>>, behaviour: Behaviour, stats: Arc<super::Stats>) -> Self {
-            Self { fs, handles: HashMap::new(), next: 1, behaviour, stats }
+        pub fn new(fs: Arc<Mutex<Fs>>, behaviour: Behaviour, stats: Arc<super::Stats>, channel: (russh::server::Handle, russh::ChannelId)) -> Self {
+            Self { fs, handles: HashMap::new(), next: 1, behaviour, stats, channel }
         }
 
         fn handle(&mut self, open: Open) -> Result<String, StatusCode> {
@@ -717,6 +763,12 @@ mod sftp {
             if self.behaviour.fail_reads_at.is_some_and(|at| offset >= at) {
                 return Err(StatusCode::Failure);
             }
+            if self.behaviour.close_channel_at.is_some_and(|at| offset >= at) {
+                let (handle, channel) = self.channel.clone();
+                let _ = handle.close(channel).await;
+                // Never answered: the channel is gone.
+                std::future::pending::<()>().await;
+            }
             let Some(Open::File(path)) = self.handles.get(&handle) else { return Err(StatusCode::Failure) };
             let fs = self.fs.lock().unwrap_or_else(PoisonError::into_inner);
             let data = fs.files.get(path).ok_or(StatusCode::NoSuchFile)?;
@@ -758,7 +810,11 @@ mod sftp {
             let Some(Open::File(path)) = self.handles.get(&handle) else { return Err(StatusCode::Failure) };
             let fs = self.fs.lock().unwrap_or_else(PoisonError::into_inner);
             let size = fs.files.get(path).map(Vec::len).ok_or(StatusCode::NoSuchFile)?;
-            Ok(Attrs { id, attrs: file_attrs(size) })
+            let mut attrs = file_attrs(size);
+            if let Some(reported) = self.behaviour.fstat_size {
+                attrs.size = reported;
+            }
+            Ok(Attrs { id, attrs })
         }
 
         async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {

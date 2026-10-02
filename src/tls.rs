@@ -16,8 +16,8 @@ pub(crate) fn provider() -> Arc<CryptoProvider> {
 }
 
 /// Fill `bytes` from the operating system's secure random source, through the same ring provider
-/// (no extra dependency): for multipart boundaries.
-#[cfg(feature = "http")]
+/// (no extra dependency): for multipart boundaries and WebSocket frame masks.
+#[cfg(any(feature = "http", feature = "ws"))]
 pub(crate) fn random_bytes(bytes: &mut [u8]) -> Result<(), ()> {
     rustls::crypto::ring::default_provider().secure_random.fill(bytes).map_err(|_| ())
 }

@@ -95,6 +95,9 @@ rcgen = { version = "=0.14.10", default-features = false, features = ["ring"] }
 # Random seeds for the throwaway SSH keys of the mock SSH server and the SSH tests (the same
 # getrandom russh already uses). Keys are generated at runtime; none is in the repository.
 getrandom = { version = "0.4", features = ["sys_rng"] }
+# The log-capture test also records what dependencies (tungstenite, russh) log through the `log`
+# crate. Already in the tree through them: no new crate.
+log = "0.4"
 
 # Examples run against a mock server they start on 127.0.0.1 (or against `BACKEND_URL`).
 [[example]]
@@ -127,6 +130,12 @@ required-features = ["ws"]
 
 [[test]]
 name = "ws_loopback"
+required-features = ["ws", "json"]
+
+# WebSocket connections through a CONNECT proxy from the environment (sets environment variables:
+# its own binary).
+[[test]]
+name = "ws_proxy"
 required-features = ["ws", "json"]
 
 # Live WSS checks against a test server (the WS mock behind a TLS proxy). `#[ignore]`d: run only

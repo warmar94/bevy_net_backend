@@ -294,7 +294,7 @@ fn on_open(
     if let Some(auth) = auth {
         // The credentials this authentication message came from (a refusal refers to them).
         conn.cred_version = credentials.map(BackendCredentials::version);
-        transport.get_mut().send(link, WsFrame::Text(auth));
+        transport.get_mut().send_auth(link, auth);
         if let Some(ack) = conn.settings.auth_ack {
             conn.authed = false;
             conn.auth_deadline = Some(now.saturating_add(ack));

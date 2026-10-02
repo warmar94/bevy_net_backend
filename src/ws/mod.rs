@@ -33,6 +33,7 @@ use crate::BackendSystems;
 
 mod link;
 mod protocol;
+mod proxy;
 mod systems;
 mod transport;
 

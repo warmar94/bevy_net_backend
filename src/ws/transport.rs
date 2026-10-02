@@ -108,6 +108,15 @@ pub trait WsTransport: Send + Sync + 'static {
     /// Send a frame on an open link (ignored for a link that is gone).
     fn send(&mut self, link: WsLinkId, frame: WsFrame);
 
+    /// Send the first-message authentication text
+    /// ([`Credentials::ws_auth_message`](crate::Credentials::ws_auth_message)) as a text frame on an
+    /// open link. It holds a credential: keep it out of logs. Default: [`send`](Self::send) with
+    /// [`WsFrame::Text`]. [`TungsteniteTransport`](crate::TungsteniteTransport) writes this frame
+    /// itself (not through tungstenite) and wipes its copies after the write.
+    fn send_auth(&mut self, link: WsLinkId, text: String) {
+        self.send(link, WsFrame::Text(text));
+    }
+
     /// Close a link with `code`. The plugin stops listening to it right away.
     fn close(&mut self, link: WsLinkId, code: u16);
 

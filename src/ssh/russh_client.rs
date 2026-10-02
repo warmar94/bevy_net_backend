@@ -1205,7 +1205,14 @@ async fn sftp_session(ctx: &Ctx) -> Result<Arc<russh_sftp::client::RawSftpSessio
     if let Some(session) = slot.as_ref() {
         return Ok(Arc::clone(session));
     }
-    let mut channel = ctx.handle.channel_open_session().await.map_err(|e| BackendError::Ssh(format!("could not open a channel for SFTP: {e}")))?;
+    let mut channel = ctx.handle.channel_open_session().await.map_err(|e| {
+        if ctx.handle.is_closed() {
+            // Nothing of the operation went out.
+            BackendError::disconnected(format!("the connection is gone: could not open a channel for SFTP ({e})"), Some(false))
+        } else {
+            BackendError::Ssh(format!("could not open a channel for SFTP: {e}"))
+        }
+    })?;
     channel.request_subsystem(true, "sftp").await.map_err(|e| BackendError::Ssh(format!("could not request the SFTP subsystem: {e}")))?;
     loop {
         match channel.wait().await {
@@ -1241,6 +1248,8 @@ async fn sftp(ctx: Ctx, id: RequestId, op: SftpOp, mut cancel: oneshot::Receiver
     };
     let session = match race(sftp_session(&ctx), deadline, &mut cancel).await {
         Race::Done(Ok(session)) => session,
+        // The operation itself never went out.
+        Race::Done(Err(BackendError::Disconnected { reason, .. })) => return finish(Err(BackendError::disconnected(reason, Some(false)))),
         Race::Done(Err(error)) => return finish(Err(error)),
         Race::TimedOut => return finish(Err(BackendError::Timeout(format!("not sent: the SFTP subsystem did not start within {timeout:?}")))),
         Race::Cancelled => return,
@@ -1263,13 +1272,15 @@ async fn sftp(ctx: Ctx, id: RequestId, op: SftpOp, mut cancel: oneshot::Receiver
         }
     };
     match outcome {
-        Race::Done(result) => {
-            if matches!(&result, Err(BackendError::Ssh(why)) if why.contains("session closed")) {
-                // The SFTP channel died: the next operation opens a new one.
-                *ctx.sftp.lock().await = None;
-            }
-            finish(result);
+        Race::Done(Err(BackendError::Disconnected { reason, .. })) => {
+            // The SFTP channel died (with its connection, or alone): the next operation opens a
+            // new one. Whether the operation went out is known here: `started` is set just before
+            // its first request.
+            *ctx.sftp.lock().await = None;
+            let reason = if ctx.handle.is_closed() { format!("the connection was lost during the SFTP operation: {reason}") } else { reason };
+            finish(Err(BackendError::disconnected(reason, Some(started))));
         }
+        Race::Done(result) => finish(result),
         Race::TimedOut => {
             cleanup();
             let why = if started {

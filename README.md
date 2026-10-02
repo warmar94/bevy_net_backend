@@ -563,11 +563,12 @@ impl Credentials for Session {
 - `Secret` prints as `<redacted>` in `Debug` and `Display`; read it with `expose()`. When it is
   dropped, its whole allocation is overwritten with zeros first (the `zeroize` crate, which
   rustls already uses), and so are the crate's temporary `Bearer …` header text and the SSH key
-  file text it reads. Not wiped: the copies that become part of a request (header values, the
-  query value of `ApiKeyQuery` and the URL built from it, the body `JsonBodyField` writes,
-  keyboard-interactive answers and passwords handed to russh, the first-message authentication
-  frame), the `String` you built the secret from, and what the HTTP, WebSocket and SSH libraries
-  copy while sending.
+  file text it reads. `TungsteniteTransport` writes the WebSocket handshake request and the
+  first-message authentication frame from buffers it wipes after the write, and wipes the
+  authentication text it was given. Not wiped: the copies that become part of a request (header
+  values, the query value of `ApiKeyQuery` and the URL built from it, the body `JsonBodyField`
+  writes, keyboard-interactive answers and passwords handed to russh), the `String` you built the
+  secret from, and what the HTTP, TLS and SSH libraries copy while sending.
   `BackendCredentials`, `BearerToken`, `ApiKeyHeader`, `ApiKeyQuery` and `JsonBodyField` never
   show the secret in `Debug`; `OutgoingRequest` and `PreparedRequest` print header names but no
   header values, no query values and no body; `RawResponse` prints the body's length only.
@@ -578,6 +579,14 @@ impl Credentials for Session {
   `RUST_LOG=trace,ureq=debug,ureq_proto=debug`, or in Bevy
   `LogPlugin { filter: "wgpu=error,naga=warn,ureq=debug,ureq_proto=debug".into(), ..default() }`.
   Bevy's default level (`info`) is safe.
+- **WebSocket credentials never reach tungstenite's logs.** tungstenite logs the handshake request
+  and the content of every frame it sends or receives at `trace` (through the `log` crate). The
+  crate writes the handshake request (credential headers, an `ApiKeyQuery` key in the URL) and the
+  first-message authentication frame itself, so neither passes through tungstenite. Other frames
+  do: the messages your game sends and receives (requests, answers, pushes, and a credential if
+  your game puts one into a message of its own) appear in tungstenite's `trace` lines; keep
+  `tungstenite=debug` in the filter to leave them out. The log-capture test records `log` lines at
+  `trace` from tungstenite and russh and finds no credential in them.
 - **`ApiKeyQuery` secrets end up in access logs.** A query key is part of the URL, so reverse
   proxies and servers log it: in testing Caddy's access log showed `api_key=…` (and an
   `X-Api-Key` header) in plain text while it masked `Authorization`. Prefer `BearerToken` (or a
@@ -653,7 +662,9 @@ let config = HttpConfig::new("http://192.168.1.20:8000/api").allow_insecure_http
 ```
 
 Loopback requests never use a proxy. Other requests use the proxy from `HTTPS_PROXY` /
-`HTTP_PROXY` / `ALL_PROXY` (with `NO_PROXY`) when set (ureq's default).
+`HTTP_PROXY` / `ALL_PROXY` (with `NO_PROXY`) when set (ureq's default). WebSocket connections
+(feature `ws`) follow the same variables and bypass rules through an `http://` proxy's `CONNECT`
+tunnel (see [WebSocket](#10-websocket-connections-feature-ws)).
 
 ### 8. Testing your game without a server
 
@@ -801,7 +812,7 @@ fn main() {
   latency added to every frame you send, because the thread sends between reads: measured median
   request round trips through a TLS proxy were 30 ms at 5 ms, 43 ms at the default 20 ms and
   118 ms at 100 ms, against about 20 ms for HTTP), connect timeout (10 s, ONE
-  deadline for TCP + TLS + handshake, at most 1 h), heartbeat (ping every 15 s, dead after 45 s
+  deadline for TCP + proxy tunnel + TLS + handshake, at most 1 h), heartbeat (ping every 15 s, dead after 45 s
   without a single byte, at most 1 h), request timeout (10 s), message limit (1 MiB, incoming and
   outgoing), reconnect policy, handshake headers, `allow_insecure_ws`, `without_credentials`, the
   protocol, outbox (64 frames), resend (32) and waiting (64 requests) limits, `with_auth_ack`,
@@ -828,6 +839,14 @@ fn main() {
   until the protocol reports `WsIncoming::AuthOk` (`{"type":"auth.ok"}` with `JsonEnvelope`); without
   it in time the waiting requests are answered `Timeout` (honest about an earlier send), the link
   closes with 1008 and the connection goes `Disconnected` with that error.
+- **Proxy:** `TungsteniteTransport` uses the proxy from the same environment variables as HTTP
+  (`HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`, read when the transport is created) with the same
+  `NO_PROXY` rules; loopback hosts always connect directly. Through an `http://` proxy the
+  connection is a `CONNECT host:port` tunnel (TLS for `wss://` runs end to end inside it; a user
+  and password in the proxy URL are sent as `Proxy-Authorization: Basic`). A proxy that refuses
+  the tunnel (e.g. `407`) or cannot be reached is a `Network` error, retried like any connect
+  failure. With an `https://` or SOCKS proxy set, a connection that would go through it fails with
+  `InvalidRequest` (not retried) and is never made around the proxy.
 - **Refreshing credentials** (off by default; `WsSettings::with_credentials_refresh`): when the
   server refuses the credentials (a `401` handshake, a refused first-message auth, or a close
   code you list with `WsCredentialsRefresh::with_close_code`, e.g. a server's 4001 for a revoked
@@ -1133,9 +1152,15 @@ login directory. A download over `with_max_transfer_bytes` is `BodyTooLarge`; an
 (from memory or from a file) is `RequestTooLarge`, refused before anything is sent
 (`started: Some(false)`); a whole operation is bounded by `with_sftp_timeout`. An
 interrupted upload can leave a partial remote file; so can a local file that grows or shrinks
-during `upload_file`, which is answered `Ssh("the local file changed size …")`. Errors carry the server's SFTP status text
-(`Ssh("SFTP: No such file")`). The SFTP channel is opened on first use and shared by the
-connection's operations. Local files are read and written on tokio's small blocking pool, never on
+during `upload_file`, which is answered `Ssh("the local file changed size …")`. A download whose
+remote file ends before the size the server reported when it was opened (the file was cut short
+meanwhile) is an error, `Ssh("SFTP: the remote file ended after <received> bytes, but it had
+<expected> bytes when it was opened …")`, with no final file and the part file removed; a file
+that reports size 0 or no size is read to its end. Errors carry the server's SFTP status text
+(`Ssh("SFTP: No such file")`). A connection (or SFTP channel) lost during an operation answers it
+`Disconnected` with `sent: Some(true)` once the operation had started (`Some(false)` when it never
+went out). The SFTP channel is opened on first use and shared by the connection's operations; after
+it ended, the next operation opens a new one. Local files are read and written on tokio's small blocking pool, never on
 the SSH thread itself.
 
 **Downloads are pipelined:** reads of 64 KiB go out ahead of the answers, up to 1 MiB requested
@@ -1393,11 +1418,13 @@ framework dropped:
   multi-megabyte answer can cost that frame a few milliseconds; keep big payloads raw
   (`HttpResponse`) or small.
 - **WebSocket threads (feature `ws`).** Each connection attempt runs on its own std thread
-  (`net-backend-ws-link#N`): TCP, then rustls for `wss://`, then the tungstenite handshake, then a
+  (`net-backend-ws-link#N`): TCP (through an `http://` proxy's `CONNECT` tunnel when one is set),
+  then rustls for `wss://`, then the HTTP upgrade (written and checked by the crate; tungstenite
+  takes the stream after the `101` answer), then a
   loop: send what the game queued, ping when due, flush, one read whose socket reads together
   stop after one read timeout (Windows reports a read timeout as `TimedOut`, Unix as
   `WouldBlock`; both mean "no data"), check for a dead peer (no byte for `dead_after`). The
-  handshake (TCP + TLS + upgrade) runs under ONE deadline. Both limits sit under rustls and
+  handshake (TCP + proxy tunnel + TLS + upgrade) runs under ONE deadline. Both limits sit under rustls and
   tungstenite, so a peer that trickles bytes can neither stretch the handshake nor starve
   outgoing frames and pings. An idle connection wakes about 50 times a second, and a frame you
   send goes out within about one read timeout, plus the time the socket needs for earlier
@@ -1485,9 +1512,9 @@ Everything is re-exported at the crate root; `prelude` holds the everyday items.
 | `WsRequest`, `WsPushMessage`, `WsResponse<T>`, `WsPush<P>`, `JsonEnvelope` | (`ws` + `json`) | typed requests (`Response`, `KIND`, `resend_on_reconnect`), typed pushes (`KIND`), their messages, the default protocol. |
 | `WsProtocol`, `WsIncoming` | trait / enum (`ws`) | `encode_request`, `decode`, `retry_after_close`; `Response { wire_id, result: Result<bytes, bytes> }`, `Push`, `AuthOk`, `AuthFailed`, `Ignore`. |
 | `DEFAULT_WS_READ_TIMEOUT`, `DEFAULT_WS_MAX_MESSAGE_BYTES` | consts (`ws`) | 20 ms, 1 MiB. |
-| `WsTransport`, `WsTransportRes`, `WsLinkId`, `WsLinkEvent`, `WsHandshake` | seam (`ws`) | `open`, `send`, `close`, `poll`, `shutdown`; one link = one connection attempt. |
+| `WsTransport`, `WsTransportRes`, `WsLinkId`, `WsLinkEvent`, `WsHandshake` | seam (`ws`) | `open`, `send`, `send_auth` (the first-message authentication; default: `send`), `close`, `poll`, `shutdown`; one link = one connection attempt. |
 | `FakeWsTransport` | transport (`ws`) | `manual_accept`, `accept`, `reject_next`, `echo_envelope`, `push`, `drop_link`, `fail_link`, `opened`, `last_link`, `live_links`, `sent`, `all_sent`, `closed`, `shutdown_count`. |
-| `TungsteniteTransport` | transport (`ws`) | the real one; `new()`. |
+| `TungsteniteTransport` | transport (`ws`) | the real one; `new()` (reads the proxy environment variables). |
 | `SshClient` | resource (`ssh`) | `connect`, `disconnect`, `run`, `cancel` (the shared one); with `sftp`: `upload`, `upload_file`, `download`, `download_file`, `list_dir`, `create_dir`, `remove_file`, `remove_dir`, `rename`, `sftp`. |
 | `SshTarget` | builder (`ssh`) | `new(host, user)`, `from_ssh_config`, `from_ssh_config_file`, `with_port`, `with_user`, `with_auth`, `with_known_hosts_file`, `trust_host_key_fingerprint`, timeouts, keepalive, limits, `with_max_channels`, `with_reconnect`, `allow_terrapin_vulnerable`, `validate`, getters. |
 | `SshAuth` | auth (`ssh`) | `key_file`, `key_file_with_passphrase`, `agent`; opt-in `password`, `keyboard_interactive`. `Debug` shows file names only, never secrets. |
@@ -1534,8 +1561,11 @@ Everything is re-exported at the crate root; `prelude` holds the everyday items.
   connections, not for hundreds). A large message you send occupies its connection thread until
   the socket takes it (that time does not count as the server's silence); if the server accepts
   no data for 30 s (or `dead_after`, if longer), the connection ends with a `Timeout` saying so.
-  At `trace` level tungstenite prints the whole handshake request, `Authorization` and query
-  included: keep `tungstenite` below `trace` like `ureq`. Received frames the game does not take
+  At `trace` level tungstenite prints the content of the frames it sends and receives (not the
+  handshake request or the first-message authentication, which the crate writes itself): keep
+  `tungstenite` below `trace` like `ureq`. A proxy is used through `CONNECT` only when it is an
+  `http://` proxy; with an `https://` or SOCKS proxy set, a connection that would use it fails
+  with `InvalidRequest`. Received frames the game does not take
   are limited to 32 times the message limit per connection (then it closes with 1008).
 - **SSH (feature `ssh`):** connections run commands (exec channels, no terminal) and SFTP;
   reconnect only when enabled and never for a running command. Output arrives in chunks, not
@@ -1625,7 +1655,9 @@ header comment (the login reads `BACKEND_USERNAME` / `BACKEND_PASSWORD`).
 Run it yourself:
 
 - `cargo test` runs the unit tests, the `FakeHttpTransport` tests (every answer kind, exactly one
-  answer each, strict ambiguity detection), a log-capture test proving no secret is logged, the
+  answer each, strict ambiguity detection), a log-capture test proving no secret is logged (every
+  `tracing` event and every `log` record at `trace`, with real WebSocket and SSH connections when
+  those features are on), the
   loopback tests (the real `UreqTransport` against the mock server on 127.0.0.1: statuses,
   redirects, timeouts, body limit, TLS handshake failure, login flow, exit while busy) and the
   upload tests (the real transport against the mock's multipart parser; files streamed from
@@ -1634,14 +1666,17 @@ Run it yourself:
   WebSocket tests: every lifecycle path on a `FakeWsTransport` (credentials refresh included:
   one message for several refused connections, one new connection, a second refusal final), the
   real transport against `mock_ws_server` (large messages across many short read timeouts,
-  reconnect, heartbeat, 401, a 503 with `Retry-After`, a refused token refreshed by the game, 1009, exit), and a TLS test
-  with large messages cut by read timeouts mid-record. With `--features ssh` (and `ssh,sftp`) also
+  reconnect, heartbeat, 401, a 503 with `Retry-After`, a refused token refreshed by the game, 1009, exit), a TLS test
+  with large messages cut by read timeouts mid-record, and connections through a local `CONNECT`
+  proxy set in the environment (`ws://` and `wss://`, proxy credentials, a refusing proxy,
+  loopback direct, SOCKS refused). With `--features ssh` (and `ssh,sftp`) also
   the SSH tests: every lifecycle path on a `FakeSshTransport` (including one app with HTTP,
   WebSocket and SSH cancelling each other's requests), the real `RusshTransport` against
   `mock_ssh_server` with throwaway keys generated at runtime (commands, timeouts, cancel, output
   limit, strict host keys, passphrases, ssh_config, SFTP: a 256 MiB download compared by SHA-1,
-  sizes from 0 bytes up, short reads, a server error, cancel and timeout in the middle with no
-  file left behind), the download pipeline against an in-memory file that answers out of order,
+  sizes from 0 bytes up, short reads, a server error, cancel and timeout in the middle, a lost
+  connection, an SFTP channel that ends, and a file cut short on the server, with no file left
+  behind; files that report size 0 or no size), the download pipeline against an in-memory file that answers out of order,
   and hostile raw TCP peers (silent, trickling, huge banner) that must not stretch the connect
   deadline. `cargo test --all-features` also compiles every Rust block of this README.
 - `tests/live.rs` holds live HTTPS checks, `#[ignore]`d: they run only with
@@ -1706,7 +1741,8 @@ current-thread runtime on one thread of its own, started on the first connect, a
 without the feature.
 
 **Does it follow the system proxy?** The `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY`
-environment variables, yes (not for loopback hosts). Windows' registry proxy settings, no.
+environment variables, yes, for HTTP requests and WebSocket connections (not for loopback hosts;
+WebSocket connections through `http://` proxies). Windows' registry proxy settings, no.
 
 ## License
 

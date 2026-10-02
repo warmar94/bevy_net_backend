@@ -379,7 +379,31 @@ pub(super) mod ops {
                 BackendError::Ssh(format!("SFTP: {message}"))
             }
             SftpError::Timeout => BackendError::Timeout("the SFTP server did not answer a request in time".into()),
+            // russh-sftp's words for "the channel under the session is gone" (its request loop
+            // ended, so pending answers are dropped) and an I/O error on that channel: the
+            // connection was lost, not a server error. `sent` is decided by the caller.
+            SftpError::UnexpectedBehavior(why) if channel_gone(&why) => BackendError::disconnected(format!("the SFTP channel ended ({why})"), None),
+            SftpError::IO(why) => BackendError::disconnected(format!("the SFTP channel failed ({why})"), None),
             other => BackendError::Ssh(format!("SFTP: {other}")),
+        }
+    }
+
+    /// russh-sftp 3.0.1 (`client/rawsession.rs`, `client/error.rs`): the texts it uses when the
+    /// channel's request loop is gone.
+    fn channel_gone(why: &str) -> bool {
+        why == "sender dropped" || why == "session closed" || why.starts_with("SendError") || why.starts_with("RecvError")
+    }
+
+    /// A download must reach the size the server reported when the file was opened. A file that
+    /// ends earlier was cut short on the server meanwhile: an error, never a short success. A size
+    /// of 0 or no size (some servers and special files report that) is no promise: then the end
+    /// of the file is wherever the server says so.
+    pub(super) fn check_downloaded(written: u64, total: Option<u64>) -> Result<u64, BackendError> {
+        match total {
+            Some(total) if total > 0 && written < total => Err(BackendError::Ssh(format!(
+                "SFTP: the remote file ended after {written} bytes, but it had {total} bytes when it was opened (it was cut short during the download)"
+            ))),
+            _ => Ok(written),
         }
     }
 
@@ -749,7 +773,7 @@ pub(super) mod ops {
             Err(too_large(max_bytes))
         } else {
             let file = SftpFile { session: Arc::clone(session), handle: Arc::from(handle.as_str()) };
-            read_pipelined(&file, max_bytes, total, report, sink, READ_WINDOW_BYTES).await.map(|(written, _)| written)
+            read_pipelined(&file, max_bytes, total, report, sink, READ_WINDOW_BYTES).await.and_then(|(written, _)| check_downloaded(written, total))
         };
         let _ = guard.close().await;
         if let Ok(done) = result {
@@ -1097,6 +1121,35 @@ mod tests {
             // Bytes may have been written: never "not sent".
             assert_eq!(error.and_then(|e| e.was_sent()), None);
         }
+    }
+
+    #[test]
+    fn a_remote_file_cut_short_is_an_error_with_both_sizes_and_no_size_reads_to_the_end() {
+        let error = super::ops::check_downloaded(1_000, Some(4_096)).err();
+        assert!(
+            matches!(&error, Some(BackendError::Ssh(why)) if why.contains("ended after 1000 bytes") && why.contains("had 4096 bytes") && why.contains("cut short")),
+            "{error:?}"
+        );
+        assert_eq!(super::ops::check_downloaded(0, Some(1)).ok(), None);
+        // Complete, grown, or no size promised (0 or none): the end of the file is the end.
+        for (written, total) in [(4_096, Some(4_096)), (5_000, Some(4_096)), (123, Some(0)), (0, Some(0)), (123, None), (0, None)] {
+            assert_eq!(super::ops::check_downloaded(written, total).ok(), Some(written), "{written} of {total:?}");
+        }
+    }
+
+    #[test]
+    fn a_lost_sftp_channel_is_a_disconnect_and_server_errors_stay_ssh_errors() {
+        use russh_sftp::client::error::Error as SftpError;
+        use russh_sftp::protocol::{Status, StatusCode};
+        for gone in ["sender dropped", "session closed", "SendError: channel closed", "RecvError: channel closed"] {
+            let error = super::ops::map_error(SftpError::UnexpectedBehavior(gone.into()));
+            assert!(matches!(&error, BackendError::Disconnected { sent: None, .. }), "{gone}: {error:?}");
+        }
+        assert!(matches!(super::ops::map_error(SftpError::IO("broken pipe".into())), BackendError::Disconnected { sent: None, .. }));
+        let status = Status { id: 1, status_code: StatusCode::NoSuchFile, error_message: "no such file".into(), language_tag: "en".into() };
+        assert_eq!(super::ops::map_error(SftpError::Status(status)), BackendError::Ssh("SFTP: no such file".into()));
+        assert!(matches!(super::ops::map_error(SftpError::UnexpectedBehavior("Duplicate version".into())), BackendError::Ssh(_)));
+        assert!(matches!(super::ops::map_error(SftpError::Timeout), BackendError::Timeout(_)));
     }
 
     #[test]
