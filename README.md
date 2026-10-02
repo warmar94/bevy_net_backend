@@ -24,10 +24,11 @@ lists, chat, matchmaking and the other MMO-style services a game runs itself. It
 and developer tools reach those servers.
 
 Three parts share one pattern: **a system fires a request and gets a `RequestId` back at once; a
-few frames later exactly one typed answer arrives as a Bevy message.**
+few frames after that exactly one typed answer arrives as a Bevy message.**
 
 - **HTTP** (default): calls to your HTTPS JSON API (Laravel, Express, Go, Django, FastAPI,
-  ASP.NET, …) with your serde types, and file uploads as `multipart/form-data`.
+  ASP.NET, …) with your serde types, and file uploads as `multipart/form-data` (files streamed
+  from disk, upload progress).
 - **WebSocket** (feature `ws`): named long-lived connections for chat, lobbies, match events and
   server pushes, with reconnect and heartbeat built in.
 - **SSH and SFTP** (features `ssh`, `sftp`), **for admin and developer tools only**: run commands on
@@ -74,6 +75,7 @@ fn main() {
 - [What it guarantees](#what-it-guarantees)
 - [Where it sits](#where-it-sits)
 - [Backend compatibility](#backend-compatibility)
+  - [Matching server](#matching-server)
 - [Install](#install)
 - [Quick start](#quick-start)
 - [How to use it](#how-to-use-it)
@@ -92,7 +94,7 @@ fn main() {
 - [How it works](#how-it-works)
 - [TLS exception: the default build is not pure Rust](#tls-exception-the-default-build-is-not-pure-rust)
 - [API reference](#api-reference)
-- [Limits and what it does not do](#limits-and-what-it-does-not-do)
+- [Good to know](#good-to-know)
 - [Versions](#versions)
 - [Examples](#examples)
 - [How it's tested](#how-its-tested)
@@ -104,7 +106,7 @@ fn main() {
 
 | Feature | Default | For | What it adds |
 |---|---|---|---|
-| `http` | yes | your HTTPS API, file uploads | The real transport, `UreqTransport`: ureq 3.4 on a few worker threads, rustls with ring's crypto and the Mozilla root certificates (webpki-roots). `multipart/form-data` uploads with `Multipart` (no extra dependency). ring compiles C and assembly (see [TLS exception](#tls-exception-the-default-build-is-not-pure-rust)). |
+| `http` | yes | your HTTPS API, file uploads | The real transport, `UreqTransport`: ureq 3.4 on a few worker threads, rustls with ring's crypto and the Mozilla root certificates (webpki-roots). `multipart/form-data` uploads with `Multipart` (no extra dependency): bytes, files streamed from disk, typed parts (JSON), upload progress. ring compiles C and assembly (see [TLS exception](#tls-exception-the-default-build-is-not-pure-rust)). |
 | `json` | yes | typed requests and answers | `get_json` / `post_json` / `send_json` / `post_multipart_json`, `JsonResponse<T>`, `OutgoingRequest::with_json`, `RawResponse::json`, `JsonBodyField` (serde + serde_json). |
 | `gzip` | no | compressed answers | Accept gzip-compressed responses (ureq's decoder, flate2). |
 | `ws` | no | live data: chat, lobbies, pushes | Named WebSocket connections: `WsClient`, `WsConnections`, the `Ws*` messages, `TungsteniteTransport` (tungstenite 0.30, sync, one thread per connection, rustls + ring, no permessage-deflate). With `json`: `JsonEnvelope`, `WsRequest`, `WsPushMessage`, `WsResponse<T>`, `WsPush<P>`. |
@@ -117,7 +119,7 @@ Crates in the build (normal and build dependencies, this crate excluded, measure
 
 | Features | Crates |
 |---|---|
-| `default-features = false` (types and fake transports only) | 67 |
+| `default-features = false` (types and fake transports only) | 68 |
 | default (`http`, `json`) | 90 |
 | default + `gzip` | 95 |
 | default + `ws` | 104 |
@@ -141,7 +143,7 @@ do that with no feature fiddling.
   or a timeout is discarded, never delivered twice.
 - **An answered request is never sent afterwards.** A request cancelled, timed out or answered
   `Shutdown` while it still waited (for a worker, a connection or a free channel) never goes out
-  later. Errors say honestly whether the request went out: `error.was_sent()` is `Some(false)`
+  afterwards. Errors say honestly whether the request went out: `error.was_sent()` is `Some(false)`
   (never sent), `Some(true)` (the server has it) or `None` (unknown), and SSH answers carry
   `started`. Retry decisions can rely on it.
 - **Real deadlines, bounded buffers, size limits.** A timeout covers the whole call, waiting
@@ -156,7 +158,8 @@ do that with no feature fiddling.
 - **No ordering ceremony:** `HttpClient`, `WsClient` and `SshClient` are used through `Res<..>`
   (shared access), so any number of systems in any schedule can fire requests.
 - **Secrets stay out of logs:** tokens and passwords are redacted from `Debug`, `Display` and the
-  crate's own log lines (a test captures every log event to prove it).
+  crate's own log lines (a test captures every log event to prove it), and the crate's `Secret`
+  overwrites its memory with zeros when it is dropped.
 - **Safe defaults:** HTTPS only (plain `http://` only to `localhost` / `127.x.x.x` / `[::1]` unless
   you allow it), redirects not followed, a 15 s timeout, strict SSH host key checking with no
   trust-on-first-use.
@@ -187,15 +190,21 @@ competes with the netcode for the frame or the socket.
 - **WebSocket** (feature `ws`) works with any plain WebSocket server (RFC 6455), through the
   default JSON envelope or your own `WsProtocol` for another message layout.
 - **Frameworks that run their own protocol on top of WebSocket** (Laravel Reverb / Pusher,
-  Socket.IO, SignalR, Phoenix Channels) need an adapter for that protocol. Adapters are planned
-  for a later version; until then use `WsProtocol` or raw frames if your server can also speak
-  plain WebSocket.
+  Socket.IO, SignalR, Phoenix Channels): the crate speaks plain WebSocket frames, so such a
+  protocol is implemented on top of it (`WsProtocol` or raw frames).
 - **SSH** (feature `ssh`, admin / dev tools) works with any standard SSH server: OpenSSH on Linux,
   BSD, macOS or Windows, and other servers speaking SSH-2 with ed25519 or ECDSA host keys (RSA with
   feature `ssh-rsa`). Servers without strict key exchange (OpenSSH before 9.6, unless the
   distribution backported it) connect through AES-GCM, which the client prefers; only a server that
   offers nothing but ChaCha20-Poly1305 or CBC + encrypt-then-MAC is refused (see Terrapin in the
   SSH section). SFTP needs the server's `sftp` subsystem (OpenSSH's default).
+
+### Matching server
+
+For a ready-made server side, the [net_backend](https://github.com/warmar94/net_backend) stack (a
+Rust game-server framework with its protocol and client crates) is built to pair with this crate.
+Its `net_backend_protocol` crate has an optional `bevy_net_backend` feature that implements this
+crate's `WsRequest`, `WsPushMessage` and `Credentials` for its messages and tokens.
 
 ## Install
 
@@ -429,7 +438,7 @@ fn on_save(mut answers: MessageReader<JsonResponse<Save>>) {
                 warn!("the server refused the save: {message}");
             }
             Err(error) if error.status() == Some(StatusCode::UNAUTHORIZED) => warn!("log in again"),
-            Err(BackendError::Timeout(_) | BackendError::Network(_)) => warn!("offline? retry later"),
+            Err(BackendError::Timeout(_) | BackendError::Network(_)) => warn!("offline? try again"),
             Err(error) => error!("save failed: {error}"),
         }
     }
@@ -468,7 +477,8 @@ discarded.
 
 `BackendError` is `#[non_exhaustive]`: keep a catch-all arm. `error.status()` and
 `error.response()` give the server's answer for `Status` and `Decode`; `RawResponse` has
-`status`, `headers`, `body`, `text()` and `json::<E>()`. `Display` of every error is safe to log:
+`status`, `headers`, `body`, `text()` and `json::<E>()`. `error.retry_after()` is the `Retry-After`
+header of a `Status` answer (delta-seconds, e.g. a 429 or 503) as a `Duration`, else `None`. `Display` of every error is safe to log:
 it never shows a body, a header value or a query. The `message` field of `Decode` is serde_json's
 text and may quote part of the body (a token, say); the crate never logs it, and neither should a
 release build.
@@ -550,7 +560,14 @@ impl Credentials for Session {
 }
 ```
 
-- `Secret` prints as `<redacted>` in `Debug` and `Display`; read it with `expose()`.
+- `Secret` prints as `<redacted>` in `Debug` and `Display`; read it with `expose()`. When it is
+  dropped, its whole allocation is overwritten with zeros first (the `zeroize` crate, which
+  rustls already uses), and so are the crate's temporary `Bearer …` header text and the SSH key
+  file text it reads. Not wiped: the copies that become part of a request (header values, the
+  query value of `ApiKeyQuery` and the URL built from it, the body `JsonBodyField` writes,
+  keyboard-interactive answers and passwords handed to russh, the first-message authentication
+  frame), the `String` you built the secret from, and what the HTTP, WebSocket and SSH libraries
+  copy while sending.
   `BackendCredentials`, `BearerToken`, `ApiKeyHeader`, `ApiKeyQuery` and `JsonBodyField` never
   show the secret in `Debug`; `OutgoingRequest` and `PreparedRequest` print header names but no
   header values, no query values and no body; `RawResponse` prints the body's length only.
@@ -565,8 +582,11 @@ impl Credentials for Session {
   proxies and servers log it: in testing Caddy's access log showed `api_key=…` (and an
   `X-Api-Key` header) in plain text while it masked `Authorization`. Prefer `BearerToken` (or a
   header your proxy redacts) wherever your API allows it.
-- Methods added to `Credentials` later always come with a default implementation.
-- Storing the token between sessions (keyring, file) and refreshing it are the game's job.
+- Compatibility rule: methods are only ever added to `Credentials` with a default
+  implementation.
+- Storing the token between sessions (keyring, file) and refreshing it are the game's job. A
+  WebSocket connection can wait for that refresh after the server refused its token
+  (`WsSettings::with_credentials_refresh`, see [WebSocket](#10-websocket-connections-feature-ws)).
 
 ### 6. Cancel, in-flight tracking, app exit
 
@@ -595,7 +615,7 @@ fn spinner(in_flight: Res<InFlight>) {
 - **Cancel:** answered with `Cancelled` in the next frame's `First`. A request already on the
   wire keeps its worker thread until it finishes or times out (a blocking call cannot be
   interrupted); its result is discarded. Cancelling an answered id does nothing.
-- **InFlight** lists every request not answered yet: HTTP, WebSocket (feature `ws`) and SSH /
+- **InFlight** lists every request still waiting for its answer: HTTP, WebSocket (feature `ws`) and SSH /
   SFTP (feature `ssh`) alike. An
   HTTP request enters it in `PostUpdate` of the frame it was made in; a WebSocket request there
   too, also while it waits for its connection. A request leaves it when it is answered; the answer
@@ -612,12 +632,11 @@ fn spinner(in_flight: Res<InFlight>) {
   was never sent**, except one that was already on the wire before that frame (it may still reach
   the server). Systems ordered after `BackendSystems::Exit` in `Last` can read those answers.
   Write `AppExit` before `BackendSystems::Send` (anywhere in `Update` or earlier is fine; a
-  `PostUpdate` writer must be ordered `.before(BackendSystems::Send)`): written later, requests
+  `PostUpdate` writer must be ordered `.before(BackendSystems::Send)`): written after that, requests
   of that frame may still go out, and written after `Exit` in `Last` it is seen by nobody in this
   crate.
 - **Save on quit:** send the save, wait for its answer (`Ok` or an error), and only then write
   `AppExit`. A save fired in the same frame as `AppExit` is answered `Shutdown` and never sent.
-  (Flushing pending requests on exit is not a feature of 0.1.0.)
 
 ### 7. Plain http:// for local development
 
@@ -672,18 +691,22 @@ assert_eq!(answer.result.as_ref().map(|r| r.text()).ok(), Some(r#"{"name":"Ayla"
   `Err(BackendError::Network("reset".into()))`.
 - Unrouted requests wait: answer them with `reply(id, result)`, or let the plugin's deadline
   answer them with `Timeout`. `waiting()`, `requests()`, `last_request()`, `cancelled()`,
-  `shutdown_count()` let tests assert what the game sent.
+  `shutdown_count()` let tests assert what the game sent; a form with files from disk is in
+  `PreparedRequest::streaming_body` (`read_all()` gives its bytes). `progress(id, sent, total)`
+  scripts an `HttpProgress` message.
 - The crate's own tests use `bevy_headless_test`'s strict `TestApp` (ambiguity detection on every
   main schedule); the plugin's systems are ordered, and `Res<HttpClient>` never conflicts.
 
 ### 9. Your own transport
 
 `HttpTransport` is the seam: `submit(id, PreparedRequest)` (never block), `poll()` (every result
-since the last call), and optionally `cancel(id)` and `shutdown()`. Wrap it in
-`HttpTransportRes::new(..)` and insert it; the plugin keeps doing all the bookkeeping (deadlines,
-cancel, exit, status and body-limit rules). Report each request at most once; a late or unknown
-result is discarded. Methods added to `HttpTransport` later always come with a default
-implementation.
+since the last call), and optionally `cancel(id)`, `shutdown()`, `poll_progress()` (upload
+progress for requests with `upload_progress`) and `streams_bodies()` (`true` if it sends a
+`PreparedRequest::streaming_body`; with the default `false` the plugin answers such a request
+`InvalidRequest` and never hands it over). Wrap it in `HttpTransportRes::new(..)` and insert it;
+the plugin keeps doing all the bookkeeping (deadlines, cancel, exit, status and body-limit rules).
+Report each request at most once; a late or unknown result is discarded. Compatibility rule:
+methods are only ever added to `HttpTransport` with a default implementation.
 
 ### 10. WebSocket connections (feature `ws`)
 
@@ -771,8 +794,9 @@ fn main() {
   `WsPush<P>` (typed pushes).
 - **State:** `WsConnections` (resource): `state(name)`, `is_connected(name)`, `get(name)` →
   `WsConnectionInfo` (state, failed attempts, last error, pending requests, queued frames).
-  `WsState` is `Connecting`, `Connected`, `Reconnecting { attempt, retry_in }` or `Disconnected`
-  (`#[non_exhaustive]`). Not Bevy `States`: a game maps it to its own states if it wants.
+  `WsState` is `Connecting`, `Connected`, `Reconnecting { attempt, retry_in }`,
+  `WaitingForCredentials` (see below) or `Disconnected` (`#[non_exhaustive]`). Not Bevy
+  `States`: a game maps it to its own states if it wants.
 - **`WsSettings`** (builder): read timeout (default 20 ms, 5–250 ms; it is also roughly the
   latency added to every frame you send, because the thread sends between reads: measured median
   request round trips through a TLS proxy were 30 ms at 5 ms, 43 ms at the default 20 ms and
@@ -780,15 +804,20 @@ fn main() {
   deadline for TCP + TLS + handshake, at most 1 h), heartbeat (ping every 15 s, dead after 45 s
   without a single byte, at most 1 h), request timeout (10 s), message limit (1 MiB, incoming and
   outgoing), reconnect policy, handshake headers, `allow_insecure_ws`, `without_credentials`, the
-  protocol, outbox (64 frames), resend (32) and waiting (64 requests) limits, `with_auth_ack`.
+  protocol, outbox (64 frames), resend (32) and waiting (64 requests) limits, `with_auth_ack`,
+  `with_credentials_refresh`.
 - **Reconnect:** exponential backoff with full jitter (`WsReconnect`: base 500 ms, cap 30 s,
   optional `with_max_attempts`, reset after 10 s connected, `never()`). Each attempt is a
-  `WsStateChanged` with `Reconnecting { attempt, retry_in }` and the error that caused it.
+  `WsStateChanged` with `Reconnecting { attempt, retry_in }` and the error that caused it. A
+  handshake refused with `429` / `503` and a `Retry-After` header waits at least that long (above
+  the cap too, at most `MAX_TIMEOUT`).
   **Permanent (not retried, the connection goes `Disconnected` with the error):** a `401` / `403`
   handshake, a TLS / certificate error (unless `WsReconnect::with_tls_retry(true)`), a close code
   4000–4099, a refused first-message auth, a missing auth acknowledgement (`with_auth_ack`),
   invalid settings or a refused plain `ws://` URL, `disconnect`, exhausted attempts. Everything
-  else (connect failures, drops, timeouts, dead peers, 5xx) is retried.
+  else (connect failures, drops, timeouts, dead peers, 5xx) is retried. With
+  `with_credentials_refresh`, a `401` handshake, a refused first-message auth and the close codes
+  you list first wait for refreshed credentials (below).
 - **Credentials** from `BackendCredentials` go on **every** handshake (headers and query; the
   request's purpose is `RequestPurpose::WebSocketHandshake`). A token changed while connected is
   used on the next reconnect (no forced reconnect). `JsonBodyField` cannot authenticate a
@@ -799,6 +828,78 @@ fn main() {
   until the protocol reports `WsIncoming::AuthOk` (`{"type":"auth.ok"}` with `JsonEnvelope`); without
   it in time the waiting requests are answered `Timeout` (honest about an earlier send), the link
   closes with 1008 and the connection goes `Disconnected` with that error.
+- **Refreshing credentials** (off by default; `WsSettings::with_credentials_refresh`): when the
+  server refuses the credentials (a `401` handshake, a refused first-message auth, or a close
+  code you list with `WsCredentialsRefresh::with_close_code`, e.g. a server's 4001 for a revoked
+  session), the connection goes `WaitingForCredentials` and the plugin writes ONE
+  `WsCredentialsRefused { name, error }` message, however many connections were refused with
+  the same credentials. Your game refreshes with its own call and sets the new credentials;
+  every waiting connection then makes ONE new connection with them. A second refusal, cleared
+  credentials, or no new credentials within the timeout (default 30 s) end it `Disconnected`
+  with the server's refusal; a further refresh is allowed only after a connection stayed up for
+  the reconnect policy's `stable_after`, so it never loops. If the credentials already changed
+  since the refused handshake (your game refreshed on its own meanwhile), no message is written
+  and the connection connects again at once. The crate never calls a refresh route itself, and
+  never logs a token. Requests made while waiting wait (until their own timeout).
+
+```rust,no_run
+use bevy::prelude::*;
+use bevy_net_backend::prelude::*;
+use bevy_net_backend::WsCredentialsRefresh;
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize)]
+struct Refresh {
+    refresh_token: String,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+struct Tokens {
+    access_token: String,
+    refresh_token: String,
+}
+
+/// Your stored refresh token.
+#[derive(Resource)]
+struct RefreshToken(String);
+
+fn connect(ws: Res<WsClient>) {
+    let settings = WsSettings::new("wss://game.example.com/ws").with_credentials_refresh(WsCredentialsRefresh::new().with_close_code(4001));
+    ws.connect("main", settings);
+}
+
+/// One refresh per message; your own refresh route, without the refused token.
+fn refresh(mut refused: MessageReader<WsCredentialsRefused>, backend: Res<HttpClient>, token: Res<RefreshToken>) {
+    if refused.read().count() > 0 {
+        let request = OutgoingRequest::post("/auth/refresh").with_json(&Refresh { refresh_token: token.0.clone() }).without_credentials();
+        backend.send_json::<Tokens>(request);
+    }
+}
+
+/// New tokens: set them (the waiting connections connect again); refused: log out.
+fn store(mut answers: MessageReader<JsonResponse<Tokens>>, mut credentials: ResMut<BackendCredentials>, mut token: ResMut<RefreshToken>) {
+    for answer in answers.read() {
+        match &answer.result {
+            Ok(tokens) => {
+                token.0 = tokens.refresh_token.clone();
+                credentials.set(BearerToken::new(tokens.access_token.clone()));
+            }
+            Err(_) => credentials.clear(),
+        }
+    }
+}
+
+fn main() {
+    App::new()
+        .add_plugins((MinimalPlugins, BackendPlugin::new(HttpConfig::new("https://game.example.com/api"))))
+        .add_json_response::<Tokens>()
+        .insert_resource(RefreshToken("from-the-login".into()))
+        .add_systems(Startup, connect)
+        .add_systems(Update, (refresh, store))
+        .run();
+}
+```
+
 - **Protocol:** with feature `json` the default is `JsonEnvelope`: requests
   `{"id":…,"type":…,"data":…}`, answers `{"id":…,"ok":true,"data":…}` or `{"id":…,"ok":false,"error":…}`
   (answered `BackendError::Rejected`), pushes `{"type":…,"data":…}` (a push may carry its own
@@ -913,7 +1014,7 @@ fn main() {
   exponential backoff with full jitter as for WebSocket (base 1 s, cap 30 s, optional
   `with_max_attempts`, the counter resets after 10 s connected). **A reconnect never re-runs a
   command:** commands running when the connection was lost are answered `Disconnected` with their
-  honest `started`; commands not sent yet wait for the new connection (until their own timeout).
+  honest `started`; commands that were never sent wait for the new connection (until their own timeout).
   Host key, authentication, protocol (`Ssh`) and invalid-settings errors are not retried. Without
   it, a lost connection goes `Disconnected` with the error; `connect` again.
 - **Host keys are always checked.** The server's key must be in a known_hosts file
@@ -926,8 +1027,8 @@ fn main() {
   patterns with `*` / `?` / `!`, hashed hosts, `[host]:port` for other ports, `@revoked` (wins
   over pins too). As OpenSSH does, the key types already listed for the host are asked for first,
   and only a different key **of the same type** is `Changed`; a host listed only with another type
-  (an old RSA line, say) is `Unknown` for the new type. `@cert-authority` lines and host
-  certificates are not supported.
+  (an old RSA line, say) is `Unknown` for the new type. `@cert-authority` lines are ignored, and
+  a server that presents a host certificate is refused with an `Ssh` error.
 - **Authentication** (`SshAuth`, tried in order): `key_file(path)`,
   `key_file_with_passphrase(path, passphrase)` (OpenSSH, PKCS#8 or PuTTY format, at most 256 KiB;
   the passphrase is a redacted `Secret`), `agent()` (Unix: `SSH_AUTH_SOCK`; Windows: the OpenSSH
@@ -946,8 +1047,8 @@ fn main() {
   connecting; settings given in code win. `Include` is followed by the crate itself, with limits
   (nesting depth 16 like OpenSSH, 64 files, 1 MiB for all files together; `~` and relative paths
   as OpenSSH, relative to `~/.ssh`; globs): a config that includes itself is an error, not a
-  crash. `Match`, `%` tokens, `ProxyJump` / `ProxyCommand` and `UserKnownHostsFile` are not
-  supported (the connection goes straight to the host).
+  crash. Other keys (`Match`, `%` tokens, `ProxyJump` / `ProxyCommand`, `UserKnownHostsFile`)
+  are ignored: the connection goes straight to the host, with the known_hosts files given in code.
 - **`SshTarget`** (builder, per connection): port (22), user, auth, known_hosts files, pins,
   connect timeout (15 s: ONE deadline for TCP + key exchange + host key + authentication, a server
   that trickles bytes cannot stretch it), keepalive (every 15 s of silence, lost after 3 unanswered),
@@ -1037,6 +1138,17 @@ during `upload_file`, which is answered `Ssh("the local file changed size …")`
 connection's operations. Local files are read and written on tokio's small blocking pool, never on
 the SSH thread itself.
 
+**Downloads are pipelined:** reads of 64 KiB go out ahead of the answers, up to 1 MiB requested
+or received and waiting to be written at once (16 reads in flight), and the answers are written in file
+order. That window is all the memory a download to a file uses, whatever the file's size (a
+download into memory holds the file, up to the transfer limit). A short read (fewer bytes than
+asked, which servers may send) asks again for the rest; a file the server reports larger than
+the transfer limit is refused before any data is read; the first error stops the download. Uploads
+keep 16 writes of 32 KiB in flight. Each read or write may wait for its answer as long as the
+whole operation (`with_sftp_timeout`, default 5 min), so a link has to move about 1 MiB within that
+time (about 3.5 KB/s with the default). After a cancel or a timeout the remote file handle is closed
+in the background, so a long-lived connection collects no stale handles.
+
 > **Listed names are untrusted input.** A hostile or broken server can list `../../.bashrc`,
 > `C:\Windows\evil.dll` or `a/b`. Never join `SftpEntry::name` into a local path: use
 > `entry.safe_file_name()`, which returns `None` for anything that is not one plain file name
@@ -1069,12 +1181,47 @@ fn upload_avatar(backend: Res<HttpClient>) {
 # fn main() { App::new().add_json_response::<AvatarSaved>().add_systems(Update, upload_avatar); }
 ```
 
+A file from disk, a JSON part and upload progress:
+
+```rust,no_run
+use bevy::prelude::*;
+use bevy_net_backend::prelude::*;
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct SaveInfo {
+    slot: u32,
+    play_time_s: u64,
+}
+
+fn upload_save(backend: Res<HttpClient>) {
+    let form = Multipart::new()
+        .json("info", &SaveInfo { slot: 2, play_time_s: 7_380 }) // Content-Type: application/json
+        .file_from_path("save", "slot2.sav", "application/octet-stream", "saves/slot2.sav") // read while it is sent
+        .with_max_bytes(512 * 1024 * 1024);
+    // A big upload needs a longer timeout than the default 15 s.
+    backend.send(OutgoingRequest::post("/saves").with_multipart(&form).with_timeout(std::time::Duration::from_secs(600)));
+}
+
+fn show_progress(mut progress: MessageReader<HttpProgress>) {
+    for step in progress.read() {
+        info!("{}: {} of {:?} bytes", step.id, step.sent, step.total);
+    }
+}
+# let _ = (upload_save, show_progress);
+```
+
 - **Builder:** `Multipart::new()`, `.text(name, value)`, `.file(name, filename, content_type,
   bytes)` (an empty content type means `application/octet-stream`; text parts have no content
-  type, as in a browser), repeated names allowed (`photos[]` twice), `.with_max_bytes(n)` (the
-  whole encoded body, part headers included, default 32 MiB: a single file of exactly 32 MiB is
-  just over it), `.with_max_parts(n)` (default 256, at most 10 000), `len()`, `is_empty()`,
-  `encoded_len()`.
+  type, as in a browser), `.file_from_path(name, filename, content_type, path)` (a file read
+  from disk while the request is sent), `.part(name, content_type, bytes)` (a non-file part with
+  its own content type), `.json(name, &value)` (feature `json`: a part with
+  `Content-Type: application/json`, as Spring's `@RequestPart` reads it; frameworks that read
+  forms by name give you its value as text), repeated names allowed (`photos[]` twice),
+  `.with_max_bytes(n)` (the whole encoded body, part headers included, default 32 MiB: a single
+  file of exactly 32 MiB is just over it), `.with_max_parts(n)` (default 256, at most 10 000),
+  `len()`, `is_empty()`, `encoded_len()` (files from disk count 0 there: they are measured when
+  the request is sent).
 - **Sending:** `HttpClient::post_multipart(path, &form)` (raw `HttpResponse`),
   `post_multipart_json::<T>(path, &form)` (typed, feature `json`), `send_multipart(method, path,
   &form)` (`PUT`, `PATCH`, …), or `OutgoingRequest::with_multipart(&form)` for headers, query and
@@ -1082,7 +1229,7 @@ fn upload_avatar(backend: Res<HttpClient>) {
   one answer, the shared `cancel`, `InFlight`, the plain-http rule, and credentials applied as
   headers or query (`BearerToken`, `ApiKeyHeader`, `ApiKeyQuery`). `JsonBodyField` cannot go into
   a form: such a request is answered `InvalidRequest` and not sent (use a header credential, or add
-  the field to the form yourself). A form later replaced by `with_json`, `with_body` or
+  the field to the form yourself). A form replaced afterwards by `with_json`, `with_body` or
   `set_body` is an ordinary request again.
 - **Refused before sending** (answered, never sent, `was_sent() == Some(false)`): a form over
   `with_max_bytes` is `RequestTooLarge { limit, size }`; more parts than `with_max_parts`, an
@@ -1091,18 +1238,31 @@ fn upload_avatar(backend: Res<HttpClient>) {
   `InvalidRequest`. A trailing backslash would turn the closing quote into an escaped one for most
   parsers: in the live test every real framework lost such a part (dropped it, or turned the file
   into a text field).
-- **Bytes only:** there is no "upload this path" helper, so no file is read on the main thread.
-  Load the bytes first (at startup, from an asset, in an async task). Encoding copies the bytes
-  once and scans them for the boundary on the calling thread (measured: about 4 ms per 10 MiB and
-  13 ms for 32 MiB in a release build on a desktop PC). **Memory:** while it is sent, the form and its encoded body both exist, so the
-  peak is about twice the form (three times if you also keep your own copy).
+- **Files from disk (`file_from_path`)** are opened, measured and read on the HTTP worker
+  thread when the request goes out, 64 KiB at a time: the main thread does no file I/O and the
+  file is never in memory as a whole (measured: a 256 MiB upload peaked at 12 MB for the whole
+  test process). The body goes out with its exact `Content-Length`. A file that cannot be opened
+  is `InvalidRequest` and a form over `with_max_bytes` `RequestTooLarge`, both before anything is
+  sent; a file that changes size while it is sent cuts the request off with a `Network` error
+  that says so. It needs a transport that streams bodies: `UreqTransport` and
+  `FakeHttpTransport` do.
+- **Bytes (`file`, `part`, `text`)** are copied once and scanned for the boundary on the calling
+  thread (measured: about 4 ms per 10 MiB and 13 ms for 32 MiB in a release build on a desktop
+  PC). **Memory:** while it is sent, the form and its encoded body both exist, so the peak is
+  about twice the in-memory parts.
+- **Upload progress:** a request with a form reports `HttpProgress { id, sent, total }` messages
+  (bytes read for sending, at most about 10 per second, plus one when the whole body is out),
+  written in `First` before that frame's answers and only while the request waits for its
+  answer. `OutgoingRequest::with_upload_progress(bool)` turns it on for any body (or off for a
+  form).
 - **Encoding details:** a fresh 128-bit random boundary per request (`bnb-` + 32 hex digits, from
-  the operating system through ring), checked not to occur in any part; CRLF line breaks; the
+  the operating system through ring), checked not to occur in any in-memory part (a file read
+  from disk is not scanned: 128 random bits, like a browser's boundary); CRLF line breaks; the
   header `Content-Type: multipart/form-data; boundary=…`; a fixed `Content-Length` (never
   chunked). In `Content-Disposition`, names and file names are escaped as browsers do (WHATWG
   HTML): `"` → `%22`, CR → `%0D`, LF → `%0A`, everything else (backslashes, non-ASCII as UTF-8)
   unchanged, no `filename*`. Text values are sent exactly as given (line breaks are not
-  rewritten). `Debug` of a form shows names and sizes only.
+  rewritten). `Debug` of a form shows names and sizes only, never file names or paths.
 
 **How backends read the same upload** (`display_name` text + `avatar` file):
 
@@ -1206,8 +1366,8 @@ framework dropped:
   out the same frame (one made after it goes out next frame). A game system in `PostUpdate` that
   fires requests should be ordered `.before(BackendSystems::Send)` if the frame matters: both only
   read `HttpClient`, so the strict ambiguity check cannot flag the race. `BackendSystems::Exit` runs in
-  `Last` only in a frame with `AppExit`. The sets are `#[non_exhaustive]` and phase-named, so a
-  later kind of connection can use the same three.
+  `Last` only in a frame with `AppExit`. The sets are `#[non_exhaustive]` and phase-named:
+  HTTP, WebSocket and SSH all run in the same three.
 - **Threads.** ureq is blocking. `UreqTransport` starts its worker threads (named
   `net-backend-N`) on the first request and shares one `ureq::Agent` (keep-alive connection
   pool) between them. At most `workers` requests are on the wire; the rest wait in a queue, and
@@ -1286,36 +1446,40 @@ Everything is re-exported at the crate root; `prelude` holds the everyday items.
 | `HttpConfig` | resource | base URL, timeout, default headers, workers, `allow_insecure_http`, body limit; `validate()`, getters, `set_base_url`, `set_timeout`. |
 | `ConfigError` | enum | `NoBaseUrl`, `BadBaseUrl`, `BadHeader`. |
 | `HttpClient` | resource | `send`, `request`, `get`, `cancel`; `post_multipart`, `send_multipart` (feature `http`); with `json`: `send_json`, `get_json`, `post_json`, `post_multipart_json`, `is_json_registered`. |
-| `Multipart` | builder (`http`) | `new`, `text`, `file`, `with_max_bytes`, `with_max_parts`, `len`, `is_empty`, `encoded_len`. `Debug` shows names and sizes only. |
+| `Multipart` | builder (`http`) | `new`, `text`, `file`, `file_from_path`, `part`, `json` (feature `json`), `with_max_bytes`, `with_max_parts`, `len`, `is_empty`, `encoded_len`. `Debug` shows names and sizes only. |
+| `StreamingBody`, `StreamingReader` | body | a body read while it is sent (a form with files from disk): `open()` (exact length + reader, on a transport's thread), `read_all()`, `max_bytes()`. |
+| `HttpProgress` | message | upload progress: `id`, `sent`, `total`. |
 | `DEFAULT_MULTIPART_MAX_BYTES`, `DEFAULT_MULTIPART_MAX_PARTS` | consts (`http`) | 32 MiB, 256. |
 | `BackendAppExt` | trait on `App` | `add_json_response::<T>()` (feature `json`); `add_ws_request::<R>()`, `add_ws_push::<P>()` (features `ws` + `json`). Sealed. |
 | `RequestId` | id | opaque, unique per process, `Copy + Eq + Hash + Ord + Display`. |
-| `OutgoingRequest` | request | constructors, `with_*` builders, accessors (`method`, `path`, `query`, `headers`, `body`, `timeout`, `purpose`, `uses_credentials`, `is_multipart`, `error`), `query_mut`, `headers_mut`, `set_body`, `reject`; `with_multipart` (feature `http`). |
+| `OutgoingRequest` | request | constructors, `with_*` builders, accessors (`method`, `path`, `query`, `headers`, `body`, `timeout`, `purpose`, `uses_credentials`, `is_multipart`, `streaming_body`, `upload_progress`, `error`), `query_mut`, `headers_mut`, `set_body`, `reject`, `with_upload_progress`; `with_multipart` (feature `http`). |
 | `RequestPurpose` | enum | `Http`, `WebSocketHandshake`. |
 | `HttpResponse` | message | `id`, `result: Result<RawResponse, BackendError>`. |
 | `JsonResponse<T>` | message | `id`, `result: Result<T, BackendError>` (feature `json`). |
 | `RawResponse` | struct | `status`, `headers`, `body`; `new`, `with_header`, `is_success`, `body()`, `text()`, `json()`. |
-| `BackendError` | enum | see [Reading answers and errors](#4-reading-answers-and-errors); `status()`, `response()`, `is_invalid_request()`, `was_sent()`, `close_code()`, `host_key(..)`, `request_too_large(..)` (constructors for fakes). |
+| `BackendError` | enum | see [Reading answers and errors](#4-reading-answers-and-errors); `status()`, `response()`, `retry_after()`, `is_invalid_request()`, `was_sent()`, `close_code()`, `host_key(..)`, `request_too_large(..)` (constructors for fakes). |
 | `Credentials` | trait | `apply(&self, &mut OutgoingRequest)`; `ws_auth_message()` (default none: a first frame for WebSocket auth). |
-| `BackendCredentials` | resource | `new`, `set`, `clear`, `is_set`. |
+| `BackendCredentials` | resource | `new`, `set`, `clear`, `is_set`. A WebSocket connection waiting for refreshed credentials connects again on `set` and ends on `clear`. |
 | `BearerToken`, `ApiKeyHeader`, `ApiKeyQuery`, `JsonBodyField` | credentials | ready-made `Credentials` (`JsonBodyField`: feature `json`). |
-| `Secret` | string | redacted in `Debug` / `Display`; `new`, `expose`, `is_empty`. No comparison, no zeroing on drop. |
+| `Secret` | string | redacted in `Debug` / `Display`, overwritten with zeros when dropped; `new`, `expose`, `is_empty`. |
 | `InFlight` | resource | HTTP, WebSocket and SSH: `contains`, `len`, `is_empty`, `ids`, `describe` (→ `RequestInfo`). |
 | `RequestInfo` (struct), `RequestKind` (enum) | types | what a pending request is: `kind` (`Http`, `WebSocket`, `Ssh`, `Sftp`), `method`, `target` (never an SSH command line); `#[non_exhaustive]`. |
 | `Rejection` | struct | the payload of `BackendError::Rejected`: `new`, `bytes`, `text`, `json` (json). |
-| `HttpTransport` | trait | `submit`, `poll`, `cancel`, `shutdown`. |
+| `HttpTransport` | trait | `submit`, `poll`, `cancel`, `shutdown`, `streams_bodies`, `poll_progress`. |
 | `HttpTransportResult` | type | `Result<RawResponse, BackendError>`. |
 | `HttpTransportRes` | resource | `new(transport)`. |
-| `PreparedRequest` | struct | what a transport receives: `method`, `uri`, `headers`, `body`, `timeout`, `max_body_bytes`, `purpose`; `path()`, `is_loopback()`, `is_https()`. |
-| `FakeHttpTransport` | transport | `new`, `route`, `clear_routes`, `reply`, `requests`, `last_request`, `waiting`, `cancelled`, `shutdown_count`. |
+| `PreparedRequest` | struct | what a transport receives: `method`, `uri`, `headers`, `body`, `streaming_body`, `upload_progress`, `timeout`, `max_body_bytes`, `purpose`; `path()`, `is_loopback()`, `is_https()`. |
+| `FakeHttpTransport` | transport | `new`, `route`, `clear_routes`, `reply`, `progress`, `requests`, `last_request`, `waiting`, `cancelled`, `shutdown_count`. |
 | `UreqTransport` | transport | feature `http`: `new(&config)`, `workers()`. |
 | `http` | crate | the `http` 1.x crate, re-exported (`Method`, `StatusCode`, `HeaderMap`, …). |
 | `DEFAULT_TIMEOUT`, `MAX_TIMEOUT`, `DEFAULT_WORKERS`, `MAX_WORKERS`, `DEFAULT_MAX_BODY_BYTES`, `DEADLINE_GRACE` | consts | 15 s, 1 h, 2, 8, 10 MiB, 5 s. |
 | `WsClient` | resource (`ws`) | `connect`, `disconnect`, `send`, `send_text`, `send_binary`, `request_raw`, `request` (json), `cancel` (the shared one). |
 | `WsConnections`, `WsConnectionInfo` | resource / struct (`ws`) | `get`, `state`, `is_connected`, `iter`; info: `state`, `attempt`, `last_error`, `pending_requests`, `queued_frames`. |
 | `WsName` | name (`ws`) | a connection's name; `From<&str>` / `From<String>`, `as_str`, compares with `&str`. |
-| `WsState` | enum (`ws`) | `Connecting`, `Connected`, `Reconnecting { attempt, retry_in }`, `Disconnected`; `#[non_exhaustive]`. |
-| `WsSettings`, `WsReconnect` | builders (`ws`) | per connection: timeouts, heartbeat, limits, reconnect, headers, `allow_insecure_ws`, `without_credentials`, protocol; backoff: base, cap, max attempts, stable-after, jitter, `never()`, `delay_bound`. |
+| `WsState` | enum (`ws`) | `Connecting`, `Connected`, `Reconnecting { attempt, retry_in }`, `WaitingForCredentials`, `Disconnected`; `#[non_exhaustive]`. |
+| `WsSettings`, `WsReconnect` | builders (`ws`) | per connection: timeouts, heartbeat, limits, reconnect, headers, `allow_insecure_ws`, `without_credentials`, protocol, `with_auth_ack`, `with_credentials_refresh`; backoff: base, cap, max attempts, stable-after, jitter, `never()`, `delay_bound`. |
+| `WsCredentialsRefresh` | builder (`ws`) | `new`, `with_timeout` (default 30 s), `with_close_code`, `timeout`, `close_codes`. |
+| `WsCredentialsRefused` | message (`ws`) | `name`, `error`: refresh the credentials (one per refused credentials). |
 | `WsFrame`, `WsOutgoing` | types (`ws`) | a text / binary frame (`Debug` shows the length only); a raw request (`kind`, payload, `resend_on_reconnect`, `with_timeout`). |
 | `WsStateChanged`, `WsMessage`, `WsRawResponse` | messages (`ws`) | state changes (with the error), every data frame, raw answers; all with `name`. |
 | `WsRequest`, `WsPushMessage`, `WsResponse<T>`, `WsPush<P>`, `JsonEnvelope` | (`ws` + `json`) | typed requests (`Response`, `KIND`, `resend_on_reconnect`), typed pushes (`KIND`), their messages, the default protocol. |
@@ -1340,18 +1504,19 @@ Everything is re-exported at the crate root; `prelude` holds the everyday items.
 | `RusshTransport` | transport (`ssh`) | the real one; `new()`, `with_release_allowed`. |
 | `DEFAULT_SSH_CONNECT_TIMEOUT`, `DEFAULT_SSH_COMMAND_TIMEOUT`, `DEFAULT_SSH_MAX_OUTPUT_BYTES`, `DEFAULT_SFTP_TIMEOUT`, `DEFAULT_SFTP_MAX_BYTES`, `MAX_SSH_COMMAND_BYTES` | consts (`ssh`) | 15 s, 60 s, 8 MiB, 5 min, 256 MiB, 64 KiB. |
 
-## Limits and what it does not do
+## Good to know
 
-- **Native only** (Windows, Linux, macOS). No WebAssembly in this version.
-- **HTTP/1.1 only** (ureq). No HTTP/2, no streaming bodies: a response is read whole (up to the
-  body limit) before it is delivered.
-- **No redirects followed**: a 3xx arrives as `Status` with its `Location` header.
-- **No retries, no offline queue, no caching, no cookies.** Retry in your game if a request
-  matters; the error kind and the "Sent?" column in
+- **Platforms:** native Windows, Linux and macOS.
+- **HTTP/1.1** (ureq). A response is read whole (up to the body limit) before it is delivered.
+- **Redirects:** a 3xx arrives as `Status` with its `Location` header.
+- **Each request is sent once.** Retrying, queueing while offline, caching and cookies are your
+  game's decisions; the error kind and the "Sent?" column in
   [Reading answers and errors](#4-reading-answers-and-errors) tell you whether it may have been sent.
-- **No token refresh, no keyring:** credentials are whatever the game puts into
-  `BackendCredentials`.
-- **One base URL** per app. Paths are relative to it; absolute URLs are refused.
+- **Credentials** are whatever the game puts into `BackendCredentials`; the game stores and
+  refreshes them (a WebSocket connection can wait for that refresh, see
+  [WebSocket](#10-websocket-connections-feature-ws)).
+- **One base URL** per app (`HttpConfig`, changeable at runtime with `set_base_url`). Paths are
+  relative to it; absolute URLs are refused.
 - **A reverse proxy in front of your API must pass responses through unchanged**: no
   decompressing or recompressing on its own (Caddy: no `encode` directive for these routes; nginx:
   `gzip off`). The body limit and gzip handling assume the client sees exactly what your
@@ -1361,26 +1526,21 @@ Everything is re-exported at the crate root; `prelude` holds the everyday items.
   or a corporate TLS-inspecting proxy is not trusted.
 - **Cancel does not interrupt** a request already on the wire; it holds its worker thread until
   ureq's timeout at most.
-- **Uploads** are built in memory (the whole form, at most `with_max_bytes`, about twice that at
-  the peak while sending): no streaming from a file, no "upload this path" helper, no upload
-  progress messages. A text part cannot carry its own content type (e.g. a JSON part for
-  Spring's `@RequestPart`); `file(..)` always adds a file name.
-- **WebSocket (feature `ws`):** no permessage-deflate (a server that requires compression cannot
-  be used), no subprotocol negotiation helper (set `Sec-WebSocket-Protocol` with `with_header`),
-  one thread per connection (fine for a few connections, not for hundreds). A large message you
-  send occupies its connection thread until the socket takes it (that time does not count as the
-  server's silence); if the server accepts no data for 30 s (or `dead_after`, if longer), the
-  connection ends with a `Timeout` saying so. At `trace` level tungstenite
-  prints the whole handshake request, `Authorization` and query included: keep `tungstenite`
-  below `trace` like `ureq`. Received frames the game does not take are limited to 32 times the
-  message limit per connection (then it closes with 1008).
-
-- **SSH (feature `ssh`):** reconnect only when enabled and never for a running command; no
-  agent or port forwarding, no PTY / interactive shell, no host certificates; ssh_config without
-  `Match`, `%` tokens, `ProxyJump` / `ProxyCommand` or `UserKnownHostsFile`. Output arrives in
-  chunks, not lines. A cancelled or timed-out remote process may keep running (see the SSH
-  section). SFTP downloads read 64 KiB at a time, one request after the other (uploads keep 16
-  writes of 32 KiB in flight), so a download's speed is bounded by the round trip. russh logs agent
+- **Uploads:** in-memory parts are built into one body (at most `with_max_bytes`, about twice
+  the in-memory parts at the peak while sending); files from disk (`file_from_path`) are streamed.
+- **WebSocket (feature `ws`):** messages go uncompressed (permessage-deflate is not negotiated,
+  so a server that requires compression refuses the connection); a subprotocol is set as a
+  `Sec-WebSocket-Protocol` header with `with_header`; one thread per connection (fine for a few
+  connections, not for hundreds). A large message you send occupies its connection thread until
+  the socket takes it (that time does not count as the server's silence); if the server accepts
+  no data for 30 s (or `dead_after`, if longer), the connection ends with a `Timeout` saying so.
+  At `trace` level tungstenite prints the whole handshake request, `Authorization` and query
+  included: keep `tungstenite` below `trace` like `ureq`. Received frames the game does not take
+  are limited to 32 times the message limit per connection (then it closes with 1008).
+- **SSH (feature `ssh`):** connections run commands (exec channels, no terminal) and SFTP;
+  reconnect only when enabled and never for a running command. Output arrives in chunks, not
+  lines. A cancelled or timed-out remote process may keep running (see the SSH section). SFTP
+  downloads keep 16 reads of 64 KiB in flight and uploads 16 writes of 32 KiB. russh logs agent
   sign requests at `debug` (challenge bytes, not secrets) and packet details at `trace`: keep
   `russh` at `info` or below like `ureq`. A lost connection is noticed through russh's own
   disconnect report, backed by a once-a-second check of the session; a lost network without any
@@ -1404,7 +1564,7 @@ from `examples/mock_server.rs` on 127.0.0.1 inside the example process.
 | `post_with_token` | 401 before login, login `without_credentials`, `BearerToken`, a 422 validation error decoded from the error body, a successful authenticated `POST`. |
 | `mock_server` | the mock API on its own and its JSON contract (including `POST /upload`, a real multipart parser that echoes what it received): `--seconds N` (maximum runtime, default 60; it exits by itself), `--bind ADDR` (default `127.0.0.1:0`). |
 | `chat_client` (features `ws`, `json`) | a named connection, a typed request and its answer, typed pushes, state changes, disconnect. Starts `mock_ws_server` unless `BACKEND_WS_URL` is set. |
-| `mock_ws_server` (features `ws`, `json`) | the mock WebSocket server and its envelope contract (echo, `chat.send` + push, `fail`, `close`, `drop`, `stall`, periodic `server.tick`, `/secure` needing a bearer token): `--seconds N`, `--bind ADDR` (default `127.0.0.1:0`), `--tick-ms N`. |
+| `mock_ws_server` (features `ws`, `json`) | the mock WebSocket server and its envelope contract (echo, `chat.send` + push, `fail`, `close`, `drop`, `stall`, periodic `server.tick`, `/secure` needing a bearer token, `/busy` refusing with `503` and `Retry-After: 2`): `--seconds N`, `--bind ADDR` (default `127.0.0.1:0`), `--tick-ms N`. |
 | `ssh_console` (feature `ssh`; SFTP steps with `sftp`) | connect with a known_hosts file, run commands and print their output and exit, then upload, list, download and remove a file one step after the other, disconnect. Starts `mock_ssh_server` with a throwaway key (written to `target/ssh-example/`) unless `SSH_HOST`, `SSH_USER`, `SSH_KEY` and `SSH_KNOWN_HOSTS` are set. |
 | `mock_ssh_server` (feature `ssh`; SFTP with `sftp`) | the mock SSH server: canned commands (never executes anything), an in-memory SFTP file system, a throwaway host key; alone it writes a throwaway client key and a known_hosts file to `--out-dir` (default `target/mock-ssh`): `--seconds N`, `--bind ADDR` (default `127.0.0.1:0`), `--user NAME`, `--host NAME` (the name clients reach it by, for the known_hosts line; with `--bind 0.0.0.0:P` and no `--host` the line says `CHANGE-ME`, or pin the printed fingerprint), `--password PW` and `--kbd PW:CODE` (also accept a password / a keyboard-interactive `Password:` + `Verification code:` login; throwaway test values only, visible in the process list). |
 
@@ -1427,8 +1587,8 @@ header comment (the login reads `BACKEND_USERNAME` / `BACKEND_PASSWORD`).
 
 ## How it's tested
 
-- **271 tests with all features** (unit tests, integration tests and every Rust block of this
-  README), plus 11 live tests that are `#[ignore]`d by default. CI runs the tests for 15
+- **312 tests with all features** (unit tests, integration tests and every Rust block of this
+  README), plus 12 live tests that are `#[ignore]`d by default. CI runs the tests for 15
   feature combinations on Linux, Windows and macOS with Rust 1.96.0, clippy with `-D warnings` for
   every combination, rustfmt, the docs with `-D warnings`, a build with the minimum Rust version
   (1.95), dependency-tree checks (one ring, one rustls, no tokio without `ssh`, no OpenSSL /
@@ -1468,16 +1628,22 @@ Run it yourself:
   answer each, strict ambiguity detection), a log-capture test proving no secret is logged, the
   loopback tests (the real `UreqTransport` against the mock server on 127.0.0.1: statuses,
   redirects, timeouts, body limit, TLS handshake failure, login flow, exit while busy) and the
-  upload tests (the real transport against the mock's multipart parser). With `--features ws`
-  (and `--all-features`) also the WebSocket tests: every lifecycle path on a `FakeWsTransport`,
-  the real transport against `mock_ws_server` (large messages across many short read timeouts,
-  reconnect, heartbeat, 401, 1009, exit), and a TLS test with large messages cut by read timeouts
-  mid-record. With `--features ssh` (and `ssh,sftp`) also the SSH tests: every lifecycle path on a
-  `FakeSshTransport` (including one app with HTTP, WebSocket and SSH cancelling each other's
-  requests), the real `RusshTransport` against `mock_ssh_server` with throwaway keys generated at
-  runtime (commands, timeouts, cancel, output limit, strict host keys, passphrases, ssh_config,
-  SFTP) and hostile raw TCP peers (silent, trickling, huge banner) that must not stretch the
-  connect deadline. `cargo test --all-features` also compiles every Rust block of this README.
+  upload tests (the real transport against the mock's multipart parser; files streamed from
+  disk, a JSON part, upload progress, refusals before sending, and a 256 MiB file streamed to a
+  local server that hashes it on the fly). With `--features ws` (and `--all-features`) also the
+  WebSocket tests: every lifecycle path on a `FakeWsTransport` (credentials refresh included:
+  one message for several refused connections, one new connection, a second refusal final), the
+  real transport against `mock_ws_server` (large messages across many short read timeouts,
+  reconnect, heartbeat, 401, a 503 with `Retry-After`, a refused token refreshed by the game, 1009, exit), and a TLS test
+  with large messages cut by read timeouts mid-record. With `--features ssh` (and `ssh,sftp`) also
+  the SSH tests: every lifecycle path on a `FakeSshTransport` (including one app with HTTP,
+  WebSocket and SSH cancelling each other's requests), the real `RusshTransport` against
+  `mock_ssh_server` with throwaway keys generated at runtime (commands, timeouts, cancel, output
+  limit, strict host keys, passphrases, ssh_config, SFTP: a 256 MiB download compared by SHA-1,
+  sizes from 0 bytes up, short reads, a server error, cancel and timeout in the middle with no
+  file left behind), the download pipeline against an in-memory file that answers out of order,
+  and hostile raw TCP peers (silent, trickling, huge banner) that must not stretch the connect
+  deadline. `cargo test --all-features` also compiles every Rust block of this README.
 - `tests/live.rs` holds live HTTPS checks, `#[ignore]`d: they run only with
   `cargo test --test live -- --ignored` and `BNB_TEST_HTTPS_URL` set to a server that serves the
   mock's contract over HTTPS (for example `mock_server` behind a TLS-terminating reverse proxy on
@@ -1505,7 +1671,8 @@ tree. A game API client does a handful of requests; blocking ureq on two threads
 **Why not Bevy's `IoTaskPool`?** It has 1–4 threads shared with asset loading. A 15-second
 request would stall asset IO; a dedicated pool cannot.
 
-**Can I call two different APIs?** Not in 0.1.0: one base URL per app.
+**How many APIs can one app call?** One base URL per app (`HttpConfig`); `set_base_url` changes
+it at runtime.
 
 **Is the answer delivered if my reader runs in `PostUpdate`?** Yes. Answers are written in
 `First` before Bevy's message update, so they are readable in every schedule of that frame (and
@@ -1517,7 +1684,7 @@ other frame can miss them.
 `FakeHttpTransport` instead (see [Testing your game](#8-testing-your-game-without-a-server)).
 
 **Where does the token live between sessions?** Wherever your game keeps it; this crate only
-sends what is in `BackendCredentials`.
+sends what is in `BackendCredentials`, and its `Secret` wipes its memory when it is dropped.
 
 **Can my game use SSH to talk to its servers?** Not a game you give to players: an SSH key in a
 player build is shell access for anyone who extracts it. Use HTTP or WebSocket with per-player
@@ -1525,8 +1692,9 @@ tokens for that. SSH is for your own admin and developer tools, and release buil
 unless the tool explicitly opts in (`SshSettings::allow_in_release`).
 
 **How do I upload a screenshot or a save file?** `HttpClient::post_multipart` with a
-`Multipart` form (see [File uploads](#12-file-uploads-multipart)); load the bytes first, the
-crate never reads files for an HTTP upload.
+`Multipart` form (see [File uploads](#12-file-uploads-multipart)): `file` for bytes you have,
+`file_from_path` for a file on disk (read on the worker thread while it is sent, with
+`HttpProgress` messages).
 
 **Can SSH log in with a password or a 2FA code?** Yes, opt-in: `SshAuth::password` and
 `SshAuth::keyboard_interactive` (see the SSH section). Keys stay the recommendation; the values are

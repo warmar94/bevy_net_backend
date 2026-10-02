@@ -9,6 +9,7 @@ use std::time::Duration;
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use http::{Method, Uri};
 
+use crate::body::StreamingBody;
 use crate::config::ConfigError;
 use crate::BackendError;
 
@@ -43,8 +44,9 @@ impl fmt::Display for RequestId {
     }
 }
 
-/// What a request is for, so [`Credentials`](crate::Credentials) can treat kinds differently.
-/// 0.1.0 only makes [`Http`](Self::Http) requests.
+/// What a request is for, so [`Credentials`](crate::Credentials) can treat kinds differently:
+/// [`Http`](Self::Http) for HTTP requests, [`WebSocketHandshake`](Self::WebSocketHandshake) for the
+/// handshake of a WebSocket connection (feature `ws`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum RequestPurpose {
@@ -83,10 +85,13 @@ pub struct OutgoingRequest {
     query: Vec<(String, String)>,
     headers: HeaderMap,
     body: Option<Vec<u8>>,
+    /// A body read while it is sent (a form with files from disk); `body` is `None` then.
+    stream: Option<StreamingBody>,
     timeout: Option<Duration>,
     purpose: RequestPurpose,
     credentials: bool,
     multipart: bool,
+    progress: bool,
     error: Option<BackendError>,
 }
 
@@ -100,10 +105,12 @@ impl fmt::Debug for OutgoingRequest {
             .field("query_names", &query)
             .field("header_names", &headers)
             .field("body_bytes", &self.body.as_ref().map(Vec::len))
+            .field("streaming_body", &self.stream.is_some())
             .field("timeout", &self.timeout)
             .field("purpose", &self.purpose)
             .field("credentials", &self.credentials)
             .field("multipart", &self.multipart)
+            .field("upload_progress", &self.progress)
             .finish_non_exhaustive()
     }
 }
@@ -119,10 +126,12 @@ impl OutgoingRequest {
             query: Vec::new(),
             headers: HeaderMap::new(),
             body: None,
+            stream: None,
             timeout: None,
             purpose: RequestPurpose::Http,
             credentials: true,
             multipart: false,
+            progress: false,
             error: None,
         }
     }
@@ -176,6 +185,7 @@ impl OutgoingRequest {
     /// form set with `with_multipart`: [`is_multipart`](Self::is_multipart) is `false` again.
     pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Self {
         self.body = Some(body.into());
+        self.stream = None;
         self.multipart = false;
         self
     }
@@ -189,6 +199,7 @@ impl OutgoingRequest {
         match serde_json::to_vec(value) {
             Ok(body) => {
                 self.body = Some(body);
+                self.stream = None;
                 self.multipart = false;
                 self.headers.insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
             }
@@ -203,34 +214,66 @@ impl OutgoingRequest {
 
     /// Encode `form` as the `multipart/form-data` body and set its `Content-Type` (with the
     /// boundary). An invalid or too large form does not panic: the request is answered with the
-    /// error (`InvalidRequest`, `RequestTooLarge`) and never sent. Large uploads may need a longer
-    /// [`with_timeout`](Self::with_timeout).
+    /// error (`InvalidRequest`, `RequestTooLarge`, `Encode`) and never sent. Large uploads may
+    /// need a longer [`with_timeout`](Self::with_timeout). It also turns on
+    /// [`with_upload_progress`](Self::with_upload_progress). A form with files from disk
+    /// (`Multipart::file_from_path`) becomes a [`StreamingBody`]: [`body`](Self::body) is `None`
+    /// then.
     #[cfg(feature = "http")]
     #[cfg_attr(docsrs, doc(cfg(feature = "http")))]
     pub fn with_multipart(mut self, form: &crate::Multipart) -> Self {
-        match form.encode() {
-            Ok((content_type, body)) => match HeaderValue::try_from(content_type) {
-                Ok(value) => {
-                    self.body = Some(body);
-                    self.multipart = true;
-                    self.headers.insert(http::header::CONTENT_TYPE, value);
-                }
-                Err(_) => self.reject("the multipart content type is not a valid header value"),
-            },
+        let (content_type, body, stream) = match form.encode() {
+            Ok(crate::multipart::Encoded::Memory { content_type, body }) => (content_type, Some(body), None),
+            Ok(crate::multipart::Encoded::Stream { content_type, body }) => (content_type, None, Some(body)),
             Err(error) => {
                 if self.error.is_none() {
                     self.error = Some(error);
                 }
+                return self;
             }
+        };
+        match HeaderValue::try_from(content_type) {
+            Ok(value) => {
+                self.body = body;
+                self.stream = stream;
+                self.multipart = true;
+                self.progress = true;
+                self.headers.insert(http::header::CONTENT_TYPE, value);
+            }
+            Err(_) => self.reject("the multipart content type is not a valid header value"),
         }
         self
     }
 
+    /// Report the upload of this request's body as [`HttpProgress`](crate::HttpProgress)
+    /// messages (default: on for a form from `with_multipart`, off otherwise). The built-in
+    /// transport reports at most about 10 per second per request, plus one when the whole body
+    /// is out. Call it after `with_multipart` to turn a form's progress off.
+    pub fn with_upload_progress(mut self, report: bool) -> Self {
+        self.progress = report;
+        self
+    }
+
+    /// Whether the upload of the body is reported as `HttpProgress`.
+    pub fn upload_progress(&self) -> bool {
+        self.progress
+    }
+
     /// Whether the body is a form from `with_multipart` (feature `http`), for
-    /// [`Credentials`](crate::Credentials) that must not touch such a body. A later `with_body`,
-    /// `with_json` or `set_body` replaces the form and clears this.
+    /// [`Credentials`](crate::Credentials) that must not touch such a body. `with_body`, `with_json`
+    /// or `set_body` called afterwards replaces the form and clears this.
     pub fn is_multipart(&self) -> bool {
         self.multipart
+    }
+
+    /// The body that is read while it is sent (a form with files from disk), if any.
+    pub fn streaming_body(&self) -> Option<&StreamingBody> {
+        self.stream.as_ref()
+    }
+
+    /// Whether there is a body of either kind.
+    pub(crate) fn has_body(&self) -> bool {
+        self.body.is_some() || self.stream.is_some()
     }
 
     /// This request's own timeout, instead of the config's (clamped like
@@ -295,6 +338,7 @@ impl OutgoingRequest {
     /// is `false`).
     pub fn set_body(&mut self, body: Option<Vec<u8>>) {
         self.body = body;
+        self.stream = None;
         self.multipart = false;
     }
 
@@ -303,7 +347,8 @@ impl OutgoingRequest {
         self.timeout
     }
 
-    /// What the request is for (always [`RequestPurpose::Http`] in this version).
+    /// What the request is for ([`RequestPurpose::WebSocketHandshake`] for the handshake of a
+    /// WebSocket connection, else [`RequestPurpose::Http`]).
     pub fn purpose(&self) -> RequestPurpose {
         self.purpose
     }
@@ -327,9 +372,28 @@ impl OutgoingRequest {
         self.error.take()
     }
 
-    pub(crate) fn into_parts(self) -> (Method, HeaderMap, Option<Vec<u8>>, Option<Duration>, RequestPurpose) {
-        (self.method, self.headers, self.body, self.timeout, self.purpose)
+    pub(crate) fn into_parts(self) -> RequestParts {
+        RequestParts {
+            method: self.method,
+            headers: self.headers,
+            body: self.body,
+            stream: self.stream,
+            timeout: self.timeout,
+            purpose: self.purpose,
+            progress: self.progress,
+        }
     }
+}
+
+/// What [`OutgoingRequest::into_parts`] hands to the plugin.
+pub(crate) struct RequestParts {
+    pub(crate) method: Method,
+    pub(crate) headers: HeaderMap,
+    pub(crate) body: Option<Vec<u8>>,
+    pub(crate) stream: Option<StreamingBody>,
+    pub(crate) timeout: Option<Duration>,
+    pub(crate) purpose: RequestPurpose,
+    pub(crate) progress: bool,
 }
 
 /// A request ready for an [`HttpTransport`](crate::HttpTransport): the full URL, every header (defaults
@@ -346,8 +410,14 @@ pub struct PreparedRequest {
     pub uri: Uri,
     /// Every header to send.
     pub headers: HeaderMap,
-    /// The body, if any.
+    /// The body, if any (in memory).
     pub body: Option<Vec<u8>>,
+    /// A body read while it is sent (a multipart form with files from disk), instead of `body`.
+    /// Only given to a transport whose [`HttpTransport::streams_bodies`](crate::HttpTransport::streams_bodies)
+    /// is `true`.
+    pub streaming_body: Option<StreamingBody>,
+    /// Report the upload of the body (`HttpTransport::poll_progress`).
+    pub upload_progress: bool,
     /// The timeout of the whole call.
     pub timeout: Duration,
     /// The largest response body to accept, in bytes.
@@ -364,6 +434,8 @@ impl fmt::Debug for PreparedRequest {
             .field("url", &redacted_url(&self.uri))
             .field("header_names", &headers)
             .field("body_bytes", &self.body.as_ref().map(Vec::len))
+            .field("streaming_body", &self.streaming_body)
+            .field("upload_progress", &self.upload_progress)
             .field("timeout", &self.timeout)
             .field("max_body_bytes", &self.max_body_bytes)
             .field("purpose", &self.purpose)

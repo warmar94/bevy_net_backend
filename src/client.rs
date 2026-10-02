@@ -61,12 +61,12 @@ pub(crate) enum Queued {
 /// systems in any schedule can use it without ordering against each other; it also works from
 /// `&World`.
 ///
-/// Every call returns the [`RequestId`] its answer will carry, and every request gets exactly
+/// Every call returns the [`RequestId`] its answer carries, and every request gets exactly
 /// one answer: [`HttpResponse`](crate::HttpResponse) for the raw calls,
 /// `JsonResponse<T>` for the typed ones (feature `json`).
 ///
 /// Requests are handed to the transport in `PostUpdate`
-/// ([`BackendSystems::Send`](crate::BackendSystems::Send)); one made later in a frame goes out in
+/// ([`BackendSystems::Send`](crate::BackendSystems::Send)); one made after that point of a frame goes out in
 /// the next frame's `PostUpdate`.
 #[derive(Resource, Default)]
 pub struct HttpClient {

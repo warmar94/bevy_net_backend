@@ -213,6 +213,51 @@ fn the_handshake_carries_credentials_and_a_401_is_final() {
     run_until(&mut app, |app| state(app, "authed") == Some(WsState::Connected));
 }
 
+/// The real transport reads the `Retry-After` of a refused handshake: the reconnect waits for it.
+#[test]
+fn a_busy_server_s_retry_after_sets_the_reconnect_delay() {
+    let server = mock(0);
+    let mut app = app();
+    let reconnect = WsReconnect::default().with_jitter(false).with_base(Duration::from_millis(10)).with_max_attempts(Some(1));
+    ws(&app).connect("busy", WsSettings::new(format!("{}/busy", server.url())).with_reconnect(reconnect));
+    run_until(&mut app, |app| matches!(state(app, "busy"), Some(WsState::Reconnecting { .. })));
+    assert_eq!(state(&app, "busy"), Some(WsState::Reconnecting { attempt: 1, retry_in: Duration::from_secs(2) }));
+    let error = app.world().resource::<WsConnections>().get("busy").and_then(|c| c.last_error.clone());
+    assert_eq!(error.as_ref().and_then(BackendError::status), Some(StatusCode::SERVICE_UNAVAILABLE));
+    assert_eq!(error.as_ref().and_then(BackendError::retry_after), Some(Duration::from_secs(2)));
+    ws(&app).disconnect("busy");
+    run_until(&mut app, |app| state(app, "busy") == Some(WsState::Disconnected));
+    assert_eq!(server.accepted(), 0);
+}
+
+/// The real transport against a server that answers 401 to an old token: the game's system sees
+/// `WsCredentialsRefused`, "refreshes" (sets the token the server accepts) and the connection
+/// opens on its one new attempt.
+#[test]
+fn a_refused_token_is_refreshed_by_the_game_and_the_connection_opens() {
+    fn refresh_on_refusal(mut refused: MessageReader<WsCredentialsRefused>, mut credentials: ResMut<BackendCredentials>) {
+        if refused.read().count() > 0 {
+            credentials.set(BearerToken::new(mock_ws_server::TOKEN));
+        }
+    }
+    let server = mock(0);
+    let mut app = app();
+    app.add_systems(Update, refresh_on_refusal);
+    app.watch::<WsCredentialsRefused>();
+    app.world_mut().resource_mut::<BackendCredentials>().set(BearerToken::new("fake-expired-token"));
+    let settings = WsSettings::new(format!("{}/secure", server.url())).with_credentials_refresh(WsCredentialsRefresh::new());
+    ws(&app).connect("main", settings);
+    run_until(&mut app, |app| state(app, "main") == Some(WsState::Connected));
+    assert_eq!(app.all_messages::<WsCredentialsRefused>().len(), 1);
+    let states: Vec<WsState> = app.all_messages::<WsStateChanged>().into_iter().filter(|c| c.name == "main").map(|c| c.state).collect();
+    assert_eq!(states, vec![WsState::Connecting, WsState::WaitingForCredentials, WsState::Connecting, WsState::Connected]);
+    let id = ws(&app).request("main", &Echo { text: "after refresh".into() });
+    run_until(&mut app, |app| echo_answer(app, id).is_some());
+    assert_eq!(echo_answer(&app, id), Some(Ok(EchoBack { text: "after refresh".into() })));
+    // The mock refuses before accepting the socket, so it counted one accepted connection.
+    assert_eq!(server.accepted(), 1);
+}
+
 #[test]
 fn a_message_over_the_limit_closes_with_1009() {
     let server = mock(0);

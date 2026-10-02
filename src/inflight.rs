@@ -19,15 +19,15 @@ use crate::client::{HttpClient, Queued, Route};
 use crate::config::HttpConfig;
 use crate::credentials::BackendCredentials;
 use crate::request::{build_uri, OutgoingRequest, PreparedRequest, RequestId};
-use crate::response::{BackendError, HttpResponse};
+use crate::response::{BackendError, HttpProgress, HttpResponse};
 use crate::transport::{HttpTransportRes, HttpTransportResult};
 
 /// How long after its own timeout a request is answered with a timeout by the plugin, in case the
 /// transport never reports it (a stuck worker, a custom transport that forgets it).
 pub const DEADLINE_GRACE: Duration = Duration::from_secs(5);
 
-/// The kind of connection a pending request belongs to. `#[non_exhaustive]`: later versions may
-/// add kinds.
+/// The kind of connection a pending request belongs to. `#[non_exhaustive]`: match it with a
+/// catch-all arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum RequestKind {
@@ -212,7 +212,7 @@ pub(crate) fn prepare(request: OutgoingRequest, config: &HttpConfig, credentials
         return Err(error);
     }
     config.validate().map_err(|e| BackendError::InvalidRequest(e.to_string()))?;
-    check_method(request.method(), request.body().is_some())?;
+    check_method(request.method(), request.has_body())?;
     let own: HashSet<HeaderName> = request.headers().keys().cloned().collect();
     for (name, value) in config.headers() {
         if !own.contains(name) {
@@ -228,8 +228,18 @@ pub(crate) fn prepare(request: OutgoingRequest, config: &HttpConfig, credentials
         return Err(error);
     }
     let uri = build_uri(config.base_url(), request.path(), request.query(), config.insecure_http_allowed())?;
-    let (method, headers, body, timeout, purpose) = request.into_parts();
-    Ok(PreparedRequest { method, uri, headers, body, timeout: timeout.unwrap_or(config.timeout()), max_body_bytes: config.max_body_bytes(), purpose })
+    let parts = request.into_parts();
+    Ok(PreparedRequest {
+        method: parts.method,
+        uri,
+        headers: parts.headers,
+        body: parts.body,
+        streaming_body: parts.stream,
+        upload_progress: parts.progress,
+        timeout: parts.timeout.unwrap_or(config.timeout()),
+        max_body_bytes: config.max_body_bytes(),
+        purpose: parts.purpose,
+    })
 }
 
 /// The methods sent: the standard ones except `CONNECT` (a tunnel, not an API call). `HEAD` has no
@@ -293,6 +303,13 @@ pub(crate) fn send_requests(
                     Err(error) => inflight.ready.push((id, route, Err(error))),
                     Ok(prepared) => match transport.as_mut() {
                         None => inflight.ready.push((id, route, Err(BackendError::NoTransport))),
+                        Some(transport) if prepared.streaming_body.is_some() && !transport.get().streams_bodies() => inflight.ready.push((
+                            id,
+                            route,
+                            Err(BackendError::InvalidRequest(
+                                "the installed HTTP transport does not send streamed bodies (a multipart form with files from disk)".into(),
+                            )),
+                        )),
                         Some(transport) => {
                             let allowed = prepared.timeout.saturating_add(DEADLINE_GRACE);
                             if let Some(method) = &info.method {
@@ -330,12 +347,22 @@ pub(crate) fn receive_answers(
     config: Res<HttpConfig>,
     time: Option<Res<Time<Real>>>,
     mut raw: MessageWriter<HttpResponse>,
+    mut progress: MessageWriter<HttpProgress>,
     mut commands: Commands,
 ) {
     let mut answers = std::mem::take(&mut inflight.ready);
     let generation = transport.as_ref().map(|t| t.generation());
     if let Some(transport) = transport.as_mut() {
-        for (id, result) in transport.get_mut().poll() {
+        // Results first, then progress: a worker sends its progress before its result, so every
+        // progress of a request whose result is here is in the progress channel too. Progress is
+        // written before the answers, only for requests that were still waiting.
+        let results = transport.get_mut().poll();
+        for (id, sent, total) in transport.get_mut().poll_progress() {
+            if inflight.entries.get(&id).is_some_and(|entry| Some(entry.generation) == generation) {
+                progress.write(HttpProgress { id, sent, total });
+            }
+        }
+        for (id, result) in results {
             match inflight.entries.get(&id) {
                 Some(entry) if Some(entry.generation) == generation => {
                     if let Some(entry) = inflight.entries.remove(&id) {

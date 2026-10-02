@@ -184,3 +184,50 @@ fn live_portable_cases_on_every_url() {
         println!("{url}: portable cases ok");
     }
 }
+
+/// A file read from disk while it is sent (a streamed body with `Content-Length`), a JSON part
+/// (`Content-Type: application/json`, no file name: read as a text field whose value is the JSON
+/// text), and the upload progress ending at the body size. A 6 MiB file: under the mock's 8 MiB
+/// limit and typical framework defaults (raise PHP's `upload_max_filesize` / `post_max_size` if
+/// they are lower).
+#[test]
+#[ignore = "live: needs BNB_TEST_HTTPS_URL and / or BNB_TEST_MULTIPART_URLS"]
+fn live_streamed_file_json_part_and_progress_on_every_url() {
+    let urls = urls();
+    assert!(!urls.is_empty(), "set BNB_TEST_HTTPS_URL and / or BNB_TEST_MULTIPART_URLS");
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("live-multipart-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+    let data: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 19) as u8).collect();
+    let path = dir.join("save.bin");
+    std::fs::write(&path, &data).unwrap_or_else(|e| panic!("{e}"));
+    let meta = serde_json::json!({"slot": 3, "name": "Ayla"});
+    for url in urls {
+        let (base, path_part) = split(&url);
+        let mut app = TestApp::builder().frame_duration(Duration::from_millis(1)).real_pause(Duration::from_millis(5)).build();
+        app.add_plugins(BackendPlugin::new(HttpConfig::new(base).with_timeout(Duration::from_secs(120))));
+        app.watch::<HttpResponse>().watch::<HttpProgress>();
+        let form = Multipart::new().json("meta", &meta).file_from_path("save", "save.bin", "application/octet-stream", &path).text("after", "last");
+        let id = app.world().resource::<HttpClient>().post_multipart(&path_part, &form);
+        let mut answer = None;
+        for _ in 0..60_000 {
+            app.step();
+            if let Some(found) = app.messages::<HttpResponse>().into_iter().find(|a| a.id == id) {
+                answer = Some(found.result);
+                break;
+            }
+        }
+        let response = answer.unwrap_or_else(|| panic!("{url}: no answer")).unwrap_or_else(|e| panic!("{url}: {e}"));
+        let echo: Echo = response.json().unwrap_or_else(|e| panic!("{url}: not the echo shape ({e}): {}", response.text()));
+        let sent: serde_json::Value = serde_json::from_str(field(&url, &echo, "meta").unwrap_or_else(|| panic!("{url}: no meta field in {echo:?}")))
+            .unwrap_or_else(|e| panic!("{url}: meta is not JSON: {e}"));
+        assert_eq!(sent, meta, "{url}");
+        assert_eq!(field(&url, &echo, "after"), Some("last"), "{url}");
+        let save = file(&url, &echo, "save");
+        assert_eq!((save.filename.as_str(), save.size, save.crc32.as_str()), ("save.bin", data.len() as u64, crc32(&data).as_str()), "{url}");
+        let progress: Vec<HttpProgress> = app.all_messages::<HttpProgress>().into_iter().filter(|p| p.id == id).collect();
+        assert!(progress.windows(2).all(|w| w[0].sent <= w[1].sent), "{url}: {progress:?}");
+        let last = progress.last().unwrap_or_else(|| panic!("{url}: no progress"));
+        assert_eq!(Some(last.sent), last.total, "{url}: the last progress is the whole body");
+        println!("{url}: streamed file + JSON part ok ({} progress messages)", progress.len());
+    }
+}

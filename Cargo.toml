@@ -33,7 +33,7 @@ ws = ["dep:tungstenite", "dep:rustls", "dep:webpki-roots"]
 # ciphers, RustCrypto for the rest), strict known_hosts checking, key files / ssh-agent / the
 # user's ~/.ssh/config. The ONLY feature that brings tokio: one private current-thread runtime on
 # its own thread. Refuses to run in release builds unless the plugin opts in.
-ssh = ["dep:russh", "dep:tokio", "dep:ssh2-config", "dep:glob", "dep:hmac", "dep:sha1", "dep:zeroize"]
+ssh = ["dep:russh", "dep:tokio", "dep:ssh2-config", "dep:glob", "dep:hmac", "dep:sha1"]
 # SFTP file operations (upload, download, list, mkdir, remove, rename) on SSH connections.
 sftp = ["ssh", "dep:russh-sftp"]
 # RSA host keys and RSA key files for SSH (rsa-sha2-256/512). Off by default: the `rsa` crate carries
@@ -47,6 +47,9 @@ bevy_app = { version = "=0.19.0", default-features = false, features = ["std"] }
 bevy_ecs = { version = "=0.19.0", default-features = false, features = ["std"] }
 # `Time<Real>` for the request deadlines.
 bevy_time = { version = "=0.19.0", default-features = false, features = ["std"] }
+# Overwrites secrets (`Secret`, key file contents) with zeros when they are dropped. rustls already
+# depends on it, so the default build gains no crate.
+zeroize = { version = "1.7", default-features = false, features = ["alloc"] }
 # Bevy's logging goes through `tracing`; its subscriber (LogPlugin) picks these messages up.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 # The public vocabulary: `Method`, `StatusCode`, `HeaderMap`, `HeaderName`, `HeaderValue`, `Uri`.
@@ -77,8 +80,6 @@ glob = { version = "0.3", optional = true }
 # Hashed known_hosts entries (`|1|salt|hash` = HMAC-SHA1); the same versions russh uses.
 hmac = { version = "0.13", optional = true }
 sha1 = { version = "0.11", default-features = false, optional = true }
-# Wipes key file contents read into memory.
-zeroize = { version = "1.7", optional = true }
 # The SFTP subsystem (feature `sftp`).
 russh-sftp = { version = "=3.0.1", optional = true }
 

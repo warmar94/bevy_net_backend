@@ -115,7 +115,7 @@ impl fmt::Debug for SshEvent {
 /// requests, deadlines, cancel, exit) and every answer; a transport only reports. All methods run
 /// on the main thread and must never block or panic.
 ///
-/// **Compatibility promise:** methods added to this trait in later versions always come with a
+/// **Compatibility rule:** methods are only ever added to this trait with a
 /// default implementation.
 pub trait SshTransport: Send + Sync + 'static {
     /// Start connecting (resolve an ssh_config alias, TCP, key exchange, host key check,
@@ -346,7 +346,7 @@ impl FakeSshTransport {
         self.lock().commands.clone()
     }
 
-    /// Commands started and not finished yet.
+    /// Commands started and still running.
     pub fn running(&self) -> Vec<RequestId> {
         let mut running: Vec<RequestId> = self.lock().running.iter().copied().collect();
         running.sort_unstable();

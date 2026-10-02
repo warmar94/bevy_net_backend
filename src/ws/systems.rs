@@ -17,7 +17,8 @@ use http::Uri;
 
 use super::transport::{WsHandshake, WsLinkEvent, WsLinkId, WsTransportRes};
 use super::{
-    WsClient, WsConnectionInfo, WsConnections, WsFrame, WsIncoming, WsMessage, WsName, WsQueued, WsRawResponse, WsRoute, WsSettings, WsState, WsStateChanged,
+    WsClient, WsConnectionInfo, WsConnections, WsCredentialsRefused, WsFrame, WsIncoming, WsMessage, WsName, WsQueued, WsRawResponse, WsRoute, WsSettings,
+    WsState, WsStateChanged,
 };
 use crate::credentials::BackendCredentials;
 use crate::inflight::{InFlight, Protocol, RequestInfo, RequestKind};
@@ -55,6 +56,24 @@ struct Conn {
     /// Requests and frames may go out (false while waiting for the auth acknowledgement).
     authed: bool,
     auth_deadline: Option<Duration>,
+    /// The version of the credentials the last handshake / authentication message used (`None`:
+    /// no credentials were applied).
+    cred_version: Option<u64>,
+    /// The one refresh after a refusal is used up (reset once a connection stays up for the
+    /// reconnect policy's `stable_after`).
+    refreshed: bool,
+    /// Waiting for refreshed credentials (`WsState::WaitingForCredentials`).
+    refresh_wait: Option<RefreshWait>,
+}
+
+/// A connection whose credentials were refused, waiting for new ones.
+struct RefreshWait {
+    /// The credentials version that was refused.
+    version: u64,
+    deadline: Duration,
+    timeout: Duration,
+    /// The server's refusal (the error of the final `Disconnected` if no refresh comes).
+    error: BackendError,
 }
 
 impl Conn {
@@ -76,6 +95,9 @@ pub(crate) struct WsRuntime {
     links: HashMap<WsLinkId, WsName>,
     ready: Vec<Answer>,
     changes: Vec<WsStateChanged>,
+    /// The credentials version a `WsCredentialsRefused` was written for (one message per version).
+    refresh_asked: Option<u64>,
+    refused: Vec<WsCredentialsRefused>,
     epoch: Instant,
     rng: u64,
 }
@@ -83,7 +105,16 @@ pub(crate) struct WsRuntime {
 impl Default for WsRuntime {
     fn default() -> Self {
         let seed = RandomState::new().hash_one(Instant::now());
-        Self { conns: HashMap::new(), links: HashMap::new(), ready: Vec::new(), changes: Vec::new(), epoch: Instant::now(), rng: seed | 1 }
+        Self {
+            conns: HashMap::new(),
+            links: HashMap::new(),
+            ready: Vec::new(),
+            changes: Vec::new(),
+            refresh_asked: None,
+            refused: Vec::new(),
+            epoch: Instant::now(),
+            rng: seed | 1,
+        }
     }
 }
 
@@ -179,7 +210,7 @@ fn prepare_handshake(settings: &WsSettings, credentials: Option<&BackendCredenti
         Uri::try_from(url.as_str()).map_err(|e| BackendError::InvalidRequest(format!("bad WebSocket URL after credentials ({e})")))?
     };
     check_scheme(&uri, settings.allow_insecure)?;
-    let (_, headers, _, _, _) = request.into_parts();
+    let headers = request.into_parts().headers;
     Ok(WsHandshake {
         uri,
         headers,
@@ -261,6 +292,8 @@ fn on_open(
     conn.authed = true;
     conn.auth_deadline = None;
     if let Some(auth) = auth {
+        // The credentials this authentication message came from (a refusal refers to them).
+        conn.cred_version = credentials.map(BackendCredentials::version);
         transport.get_mut().send(link, WsFrame::Text(auth));
         if let Some(ack) = conn.settings.auth_ack {
             conn.authed = false;
@@ -297,16 +330,40 @@ fn link_lost(
     now: Duration,
     random: u64,
 ) {
+    let reason = drop_link(conn, name, &error, ready);
+    let next_attempt = conn.attempt.saturating_add(1);
+    if retry_allowed && !conn.no_retry && conn.settings.reconnect.may_retry(next_attempt) {
+        conn.attempt = next_attempt;
+        let mut delay = conn.settings.reconnect.delay(next_attempt, random);
+        // A busy server (handshake 429 / 503) may say how long to wait: at least that long.
+        if matches!(error.status().map(|s| s.as_u16()), Some(429 | 503)) {
+            if let Some(wait) = error.retry_after() {
+                delay = delay.max(wait);
+            }
+        }
+        conn.retry_at = Some(now.saturating_add(delay));
+        tracing::info!(">>> NET-BACKEND: ws `{name}`: {reason}; reconnect attempt {next_attempt} in {delay:?}");
+        set_state(changes, name, conn, WsState::Reconnecting { attempt: next_attempt, retry_in: delay }, Some(error));
+    } else {
+        conn.retry_at = None;
+        tracing::warn!(">>> NET-BACKEND: ws `{name}`: {reason}; not reconnecting");
+        fail_all(conn, name, &reason, ready);
+        set_state(changes, name, conn, WsState::Disconnected, Some(error));
+    }
+}
+
+/// The link is gone: forget it and answer the requests sent on it (they may have reached the
+/// server), unless marked resend (bounded). Requests not sent yet keep waiting. Returns the
+/// reason text.
+fn drop_link(conn: &mut Conn, name: &WsName, error: &BackendError, ready: &mut Vec<Answer>) -> String {
     conn.link = None;
     conn.connected_at = None;
     conn.authed = false;
     conn.auth_deadline = None;
-    let reason = match &error {
+    let reason = match error {
         BackendError::Disconnected { reason, .. } => reason.clone(),
         other => other.to_string(),
     };
-    // Requests sent on this link: answered (they may have reached the server), unless marked
-    // resend (bounded). Requests not sent yet keep waiting.
     let mut kept = 0;
     let mut remaining = Vec::with_capacity(conn.requests.len());
     for mut request in conn.requests.drain(..) {
@@ -322,18 +379,85 @@ fn link_lost(
         }
     }
     conn.requests = remaining;
-    let next_attempt = conn.attempt.saturating_add(1);
-    if retry_allowed && !conn.no_retry && conn.settings.reconnect.may_retry(next_attempt) {
-        conn.attempt = next_attempt;
-        let delay = conn.settings.reconnect.delay(next_attempt, random);
-        conn.retry_at = Some(now.saturating_add(delay));
-        tracing::info!(">>> NET-BACKEND: ws `{name}`: {reason}; reconnect attempt {next_attempt} in {delay:?}");
-        set_state(changes, name, conn, WsState::Reconnecting { attempt: next_attempt, retry_in: delay }, Some(error));
+    reason
+}
+
+/// Whether a refusal of `conn`'s credentials starts a refresh: opted in, credentials were
+/// applied, and the one refresh is not used up.
+fn may_refresh(conn: &Conn) -> bool {
+    conn.settings.refresh.is_some() && conn.settings.credentials && conn.cred_version.is_some() && !conn.refreshed
+}
+
+/// The server refused the credentials of `conn` (refresh enabled): the link is gone; wait for new
+/// credentials. ONE `WsCredentialsRefused` per refused credentials version, and none when the
+/// credentials already changed since (the game refreshed meanwhile: `ws_send` connects again at
+/// once).
+#[allow(clippy::too_many_arguments)]
+fn wait_for_credentials(
+    changes: &mut Vec<WsStateChanged>,
+    ready: &mut Vec<Answer>,
+    asked: &mut Option<u64>,
+    refused: &mut Vec<WsCredentialsRefused>,
+    name: &WsName,
+    conn: &mut Conn,
+    error: BackendError,
+    now: Duration,
+    current: Option<u64>,
+) {
+    drop_link(conn, name, &error, ready);
+    conn.retry_at = None;
+    conn.refreshed = true;
+    let version = conn.cred_version.unwrap_or_default();
+    let timeout = conn.settings.refresh.as_ref().map_or(Duration::from_secs(30), |r| r.timeout);
+    conn.refresh_wait = Some(RefreshWait { version, deadline: now.saturating_add(timeout), timeout, error: error.clone() });
+    if current != Some(version) {
+        tracing::info!(">>> NET-BACKEND: ws `{name}`: the server refused the credentials; they changed meanwhile, connecting again with the new ones");
+    } else if *asked == Some(version) {
+        tracing::info!(">>> NET-BACKEND: ws `{name}`: the server refused the credentials; waiting for the refresh already asked for");
     } else {
-        conn.retry_at = None;
-        tracing::warn!(">>> NET-BACKEND: ws `{name}`: {reason}; not reconnecting");
-        fail_all(conn, name, &reason, ready);
-        set_state(changes, name, conn, WsState::Disconnected, Some(error));
+        *asked = Some(version);
+        tracing::info!(">>> NET-BACKEND: ws `{name}`: the server refused the credentials; asking the game to refresh them (waiting up to {timeout:?})");
+        refused.push(WsCredentialsRefused { name: name.clone(), error: error.clone() });
+    }
+    set_state(changes, name, conn, WsState::WaitingForCredentials, Some(error));
+}
+
+/// Single flight covers only connections still waiting: once none waits for the refused version
+/// (refreshed, ended, disconnected), a later refusal of the same credentials asks the game again.
+fn release_refresh_ask(runtime: &mut WsRuntime) {
+    if let Some(version) = runtime.refresh_asked {
+        if !runtime.conns.values().any(|c| c.refresh_wait.as_ref().is_some_and(|w| w.version == version)) {
+            runtime.refresh_asked = None;
+        }
+    }
+}
+
+/// In `ws_send`: a connection waiting for credentials connects again once they changed (ONE new
+/// connection, outside the backoff policy), or ends when they were cleared or the wait timed out.
+fn check_refresh_waits(runtime: &mut WsRuntime, current: Option<(u64, bool)>, now: Duration) {
+    let waiting: Vec<WsName> = runtime.conns.iter().filter(|(_, c)| c.refresh_wait.is_some()).map(|(n, _)| n.clone()).collect();
+    for name in waiting {
+        let Some(conn) = runtime.conns.get_mut(&name) else { continue };
+        let Some(wait) = conn.refresh_wait.as_ref() else { continue };
+        let end = match current {
+            Some((version, true)) if version != wait.version => None,
+            Some((version, false)) if version != wait.version => Some("the credentials were cleared instead of refreshed".to_string()),
+            None => Some("the credentials were removed instead of refreshed".to_string()),
+            _ if wait.deadline <= now => Some(format!("no refreshed credentials arrived within {:?}", wait.timeout)),
+            _ => continue,
+        };
+        let Some(wait) = conn.refresh_wait.take() else { continue };
+        match end {
+            None => {
+                tracing::info!(">>> NET-BACKEND: ws `{name}`: new credentials; connecting again");
+                conn.retry_at = Some(now);
+            }
+            Some(why) => {
+                tracing::warn!(">>> NET-BACKEND: ws `{name}`: the server refused the credentials and {why}; not reconnecting");
+                fail_all(conn, &name, &format!("the server refused the credentials and {why}"), &mut runtime.ready);
+                set_state(&mut runtime.changes, &name, conn, WsState::Disconnected, Some(wait.error));
+            }
+        }
     }
 }
 
@@ -427,6 +551,9 @@ pub(crate) fn ws_send(
                     no_retry: false,
                     authed: false,
                     auth_deadline: None,
+                    cred_version: None,
+                    refreshed: false,
+                    refresh_wait: None,
                 };
                 runtime.conns.insert(name, conn);
             }
@@ -440,6 +567,7 @@ pub(crate) fn ws_send(
                     }
                     conn.retry_at = None;
                     conn.connected_at = None;
+                    conn.refresh_wait = None;
                     fail_all(conn, &name, "disconnected by the game", &mut runtime.ready);
                     set_state(&mut runtime.changes, &name, conn, WsState::Disconnected, None);
                 }
@@ -505,6 +633,8 @@ pub(crate) fn ws_send(
             }
         }
     }
+    check_refresh_waits(runtime, credentials.as_deref().map(|c| (c.version(), c.is_set())), now);
+    release_refresh_ask(runtime);
     // Due (re)connect attempts, with the credentials as they are now.
     let due: Vec<WsName> = runtime.conns.iter().filter(|(_, c)| c.link.is_none() && c.retry_at.is_some_and(|at| at <= now)).map(|(n, _)| n.clone()).collect();
     for name in due {
@@ -521,6 +651,9 @@ pub(crate) fn ws_send(
                 set_state(&mut runtime.changes, &name, conn, WsState::Disconnected, Some(BackendError::NoTransport));
             }
             (Ok(handshake), Some(transport)) => {
+                // The credentials this handshake carries (a refusal refers to them).
+                conn.cred_version =
+                    if conn.settings.credentials { credentials.as_deref().filter(|c| c.is_set()).map(BackendCredentials::version) } else { None };
                 let link = WsLinkId::next();
                 tracing::debug!(">>> NET-BACKEND: ws `{name}`: {link} connecting");
                 conn.link = Some(link);
@@ -547,11 +680,13 @@ pub(crate) fn ws_receive(
     credentials: Option<Res<BackendCredentials>>,
     time: Option<Res<Time<Real>>>,
     mut states: MessageWriter<WsStateChanged>,
+    mut refused: MessageWriter<WsCredentialsRefused>,
     mut frames: MessageWriter<WsMessage>,
     mut raw: MessageWriter<WsRawResponse>,
     mut commands: Commands,
 ) {
     let now = runtime.now(time.as_deref());
+    let current = credentials.as_deref().map(BackendCredentials::version);
     let generation = transport.as_ref().map(|t| t.generation());
     let events = transport.as_mut().map(|t| t.get_mut().poll()).unwrap_or_default();
     let runtime = &mut *runtime;
@@ -604,14 +739,28 @@ pub(crate) fn ws_receive(
                             }
                         }
                         WsIncoming::AuthFailed(_) => {
-                            conn.no_retry = true;
                             if let Some(transport) = transport.as_mut() {
                                 transport.get_mut().close(link, 1008);
                             }
                             runtime.links.remove(&link);
                             let error = BackendError::disconnected("the server refused the authentication message", None);
-                            let random = runtime.rng;
-                            link_lost(&mut runtime.changes, &mut runtime.ready, &name, conn, error, false, now, random);
+                            if may_refresh(conn) {
+                                wait_for_credentials(
+                                    &mut runtime.changes,
+                                    &mut runtime.ready,
+                                    &mut runtime.refresh_asked,
+                                    &mut runtime.refused,
+                                    &name,
+                                    conn,
+                                    error,
+                                    now,
+                                    current,
+                                );
+                            } else {
+                                conn.no_retry = true;
+                                let random = runtime.rng;
+                                link_lost(&mut runtime.changes, &mut runtime.ready, &name, conn, error, false, now, random);
+                            }
                         }
                         WsIncoming::Ignore => {}
                     }
@@ -621,23 +770,53 @@ pub(crate) fn ws_receive(
             WsLinkEvent::Closed { code, reason } => {
                 runtime.links.remove(&link);
                 let retry = code.is_none_or(|code| conn.settings.protocol.as_ref().is_none_or(|p| p.retry_after_close(code)));
+                let refresh_code = code.is_some_and(|code| conn.settings.refresh.as_ref().is_some_and(|r| r.close_codes.contains(&code)));
                 let error = match code {
                     Some(code) => BackendError::Closed { code, reason },
                     None => BackendError::disconnected("the connection closed", None),
                 };
-                let random = runtime.rng;
-                link_lost(&mut runtime.changes, &mut runtime.ready, &name, conn, error, retry, now, random);
+                if refresh_code && may_refresh(conn) {
+                    wait_for_credentials(
+                        &mut runtime.changes,
+                        &mut runtime.ready,
+                        &mut runtime.refresh_asked,
+                        &mut runtime.refused,
+                        &name,
+                        conn,
+                        error,
+                        now,
+                        current,
+                    );
+                } else {
+                    let random = runtime.rng;
+                    link_lost(&mut runtime.changes, &mut runtime.ready, &name, conn, error, retry, now, random);
+                }
                 runtime.random();
             }
             WsLinkEvent::Failed(error) => {
                 runtime.links.remove(&link);
                 // Permanent: 401 / 403, invalid settings, and TLS (certificate) errors unless the
                 // game opted in with `WsReconnect::with_tls_retry(true)`.
-                let refused = matches!(error.status().map(|s| s.as_u16()), Some(401 | 403))
+                let unauthorized = error.status().is_some_and(|s| s.as_u16() == 401);
+                let permanent = matches!(error.status().map(|s| s.as_u16()), Some(401 | 403))
                     || error.is_invalid_request()
                     || (matches!(error, BackendError::Tls(_)) && !conn.settings.reconnect.retry_tls);
-                let random = runtime.rng;
-                link_lost(&mut runtime.changes, &mut runtime.ready, &name, conn, error, !refused, now, random);
+                if unauthorized && may_refresh(conn) {
+                    wait_for_credentials(
+                        &mut runtime.changes,
+                        &mut runtime.ready,
+                        &mut runtime.refresh_asked,
+                        &mut runtime.refused,
+                        &name,
+                        conn,
+                        error,
+                        now,
+                        current,
+                    );
+                } else {
+                    let random = runtime.rng;
+                    link_lost(&mut runtime.changes, &mut runtime.ready, &name, conn, error, !permanent, now, random);
+                }
                 runtime.random();
             }
         }
@@ -689,6 +868,7 @@ pub(crate) fn ws_receive(
     for (name, conn) in &mut runtime.conns {
         if conn.connected_at.is_some_and(|at| now.saturating_sub(at) >= conn.settings.reconnect.stable_after) {
             conn.attempt = 0;
+            conn.refreshed = false;
         }
         let mut index = 0;
         while index < conn.requests.len() {
@@ -700,6 +880,8 @@ pub(crate) fn ws_receive(
                     format!("sent before the connection was lost, no answer within {:?}", request.timeout)
                 } else if conn.state == WsState::Connected && !conn.authed {
                     format!("not sent: the authentication was not acknowledged within {:?}", request.timeout)
+                } else if conn.state == WsState::WaitingForCredentials {
+                    format!("not sent: the connection was still waiting for refreshed credentials after {:?}", request.timeout)
                 } else {
                     format!("not sent: the connection did not open within {:?}", request.timeout)
                 };
@@ -713,6 +895,9 @@ pub(crate) fn ws_receive(
     runtime.publish(&mut inflight);
     for change in std::mem::take(&mut runtime.changes) {
         states.write(change);
+    }
+    for message in std::mem::take(&mut runtime.refused) {
+        refused.write(message);
     }
     deliver(std::mem::take(&mut runtime.ready), &mut raw, &mut commands);
 }
@@ -758,9 +943,11 @@ pub(crate) fn ws_exit(
         conn.outbox.clear();
         conn.retry_at = None;
         conn.auth_deadline = None;
+        conn.refresh_wait = None;
         set_state(&mut runtime.changes, name, conn, WsState::Disconnected, None);
     }
     runtime.links.clear();
+    runtime.refresh_asked = None;
     if let Some(transport) = transport.as_mut() {
         transport.get_mut().shutdown();
     }

@@ -14,11 +14,43 @@ use crate::request::OutgoingRequest;
 /// crate's logs: both print `<redacted>`. Read it with [`expose`](Self::expose) where it is really
 /// needed.
 ///
-/// It is a plain `String` inside: no comparison (compare `expose()` yourself if you must) and no
-/// zeroing of memory on drop. At `trace` level the HTTP client's own logging (ureq / ureq_proto)
-/// writes raw request bytes, secrets included: keep those targets below `trace`.
+/// When a `Secret` is dropped, its memory (the whole allocation) is overwritten with zeros first
+/// (the `zeroize` crate). Each clone is its own copy and is wiped when it is dropped. The crate also
+/// wipes its temporary `Bearer …` header text and the SSH key file text it reads. Not wiped: the
+/// copies that become part of a request (an `ApiKeyHeader` / `BearerToken` header value, the query
+/// value of `ApiKeyQuery` and the URL built from it, the body `JsonBodyField` writes,
+/// keyboard-interactive answers and passwords handed to russh, the first-message authentication
+/// frame), a `String` you built the secret from, and what the HTTP, WebSocket and SSH libraries
+/// copy while sending.
+/// There is no comparison (compare `expose()` yourself if you must). At `trace` level the HTTP
+/// client's own logging (ureq / ureq_proto) writes raw request bytes, secrets included: keep those
+/// targets below `trace`.
 #[derive(Clone, Default)]
 pub struct Secret(String);
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
+impl Secret {
+    /// Overwrite the whole allocation (spare capacity included) with zeros and empty it; the
+    /// allocation itself is kept until the `String` is dropped.
+    pub(crate) fn wipe(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+
+    /// The bytes of the allocation after the text (for the wipe test).
+    #[cfg(test)]
+    pub(crate) fn allocation(&mut self) -> (usize, usize, bool) {
+        // SAFETY: only reads; the spare capacity was written by `wipe` (zeroize writes every byte
+        // of it), so reading it as initialized bytes is sound.
+        let vec = unsafe { self.0.as_mut_vec() };
+        let zeroed = vec.spare_capacity_mut().iter().all(|b| unsafe { b.assume_init() } == 0);
+        (vec.len(), vec.capacity(), zeroed)
+    }
+}
 
 impl Secret {
     /// Wrap a secret.
@@ -94,8 +126,8 @@ impl fmt::Display for Secret {
 /// `ureq_proto` log targets below `trace`, see the README.) A request
 /// made with [`OutgoingRequest::without_credentials`] is not passed to it.
 ///
-/// **Compatibility promise:** methods added to this trait in later versions always come with a
-/// default implementation, so an implementation written today keeps compiling.
+/// **Compatibility rule:** methods are only ever added to this trait with a default
+/// implementation, so an implementation written today keeps compiling.
 pub trait Credentials: Send + Sync + 'static {
     /// Edit the request: add a header, a query parameter or a body field. Look at
     /// [`OutgoingRequest::purpose`] if a kind of request needs different handling.
@@ -117,6 +149,16 @@ pub trait Credentials: Send + Sync + 'static {
 #[derive(Resource, Default, Clone)]
 pub struct BackendCredentials {
     inner: Option<Arc<dyn Credentials>>,
+    /// Changes with every `new`, `set` and `clear` (process-wide counter; a clone keeps it), so the
+    /// WebSocket side can tell whether the credentials changed since a handshake used them.
+    version: u64,
+}
+
+/// Versions of [`BackendCredentials`]: 0 is the empty default, every change takes the next one.
+static NEXT_CREDENTIALS_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_version() -> u64 {
+    NEXT_CREDENTIALS_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl fmt::Debug for BackendCredentials {
@@ -128,22 +170,33 @@ impl fmt::Debug for BackendCredentials {
 impl BackendCredentials {
     /// Credentials set to `credentials`.
     pub fn new(credentials: impl Credentials) -> Self {
-        Self { inner: Some(Arc::new(credentials)) }
+        Self { inner: Some(Arc::new(credentials)), version: next_version() }
     }
 
-    /// Use these credentials from now on (requests already sent keep what they had).
+    /// Use these credentials from now on (requests already sent keep what they had). A WebSocket
+    /// connection waiting for refreshed credentials (`WsState::WaitingForCredentials`, feature
+    /// `ws`) connects again with them.
     pub fn set(&mut self, credentials: impl Credentials) {
         self.inner = Some(Arc::new(credentials));
+        self.version = next_version();
     }
 
-    /// Stop sending credentials (logout).
+    /// Stop sending credentials (logout). A WebSocket connection waiting for refreshed
+    /// credentials (feature `ws`) goes `Disconnected`.
     pub fn clear(&mut self) {
         self.inner = None;
+        self.version = next_version();
     }
 
     /// Whether credentials are set.
     pub fn is_set(&self) -> bool {
         self.inner.is_some()
+    }
+
+    /// The version of the credentials: it changes with every `new`, `set` and `clear`.
+    #[cfg_attr(not(feature = "ws"), allow(dead_code))]
+    pub(crate) fn version(&self) -> u64 {
+        self.version
     }
 
     pub(crate) fn apply(&self, request: &mut OutgoingRequest) {
@@ -177,7 +230,13 @@ impl BearerToken {
 
 impl Credentials for BearerToken {
     fn apply(&self, request: &mut OutgoingRequest) {
-        match sensitive_value(&format!("Bearer {}", self.0.expose())) {
+        // The temporary text with the token is wiped when it is dropped (sized up front, so no
+        // reallocation leaves an unwiped copy behind).
+        let token = self.0.expose();
+        let mut text = zeroize::Zeroizing::new(String::with_capacity(token.len().saturating_add(7)));
+        text.push_str("Bearer ");
+        text.push_str(token);
+        match sensitive_value(&text) {
             Some(value) => {
                 request.headers_mut().insert(AUTHORIZATION, value);
             }

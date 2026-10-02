@@ -5,9 +5,11 @@
 //! "File uploads" section.
 
 use std::fmt;
+use std::path::PathBuf;
 
 use http::header::HeaderValue;
 
+use crate::body::{Segment, StreamingBody};
 use crate::response::BackendError;
 
 /// Default limit of one encoded form (the whole request body): 32 MiB.
@@ -26,7 +28,31 @@ struct Part {
     /// `Some` for a file part (may be empty; see [`Multipart::file`]).
     filename: Option<String>,
     content_type: Option<String>,
-    data: Vec<u8>,
+    data: Data,
+}
+
+/// A part's content: in memory, or a local file read while the request is sent.
+#[derive(Clone)]
+enum Data {
+    Bytes(Vec<u8>),
+    File(PathBuf),
+}
+
+impl Data {
+    /// The bytes in memory (none for a file read later).
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Data::Bytes(bytes) => bytes,
+            Data::File(_) => &[],
+        }
+    }
+}
+
+/// An encoded form: the whole body in memory, or (with file parts read from disk) a body that is
+/// read while it is sent.
+pub(crate) enum Encoded {
+    Memory { content_type: String, body: Vec<u8> },
+    Stream { content_type: String, body: StreamingBody },
 }
 
 /// A `multipart/form-data` form: text fields and files, in order. Build it, then send it with
@@ -45,18 +71,29 @@ struct Part {
 /// assert_eq!(form.len(), 4);
 /// ```
 ///
-/// Bytes only: read a file yourself (e.g. in an async task or at load time), then pass the bytes.
-/// Encoding copies the bytes once and scans them for the boundary, on the thread that sends the
-/// request (usually the main thread; measured about 4 ms per 10 MiB in a release build on a desktop PC).
-/// Memory: while a request is being sent, the form and its encoded body both exist, so the peak
-/// is about twice the form (three times if you also keep your own copy of the bytes).
+/// Two ways to add a file:
+/// - [`file`](Self::file) takes the bytes. Encoding copies them once and scans them for the
+///   boundary, on the thread that sends the request (usually the main thread; measured about 4 ms
+///   per 10 MiB in a release build on a desktop PC). Memory: while the request is being sent, the
+///   form and its encoded body both exist, so the peak is about twice the form.
+/// - [`file_from_path`](Self::file_from_path) takes a path. The file is opened, measured and read
+///   on the HTTP worker thread while the request is sent, in small pieces: it is never loaded
+///   into memory as a whole and the main thread does no file I/O. A form with such a part is sent
+///   with its exact `Content-Length`.
+///
+/// A non-file part with its own content type: [`part`](Self::part), or `json` (feature `json`)
+/// for a JSON value (`Content-Type: application/json`, the way Spring's `@RequestPart` reads it).
+///
+/// Upload progress: a request with a form reports [`HttpProgress`](crate::HttpProgress) messages
+/// (see [`OutgoingRequest::with_upload_progress`](crate::OutgoingRequest::with_upload_progress)).
 ///
 /// Invalid input never panics: the request is answered with an error and never sent
 /// (`InvalidRequest`: an empty field name, a name or file name that ends with a backslash or
 /// contains a control character other than CR / LF, a content type that is not a valid header
-/// value, more parts than [`with_max_parts`](Self::with_max_parts); `RequestTooLarge`: a body over
-/// [`with_max_bytes`](Self::with_max_bytes)). `Debug` shows field names and sizes, never values
-/// or file contents.
+/// value, more parts than [`with_max_parts`](Self::with_max_parts), a file from
+/// [`file_from_path`](Self::file_from_path) that cannot be opened; `RequestTooLarge`: a body over
+/// [`with_max_bytes`](Self::with_max_bytes); `Encode`: a `json` value that cannot be serialized).
+/// `Debug` shows field names and sizes, never values, file names, paths or file contents.
 #[derive(Clone)]
 pub struct Multipart {
     parts: Vec<Part>,
@@ -73,7 +110,12 @@ impl Default for Multipart {
 
 impl fmt::Debug for Multipart {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let parts: Vec<(&str, bool, usize)> = self.parts.iter().map(|p| (p.name.as_str(), p.filename.is_some(), p.data.len())).collect();
+        // In-memory bytes as a size; a file read from disk as `None`.
+        let size = |data: &Data| match data {
+            Data::Bytes(bytes) => Some(bytes.len()),
+            Data::File(_) => None,
+        };
+        let parts: Vec<(&str, bool, Option<usize>)> = self.parts.iter().map(|p| (p.name.as_str(), p.filename.is_some(), size(&p.data))).collect();
         f.debug_struct("Multipart").field("parts_name_isfile_bytes", &parts).field("max_bytes", &self.max_bytes).field("max_parts", &self.max_parts).finish()
     }
 }
@@ -109,7 +151,7 @@ impl Multipart {
     pub fn text(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         let name = name.into();
         if self.check_name(&name) {
-            self.parts.push(Part { name, filename: None, content_type: None, data: value.into().into_bytes() });
+            self.parts.push(Part { name, filename: None, content_type: None, data: Data::Bytes(value.into().into_bytes()) });
         }
         self
     }
@@ -122,31 +164,88 @@ impl Multipart {
     /// ends with `\` is refused (`InvalidRequest`): every tested server loses such a part. An
     /// empty file name is sent as `filename=""`, but several servers (multer, Go, Django) then
     /// treat the part as a text field.
-    pub fn file(mut self, name: impl Into<String>, filename: impl Into<String>, content_type: impl Into<String>, data: impl Into<Vec<u8>>) -> Self {
-        let name = name.into();
+    pub fn file(self, name: impl Into<String>, filename: impl Into<String>, content_type: impl Into<String>, data: impl Into<Vec<u8>>) -> Self {
+        self.file_part(name.into(), filename.into(), content_type.into(), Data::Bytes(data.into()))
+    }
+
+    /// A file field read from the local file `path` while the request is sent (see
+    /// [`file`](Self::file) for `filename` and `content_type`; the path itself is never sent).
+    /// The file is opened on the HTTP worker thread when the request goes out and streamed in
+    /// small pieces; its size counts against [`with_max_bytes`](Self::with_max_bytes) then. A file
+    /// that cannot be opened answers the request `InvalidRequest` and nothing is sent; a file that
+    /// changes size while it is sent cuts the request off with an error.
+    ///
+    /// The file's bytes are not scanned for the boundary (128 random bits, like a browser's
+    /// boundary). It needs a transport that streams bodies (the built-in one does).
+    pub fn file_from_path(self, name: impl Into<String>, filename: impl Into<String>, content_type: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+        self.file_part(name.into(), filename.into(), content_type.into(), Data::File(path.into()))
+    }
+
+    fn file_part(mut self, name: String, filename: String, content_type: String, data: Data) -> Self {
         if !self.check_name(&name) {
             return self;
         }
-        let filename = filename.into();
         if let Some(why) = unsafe_name(&filename) {
             self.fail(format!("the file name of multipart field `{name}` {why}"));
             return self;
         }
-        let mut content_type = content_type.into();
-        if content_type.is_empty() {
-            content_type = "application/octet-stream".into();
-        }
-        if HeaderValue::try_from(content_type.as_str()).is_err() || content_type.contains(['\r', '\n']) {
-            self.fail(format!("the content type of multipart field `{name}` is not a valid header value"));
+        let content_type = if content_type.is_empty() { "application/octet-stream".to_string() } else { content_type };
+        if !self.check_content_type(&name, &content_type) {
             return self;
         }
-        self.parts.push(Part { name, filename: Some(filename), content_type: Some(content_type), data: data.into() });
+        self.parts.push(Part { name, filename: Some(filename), content_type: Some(content_type), data });
         self
+    }
+
+    /// A non-file field with its own `Content-Type` (no file name), for servers that read a part
+    /// by its type, such as Spring's `@RequestPart`. An empty content type sends none (like
+    /// [`text`](Self::text), with any bytes). Frameworks that read forms by name treat a part
+    /// without a file name as a text field and give you its value as text.
+    pub fn part(mut self, name: impl Into<String>, content_type: impl Into<String>, data: impl Into<Vec<u8>>) -> Self {
+        let name = name.into();
+        if !self.check_name(&name) {
+            return self;
+        }
+        let content_type = content_type.into();
+        if !content_type.is_empty() && !self.check_content_type(&name, &content_type) {
+            return self;
+        }
+        let content_type = (!content_type.is_empty()).then_some(content_type);
+        self.parts.push(Part { name, filename: None, content_type, data: Data::Bytes(data.into()) });
+        self
+    }
+
+    /// A JSON field (feature `json`): `value` serialized, with `Content-Type: application/json`
+    /// and no file name (see [`part`](Self::part)). A value that cannot be serialized answers the
+    /// request `Encode` and nothing is sent.
+    #[cfg(feature = "json")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
+    pub fn json<T: serde::Serialize + ?Sized>(mut self, name: impl Into<String>, value: &T) -> Self {
+        match serde_json::to_vec(value) {
+            Ok(bytes) => self.part(name, "application/json", bytes),
+            Err(e) => {
+                if self.error.is_none() {
+                    self.error = Some(BackendError::Encode(e.to_string()));
+                }
+                self
+            }
+        }
+    }
+
+    fn check_content_type(&mut self, name: &str, content_type: &str) -> bool {
+        if HeaderValue::try_from(content_type).is_err() || content_type.contains(['\r', '\n']) {
+            self.fail(format!("the content type of multipart field `{name}` is not a valid header value"));
+            return false;
+        }
+        true
     }
 
     /// The largest encoded form (the whole request body, part headers and boundaries included)
     /// that may be sent (default 32 MiB, at least 1 KiB): with the default, a single file of
-    /// exactly 32 MiB is just over it. A bigger form is answered `RequestTooLarge` and never sent.
+    /// exactly 32 MiB is just over it. A bigger form is answered `RequestTooLarge` and never sent
+    /// (with [`file_from_path`](Self::file_from_path) parts it is checked when the files are
+    /// opened, still before anything is sent). Raise it for big files read from disk: they are
+    /// not held in memory.
     /// Check the server's own limits too (PHP `upload_max_filesize` / `post_max_size`, nginx
     /// `client_max_body_size`, …): not every server answers `413` over them (the README lists
     /// what real servers do).
@@ -171,21 +270,58 @@ impl Multipart {
         self.parts.is_empty()
     }
 
-    /// The encoded size in bytes (the request body), whatever boundary is chosen.
+    /// The encoded size in bytes (the request body), whatever boundary is chosen. Files added
+    /// with [`file_from_path`](Self::file_from_path) count with 0 bytes here (they are measured
+    /// when the request is sent).
     pub fn encoded_len(&self) -> u64 {
         encoded_len(&self.parts, BOUNDARY_LEN)
     }
 
-    /// Encode with a fresh random boundary: `(content type header value, body)`.
-    pub(crate) fn encode(&self) -> Result<(String, Vec<u8>), BackendError> {
+    /// Whether a part is a file read from disk (the body is then streamed).
+    fn has_files(&self) -> bool {
+        self.parts.iter().any(|p| matches!(p.data, Data::File(_)))
+    }
+
+    /// Encode with a fresh random boundary.
+    pub(crate) fn encode(&self) -> Result<Encoded, BackendError> {
         self.check()?;
         for _ in 0..BOUNDARY_TRIES {
             let boundary = random_boundary()?;
-            if !self.parts.iter().any(|p| contains(&p.data, boundary.as_bytes()) || part_head(p).contains(&boundary)) {
-                return Ok(self.encode_with(&boundary));
+            if !self.parts.iter().any(|p| contains(p.data.bytes(), boundary.as_bytes()) || part_head(p).contains(&boundary)) {
+                let content_type = format!("multipart/form-data; boundary={boundary}");
+                return Ok(if self.has_files() {
+                    Encoded::Stream { content_type, body: StreamingBody::new(self.segments_with(&boundary), self.max_bytes) }
+                } else {
+                    Encoded::Memory { content_type, body: self.encode_with(&boundary).1 }
+                });
             }
         }
         Err(BackendError::InvalidRequest("could not find a multipart boundary that does not occur in the content".into()))
+    }
+
+    /// The body as pieces: bytes in memory (merged) and the files read while sending.
+    pub(crate) fn segments_with(&self, boundary: &str) -> Vec<Segment> {
+        let mut segments = Vec::new();
+        let mut bytes = Vec::new();
+        for part in &self.parts {
+            bytes.extend_from_slice(b"--");
+            bytes.extend_from_slice(boundary.as_bytes());
+            bytes.extend_from_slice(b"\r\n");
+            bytes.extend_from_slice(part_head(part).as_bytes());
+            match &part.data {
+                Data::Bytes(data) => bytes.extend_from_slice(data),
+                Data::File(path) => {
+                    segments.push(Segment::Bytes(std::mem::take(&mut bytes)));
+                    segments.push(Segment::File { path: path.clone(), field: part.name.clone() });
+                }
+            }
+            bytes.extend_from_slice(b"\r\n");
+        }
+        bytes.extend_from_slice(b"--");
+        bytes.extend_from_slice(boundary.as_bytes());
+        bytes.extend_from_slice(b"--\r\n");
+        segments.push(Segment::Bytes(bytes));
+        segments
     }
 
     fn check(&self) -> Result<(), BackendError> {
@@ -211,7 +347,7 @@ impl Multipart {
             body.extend_from_slice(boundary.as_bytes());
             body.extend_from_slice(b"\r\n");
             body.extend_from_slice(part_head(part).as_bytes());
-            body.extend_from_slice(&part.data);
+            body.extend_from_slice(part.data.bytes());
             body.extend_from_slice(b"\r\n");
         }
         body.extend_from_slice(b"--");
@@ -286,7 +422,7 @@ fn encoded_len(parts: &[Part], boundary_len: usize) -> u64 {
     for part in parts {
         add(&mut total, 2 + boundary_len + 2);
         add(&mut total, part_head(part).len());
-        add(&mut total, part.data.len());
+        add(&mut total, part.data.bytes().len());
         add(&mut total, 2);
     }
     add(&mut total, 2 + boundary_len + 4);
@@ -318,8 +454,17 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{contains, escape, Multipart, BOUNDARY_LEN};
+    use super::{contains, escape, Encoded, Multipart, BOUNDARY_LEN};
     use crate::response::BackendError;
+
+    /// An in-memory form encoded with a random boundary: (content type, body).
+    fn memory(form: &Multipart) -> (String, Vec<u8>) {
+        match form.encode() {
+            Ok(Encoded::Memory { content_type, body }) => (content_type, body),
+            Ok(Encoded::Stream { .. }) => panic!("streamed"),
+            Err(e) => panic!("{e}"),
+        }
+    }
 
     #[test]
     fn golden_encoding_byte_for_byte() {
@@ -357,8 +502,8 @@ mod tests {
     #[test]
     fn the_random_boundary_is_fresh_valid_and_never_in_the_content() {
         let form = Multipart::new().text("a", "--bnb-").file("f", "x", "", b"--bnb-0000\r\n".to_vec());
-        let (ct1, body1) = form.encode().unwrap_or_else(|e| panic!("{e}"));
-        let (ct2, _) = form.encode().unwrap_or_else(|e| panic!("{e}"));
+        let (ct1, body1) = memory(&form);
+        let (ct2, _) = memory(&form);
         assert_ne!(ct1, ct2, "the boundary must be random per request");
         let boundary = ct1.strip_prefix("multipart/form-data; boundary=").unwrap_or_default();
         assert_eq!(boundary.len(), BOUNDARY_LEN);
@@ -382,7 +527,7 @@ mod tests {
     fn large_binary_and_empty_forms() {
         let data: Vec<u8> = (0..3_000_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
         let form = Multipart::new().file("blob", "blob.bin", "", data.clone());
-        let (_, body) = form.encode().unwrap_or_else(|e| panic!("{e}"));
+        let (_, body) = memory(&form);
         assert_eq!(u64::try_from(body.len()).unwrap_or(0), form.encoded_len());
         assert!(contains(&body, &data[1000..1100]));
         let (_, empty) = Multipart::new().encode_with("B");

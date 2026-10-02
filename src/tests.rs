@@ -240,6 +240,24 @@ fn json_body_field_only_touches_json_objects() {
 // --- Redaction ----------------------------------------------------------------------------------
 
 #[test]
+fn a_secret_overwrites_its_whole_allocation_with_zeros() {
+    let mut text = String::with_capacity(64);
+    text.push_str("fake-token-to-wipe");
+    let mut secret = Secret::from(text);
+    secret.wipe();
+    let (len, capacity, zeroed) = secret.allocation();
+    assert_eq!(len, 0);
+    assert!(capacity >= 64, "the allocation is kept until the drop: {capacity}");
+    assert!(zeroed, "every byte of the allocation is zero after the wipe");
+    assert_eq!(secret.expose(), "");
+    // Clones are separate copies: wiping one leaves the other intact.
+    let original = Secret::new("fake-token-2");
+    let mut copy = original.clone();
+    copy.wipe();
+    assert_eq!((original.expose(), copy.expose()), ("fake-token-2", ""));
+}
+
+#[test]
 fn secrets_never_show_in_debug_or_display() {
     let secret = Secret::new(SECRET);
     assert_eq!(format!("{secret}"), "<redacted>");
@@ -306,6 +324,28 @@ fn error_helpers() {
     assert!(BackendError::Encode("x".into()).is_invalid_request());
     assert!(!BackendError::Timeout("x".into()).is_invalid_request());
     assert_eq!(status.to_string(), "HTTP status 422 Unprocessable Entity");
+}
+
+#[test]
+fn retry_after_reads_the_header_of_a_status_answer() {
+    let busy = |value: &'static str| {
+        let response = RawResponse::new(StatusCode::TOO_MANY_REQUESTS, "").with_header(http::header::RETRY_AFTER, HeaderValue::from_static(value));
+        BackendError::Status(Box::new(response))
+    };
+    assert_eq!(busy("120").retry_after(), Some(Duration::from_secs(120)));
+    assert_eq!(busy(" 0 ").retry_after(), Some(Duration::ZERO));
+    assert_eq!(busy("99999999999").retry_after(), Some(MAX_TIMEOUT), "lowered to MAX_TIMEOUT");
+    assert_eq!(busy("Wed, 21 Oct 2015 07:28:00 GMT").retry_after(), None, "an HTTP-date is not read");
+    assert_eq!(busy("-5").retry_after(), None);
+    assert_eq!(busy("1.5").retry_after(), None);
+    assert_eq!(BackendError::Status(Box::new(RawResponse::new(StatusCode::SERVICE_UNAVAILABLE, ""))).retry_after(), None, "no header");
+    assert_eq!(BackendError::Network("refused".into()).retry_after(), None);
+    assert_eq!(BackendError::Closed { code: 1013, reason: "try again later".into() }.retry_after(), None);
+    let decode = BackendError::Decode {
+        message: "x".into(),
+        response: Box::new(RawResponse::new(StatusCode::OK, "").with_header(http::header::RETRY_AFTER, HeaderValue::from_static("3"))),
+    };
+    assert_eq!(decode.retry_after(), None, "only a Status answer");
 }
 
 #[cfg(feature = "json")]

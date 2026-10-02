@@ -34,7 +34,7 @@ pub enum WsIncoming {
 /// How requests and pushes are laid out in frames. Every frame also arrives raw as a
 /// [`WsMessage`](super::WsMessage), whatever the protocol does with it.
 ///
-/// **Compatibility promise:** methods added later always come with a default implementation.
+/// **Compatibility rule:** methods are only ever added to this trait with a default implementation.
 pub trait WsProtocol: Send + Sync + 'static {
     /// Encode a request. `wire_id` is unique per process and must come back in the answer.
     fn encode_request(&self, wire_id: u64, kind: &str, payload: &[u8]) -> Result<WsFrame, String>;

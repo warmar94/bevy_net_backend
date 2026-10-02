@@ -30,7 +30,8 @@
 //! Anything that is not an envelope request (plain text, binary) is echoed back as it came.
 //! Every `tick_ms` it pushes `{"type":"server.tick","data":{"n":…}}` (per connection:
 //! `?tick_ms=N` in the URL, at least 10, or 0 for none). A path ending in `/secure` requires
-//! `Authorization: Bearer mock-token-123` (else `401`).
+//! `Authorization: Bearer mock-token-123` (else `401`). A path ending in `/busy` refuses every
+//! handshake with `503` and `Retry-After: 2`.
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -147,6 +148,12 @@ fn serve(stream: TcpStream, stop: &AtomicBool, accepted: &AtomicUsize, default_t
             if let Some(ms) = query.split('&').filter_map(|p| p.split_once('=')).find(|(n, _)| *n == "tick_ms").and_then(|(_, v)| v.parse::<u64>().ok()) {
                 tick_ms = if ms == 0 { 0 } else { ms.max(10) };
             }
+        }
+        if request.uri().path().ends_with("/busy") {
+            let mut busy = ErrorResponse::new(None);
+            *busy.status_mut() = http::StatusCode::SERVICE_UNAVAILABLE;
+            busy.headers_mut().insert(http::header::RETRY_AFTER, http::HeaderValue::from_static("2"));
+            return Err(busy);
         }
         let authorized = request.headers().get("authorization").and_then(|v| v.to_str().ok()) == Some(format!("Bearer {TOKEN}").as_str());
         if request.uri().path().ends_with("/secure") && !authorized {

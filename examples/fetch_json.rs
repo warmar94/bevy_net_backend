@@ -62,7 +62,7 @@ fn main() -> AppExit {
         .run()
 }
 
-/// Fire the request; the id comes back at once, the answer a few frames later.
+/// Fire the request; the id comes back at once, the answer a few frames after that.
 fn ask(backend: Res<HttpClient>, mut commands: Commands) {
     let id = backend.get_json::<Character>("/characters/1");
     commands.insert_resource(Waiting(id));

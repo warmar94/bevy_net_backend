@@ -20,6 +20,8 @@ use tracing::{Event, Metadata, Subscriber};
 const SECRETS: [&str; 4] = ["fake-bearer-7f3a", "fake-header-9c2e", "fake-query-41bd", "fake-field-d00d"];
 #[cfg(feature = "ssh")]
 const SSH_SECRETS: [&str; 4] = ["fake-ssh-pass-5e1f", "fake-ssh-cmd-77aa", "fake-ssh-stdin-9b9b", "fake-ssh-wrong-0a0a"];
+#[cfg(feature = "ws")]
+const WS_SECRETS: [&str; 2] = ["fake-ws-old-3c3c", "fake-ws-new-4d4d"];
 
 #[cfg(feature = "ssh")]
 #[allow(dead_code)]
@@ -99,12 +101,21 @@ fn no_secret_is_ever_logged() {
     app.step();
     #[cfg(feature = "ssh")]
     ssh_part();
+    #[cfg(feature = "ws")]
+    ws_part();
 
     let logs = capture.0.lock().unwrap_or_else(PoisonError::into_inner).clone();
     assert!(logs.contains(">>> NET-BACKEND"), "nothing captured:\n{logs}");
     assert!(logs.contains("not sent"), "the refused request is logged:\n{logs}");
     for secret in SECRETS {
         assert!(!logs.contains(secret), "`{secret}` was logged:\n{logs}");
+    }
+    #[cfg(feature = "ws")]
+    {
+        assert!(logs.contains("refused the credentials"), "the WebSocket part logged nothing:\n{logs}");
+        for secret in WS_SECRETS {
+            assert!(!logs.contains(secret), "`{secret}` was logged:\n{logs}");
+        }
     }
     #[cfg(feature = "ssh")]
     {
@@ -143,6 +154,42 @@ fn ssh_part() {
     app.step();
     app.run_until(|world| world.resource::<InFlight>().is_empty(), 3000);
     app.step_n(5);
+    app.world_mut().write_message(AppExit::Success);
+    app.step();
+}
+
+/// A WebSocket connection whose token is refused, refreshed by the game and accepted, plus a
+/// first-message token that is refused twice (final).
+#[cfg(feature = "ws")]
+fn ws_part() {
+    struct FirstMessage;
+    impl Credentials for FirstMessage {
+        fn apply(&self, _request: &mut OutgoingRequest) {}
+        fn ws_auth_message(&self) -> Option<String> {
+            Some(format!(r#"{{"type":"auth","token":"{}"}}"#, WS_SECRETS[0]))
+        }
+    }
+    let fake = FakeWsTransport::new();
+    fake.reject_next(BackendError::Status(Box::new(RawResponse::new(StatusCode::UNAUTHORIZED, WS_SECRETS[0]))));
+    let mut app = TestApp::new();
+    app.insert_resource(WsTransportRes::new(fake.clone())).add_plugins(BackendPlugin::default());
+    app.world_mut().resource_mut::<BackendCredentials>().set(BearerToken::new(WS_SECRETS[0]));
+    let settings = WsSettings::new("wss://game.example.com/ws").with_credentials_refresh(WsCredentialsRefresh::new());
+    app.world().resource::<WsClient>().connect("main", settings.clone());
+    app.step_n(3);
+    app.world_mut().resource_mut::<BackendCredentials>().set(BearerToken::new(WS_SECRETS[1]));
+    app.step_n(3);
+    app.world_mut().resource_mut::<BackendCredentials>().set(FirstMessage);
+    app.world().resource::<WsClient>().connect("first", settings);
+    app.step_n(2);
+    for _ in 0..2 {
+        if let Some(link) = fake.last_link() {
+            fake.push(link, WsFrame::Text(format!(r#"{{"type":"auth.failed","error":"{}"}}"#, WS_SECRETS[0])));
+        }
+        app.step_n(2);
+        app.world_mut().resource_mut::<BackendCredentials>().set(FirstMessage);
+        app.step_n(2);
+    }
     app.world_mut().write_message(AppExit::Success);
     app.step();
 }

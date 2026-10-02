@@ -28,7 +28,7 @@ pub type HttpTransportResult = Result<RawResponse, BackendError>;
 ///   (cancelled, timed out) is discarded, so reporting late is harmless.
 /// - Never panic.
 ///
-/// **Compatibility promise:** methods added to this trait in later versions always come with a
+/// **Compatibility rule:** methods are only ever added to this trait with a
 /// default implementation.
 pub trait HttpTransport: Send + Sync + 'static {
     /// Start `request`. Called in `PostUpdate` ([`BackendSystems::Send`](crate::BackendSystems::Send)).
@@ -47,6 +47,20 @@ pub trait HttpTransport: Send + Sync + 'static {
     /// The app is exiting: the plugin has answered everything. Release threads and connections;
     /// never wait for work in progress. Default: nothing.
     fn shutdown(&mut self) {}
+
+    /// Whether this transport sends a [`PreparedRequest::streaming_body`] (a multipart form with
+    /// files from disk). Default `false`: the plugin then answers such a request `InvalidRequest`
+    /// and never hands it over.
+    fn streams_bodies(&self) -> bool {
+        false
+    }
+
+    /// Upload progress since the last call: `(request, bytes sent, total)`, for requests with
+    /// [`PreparedRequest::upload_progress`]. Called once per frame in `First`, before
+    /// [`poll`](Self::poll). Default: none.
+    fn poll_progress(&mut self) -> Vec<(RequestId, u64, Option<u64>)> {
+        Vec::new()
+    }
 }
 
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -76,6 +90,10 @@ impl HttpTransportRes {
 
     pub(crate) fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub(crate) fn get(&self) -> &dyn HttpTransport {
+        self.inner.as_ref()
     }
 
     pub(crate) fn get_mut(&mut self) -> &mut dyn HttpTransport {

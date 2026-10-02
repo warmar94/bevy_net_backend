@@ -260,6 +260,37 @@ fn backoff_doubles_and_stops_after_max_attempts() {
 }
 
 #[test]
+fn a_busy_handshake_waits_at_least_its_retry_after() {
+    let refused = |status: StatusCode, retry_after: &'static str| {
+        let response = RawResponse::new(status, "").with_header(http::header::RETRY_AFTER, http::HeaderValue::from_static(retry_after));
+        BackendError::Status(Box::new(response))
+    };
+    let fake = FakeWsTransport::new();
+    fake.reject_next(refused(StatusCode::SERVICE_UNAVAILABLE, "2"));
+    fake.reject_next(refused(StatusCode::TOO_MANY_REQUESTS, "1"));
+    fake.reject_next(refused(StatusCode::BAD_GATEWAY, "5"));
+    fake.reject_next(refused(StatusCode::SERVICE_UNAVAILABLE, "0"));
+    let mut app = app(&fake);
+    let reconnect =
+        WsReconnect::default().with_jitter(false).with_base(Duration::from_millis(100)).with_cap(Duration::from_millis(300)).with_max_attempts(Some(4));
+    ws(&app).connect("main", WsSettings::new(URL).with_reconnect(reconnect));
+    run_until(&mut app, 10, |app| matches!(state(app, "main"), Some(WsState::Reconnecting { .. })));
+    // 1.5 s of frames: still waiting for the server's 2 s, no second attempt yet.
+    app.step_n(96);
+    assert_eq!(fake.opened().len(), 1, "the second attempt waits for Retry-After");
+    run_until(&mut app, 600, |app| state(app, "main") == Some(WsState::Connected));
+    let delays: Vec<Duration> = app
+        .all_messages::<WsStateChanged>()
+        .into_iter()
+        .filter_map(|c| if let WsState::Reconnecting { retry_in, .. } = c.state { Some(retry_in) } else { None })
+        .collect();
+    // 503 + 2 s and 429 + 1 s raise the backoff (even above the cap); a 502's header is not read;
+    // a Retry-After below the backoff changes nothing.
+    assert_eq!(delays, vec![Duration::from_secs(2), Duration::from_secs(1), Duration::from_millis(300), Duration::from_millis(300)]);
+    assert_eq!(fake.opened().len(), 5, "the first attempt + 4 retries");
+}
+
+#[test]
 fn jitter_stays_within_the_bound() {
     let reconnect = WsReconnect::default().with_base(Duration::from_millis(500)).with_cap(Duration::from_secs(30));
     assert_eq!(reconnect.delay_bound(1), Duration::from_millis(500));
@@ -839,5 +870,318 @@ mod json {
         let id = ws(&app).request("main", &NotRegistered);
         app.step_n(2);
         assert!(matches!(one_error(&app, id), BackendError::InvalidRequest(why) if why.contains("add_ws_request")));
+    }
+}
+
+/// Credentials refresh after a refusal (`WsSettings::with_credentials_refresh`): one message per
+/// refused credentials version, ONE new connection with the new credentials, never a loop.
+mod refresh {
+    use super::*;
+
+    fn unauthorized() -> BackendError {
+        BackendError::Status(Box::new(RawResponse::new(StatusCode::UNAUTHORIZED, r#"{"error":{"code":"token_expired"}}"#)))
+    }
+
+    fn refreshing() -> WsSettings {
+        settings().with_credentials_refresh(WsCredentialsRefresh::new())
+    }
+
+    fn token(fake: &FakeWsTransport, i: usize) -> Option<String> {
+        fake.opened().get(i).and_then(|(_, h)| h.headers.get("authorization")).and_then(|v| v.to_str().ok()).map(str::to_string)
+    }
+
+    fn refused(app: &TestApp) -> Vec<WsCredentialsRefused> {
+        app.all_messages::<WsCredentialsRefused>()
+    }
+
+    fn logged_in(fake: &FakeWsTransport) -> TestApp {
+        let mut app = app(fake);
+        app.watch::<WsCredentialsRefused>();
+        app.world_mut().resource_mut::<BackendCredentials>().set(BearerToken::new("fake-token-old"));
+        app
+    }
+
+    fn set_token(app: &mut TestApp, token: &str) {
+        app.world_mut().resource_mut::<BackendCredentials>().set(BearerToken::new(token.to_string()));
+    }
+
+    #[test]
+    fn a_refused_handshake_asks_once_then_connects_once_with_the_new_credentials() {
+        let fake = FakeWsTransport::new();
+        fake.echo_envelope(true);
+        fake.reject_next(unauthorized());
+        let mut app = logged_in(&fake);
+        ws(&app).connect("main", refreshing());
+        app.step_n(3);
+        assert_eq!(state(&app, "main"), Some(WsState::WaitingForCredentials));
+        let asked = refused(&app);
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert_eq!(asked[0].name, "main");
+        assert_eq!(asked[0].error.status(), Some(StatusCode::UNAUTHORIZED));
+        // A request made while waiting waits for the new connection.
+        let id = ws(&app).request_raw("main", WsOutgoing::new("echo", b"7".to_vec()));
+        app.step_n(10);
+        assert_eq!(fake.opened().len(), 1, "nothing happens until the game sets new credentials");
+        assert!(raw_answers(&app, id).is_empty());
+        set_token(&mut app, "fake-token-new");
+        run_until(&mut app, 10, |app| state(app, "main") == Some(WsState::Connected));
+        assert_eq!(fake.opened().len(), 2);
+        assert_eq!(token(&fake, 0).as_deref(), Some("Bearer fake-token-old"));
+        assert_eq!(token(&fake, 1).as_deref(), Some("Bearer fake-token-new"));
+        run_until(&mut app, 10, |app| !raw_answers(app, id).is_empty());
+        assert_eq!(raw_answers(&app, id)[0].result.as_deref().ok(), Some(&b"7"[..]));
+        assert_eq!(refused(&app).len(), 1);
+        let states: Vec<WsState> = app.all_messages::<WsStateChanged>().into_iter().map(|c| c.state).collect();
+        assert_eq!(states, vec![WsState::Connecting, WsState::WaitingForCredentials, WsState::Connecting, WsState::Connected]);
+    }
+
+    #[test]
+    fn a_second_refusal_is_final_and_asks_nothing_more() {
+        let fake = FakeWsTransport::new();
+        fake.reject_next(unauthorized()).reject_next(unauthorized()).reject_next(unauthorized());
+        let mut app = logged_in(&fake);
+        ws(&app).connect("main", refreshing());
+        let id = ws(&app).request_raw("main", WsOutgoing::new("echo", b"1".to_vec()));
+        app.step_n(3);
+        set_token(&mut app, "fake-token-new");
+        app.step_n(100);
+        assert_eq!(state(&app, "main"), Some(WsState::Disconnected));
+        assert_eq!(fake.opened().len(), 2, "one refresh, one new connection, no loop");
+        assert_eq!(refused(&app).len(), 1);
+        let info = app.world().resource::<WsConnections>().get("main").cloned().unwrap_or_else(|| panic!("no info"));
+        assert_eq!(info.last_error.and_then(|e| e.status()), Some(StatusCode::UNAUTHORIZED));
+        let error = one_error(&app, id);
+        assert_eq!(error.was_sent(), Some(false), "{error:?}");
+        // Setting credentials again later does not revive it.
+        set_token(&mut app, "fake-token-newer");
+        app.step_n(20);
+        assert_eq!(fake.opened().len(), 2);
+    }
+
+    #[test]
+    fn cleared_credentials_or_the_timeout_end_the_wait() {
+        let fake = FakeWsTransport::new();
+        fake.reject_next(unauthorized());
+        let mut app = logged_in(&fake);
+        ws(&app).connect("main", refreshing());
+        let id = ws(&app).request_raw("main", WsOutgoing::new("echo", b"1".to_vec()));
+        app.step_n(3);
+        app.world_mut().resource_mut::<BackendCredentials>().clear();
+        app.step_n(2);
+        assert_eq!(state(&app, "main"), Some(WsState::Disconnected));
+        assert!(matches!(one_error(&app, id), BackendError::Disconnected { sent: Some(false), reason, .. } if reason.contains("cleared")));
+        assert_eq!(fake.opened().len(), 1);
+
+        let fake = FakeWsTransport::new();
+        fake.reject_next(unauthorized());
+        let mut app = logged_in(&fake);
+        ws(&app).connect("main", settings().with_credentials_refresh(WsCredentialsRefresh::new().with_timeout(Duration::from_millis(100))));
+        run_until(&mut app, 60, |app| state(app, "main") == Some(WsState::Disconnected));
+        assert_eq!(fake.opened().len(), 1);
+        let info = app.world().resource::<WsConnections>().get("main").cloned().unwrap_or_else(|| panic!("no info"));
+        assert_eq!(info.last_error.and_then(|e| e.status()), Some(StatusCode::UNAUTHORIZED));
+    }
+
+    /// Review S1: single flight covers only connections still waiting. After a wait ended, a new
+    /// refusal of the same credentials asks the game again.
+    #[test]
+    fn a_refusal_after_an_ended_wait_asks_again() {
+        let fake = FakeWsTransport::new();
+        fake.reject_next(unauthorized()).reject_next(unauthorized());
+        let mut app = logged_in(&fake);
+        let settings = settings().with_credentials_refresh(WsCredentialsRefresh::new().with_timeout(Duration::from_millis(100)));
+        ws(&app).connect("main", settings.clone());
+        run_until(&mut app, 60, |app| state(app, "main") == Some(WsState::Disconnected));
+        assert_eq!(refused(&app).len(), 1);
+        // The game's refresh failed without clearing; the player reconnects with the same token.
+        ws(&app).connect("main", settings);
+        run_until(&mut app, 10, |app| state(app, "main") == Some(WsState::WaitingForCredentials));
+        assert_eq!(refused(&app).len(), 2, "the game is asked again");
+        assert_eq!(fake.opened().len(), 2);
+    }
+
+    #[test]
+    fn several_connections_refused_together_share_one_refresh() {
+        let fake = FakeWsTransport::new();
+        fake.reject_next(unauthorized()).reject_next(unauthorized()).reject_next(unauthorized());
+        let mut app = logged_in(&fake);
+        for name in ["a", "b", "c"] {
+            ws(&app).connect(name, refreshing());
+        }
+        app.step_n(3);
+        assert_eq!(refused(&app).len(), 1, "one message for three refused connections");
+        for name in ["a", "b", "c"] {
+            assert_eq!(state(&app, name), Some(WsState::WaitingForCredentials));
+        }
+        set_token(&mut app, "fake-token-new");
+        app.step_n(3);
+        for name in ["a", "b", "c"] {
+            assert_eq!(state(&app, name), Some(WsState::Connected), "{name}");
+        }
+        assert_eq!(fake.opened().len(), 6);
+        assert!((3..6).all(|i| token(&fake, i).as_deref() == Some("Bearer fake-token-new")));
+    }
+
+    #[test]
+    fn credentials_changed_since_the_refused_handshake_reconnect_without_asking() {
+        let fake = FakeWsTransport::new();
+        fake.manual_accept(true);
+        let mut app = logged_in(&fake);
+        ws(&app).connect("main", refreshing());
+        app.step();
+        let link = fake.last_link().unwrap_or_else(|| panic!("no link"));
+        // The game refreshed on its own while the handshake was on the way; then the old token is
+        // refused.
+        set_token(&mut app, "fake-token-new");
+        fake.manual_accept(false);
+        fake.fail_link(link, unauthorized());
+        app.step_n(3);
+        assert!(refused(&app).is_empty(), "no refresh asked for: the credentials already changed");
+        assert_eq!(state(&app, "main"), Some(WsState::Connected));
+        assert_eq!(token(&fake, 1).as_deref(), Some("Bearer fake-token-new"));
+    }
+
+    #[test]
+    fn a_refused_authentication_message_and_an_opted_in_close_code_refresh_too() {
+        struct FirstMessage(&'static str);
+        impl Credentials for FirstMessage {
+            fn apply(&self, _request: &mut OutgoingRequest) {}
+            fn ws_auth_message(&self) -> Option<String> {
+                Some(format!(r#"{{"type":"auth","token":"{}"}}"#, self.0))
+            }
+        }
+        let fake = FakeWsTransport::new();
+        let mut app = app(&fake);
+        app.watch::<WsCredentialsRefused>();
+        app.world_mut().resource_mut::<BackendCredentials>().set(FirstMessage("fake-token-old"));
+        ws(&app).connect("main", refreshing());
+        app.step_n(2);
+        let first = fake.last_link().unwrap_or_else(|| panic!("no link"));
+        fake.push(first, WsFrame::Text(r#"{"type":"auth.failed","error":{"code":"token_expired"}}"#.into()));
+        app.step_n(2);
+        assert_eq!(state(&app, "main"), Some(WsState::WaitingForCredentials));
+        assert!(fake.closed().contains(&(first, 1008)));
+        app.world_mut().resource_mut::<BackendCredentials>().set(FirstMessage("fake-token-new"));
+        app.step_n(3);
+        let second = fake.last_link().unwrap_or_else(|| panic!("no link"));
+        assert_ne!(first, second);
+        let auth = fake.sent(second).first().and_then(|f| f.as_text().map(str::to_string));
+        assert_eq!(auth.as_deref(), Some(r#"{"type":"auth","token":"fake-token-new"}"#));
+        assert_eq!(refused(&app).len(), 1);
+
+        // Close 4001 only with the opt-in code; a second 4001 before the connection was stable is
+        // final.
+        let fake = FakeWsTransport::new();
+        let mut app = logged_in(&fake);
+        ws(&app).connect("main", settings().with_credentials_refresh(WsCredentialsRefresh::new().with_close_code(4001)));
+        app.step_n(2);
+        fake.drop_link(fake.last_link().unwrap_or_else(|| panic!("no link")), 4001);
+        app.step_n(2);
+        assert_eq!(state(&app, "main"), Some(WsState::WaitingForCredentials));
+        assert_eq!(refused(&app).first().and_then(|r| r.error.close_code()), Some(4001));
+        set_token(&mut app, "fake-token-new");
+        app.step_n(3);
+        assert_eq!(state(&app, "main"), Some(WsState::Connected));
+        fake.drop_link(fake.last_link().unwrap_or_else(|| panic!("no link")), 4001);
+        app.step_n(100);
+        assert_eq!(state(&app, "main"), Some(WsState::Disconnected));
+        assert_eq!(fake.opened().len(), 2);
+
+        // Without the opt-in code a policy close stays final.
+        let fake = FakeWsTransport::new();
+        let mut app = logged_in(&fake);
+        ws(&app).connect("main", refreshing());
+        app.step_n(2);
+        fake.drop_link(fake.last_link().unwrap_or_else(|| panic!("no link")), 4001);
+        app.step_n(100);
+        assert_eq!(state(&app, "main"), Some(WsState::Disconnected));
+        assert!(refused(&app).is_empty());
+    }
+
+    #[test]
+    fn a_stable_connection_earns_a_new_refresh_and_403_never_refreshes() {
+        let fake = FakeWsTransport::new();
+        fake.reject_next(unauthorized());
+        let mut app = logged_in(&fake);
+        let quick = WsReconnect::default().with_jitter(false).with_base(Duration::from_millis(10)).with_stable_after(Duration::from_millis(100));
+        ws(&app).connect("main", refreshing().with_reconnect(quick));
+        app.step_n(3);
+        set_token(&mut app, "fake-token-2");
+        run_until(&mut app, 10, |app| state(app, "main") == Some(WsState::Connected));
+        app.step_n(30); // stays up past `stable_after`
+                        // Lost later and the reconnect is refused: a new refresh is allowed.
+        fake.reject_next(unauthorized());
+        fake.drop_link(fake.last_link().unwrap_or_else(|| panic!("no link")), 1006);
+        run_until(&mut app, 60, |app| state(app, "main") == Some(WsState::WaitingForCredentials));
+        assert_eq!(refused(&app).len(), 2);
+        set_token(&mut app, "fake-token-3");
+        run_until(&mut app, 10, |app| state(app, "main") == Some(WsState::Connected));
+        assert_eq!(token(&fake, 3).as_deref(), Some("Bearer fake-token-3"));
+
+        let fake = FakeWsTransport::new();
+        fake.reject_next(BackendError::Status(Box::new(RawResponse::new(StatusCode::FORBIDDEN, ""))));
+        let mut app = logged_in(&fake);
+        ws(&app).connect("main", refreshing());
+        app.step_n(100);
+        assert_eq!(state(&app, "main"), Some(WsState::Disconnected));
+        assert!(refused(&app).is_empty());
+    }
+
+    #[test]
+    fn no_refresh_without_credentials_or_when_the_connection_does_not_use_them() {
+        let fake = FakeWsTransport::new();
+        fake.reject_next(unauthorized());
+        let mut app = app(&fake);
+        app.watch::<WsCredentialsRefused>();
+        ws(&app).connect("main", refreshing());
+        app.step_n(50);
+        assert_eq!(state(&app, "main"), Some(WsState::Disconnected));
+        assert!(refused(&app).is_empty());
+
+        let fake = FakeWsTransport::new();
+        fake.reject_next(unauthorized());
+        let mut app = logged_in(&fake);
+        ws(&app).connect("main", refreshing().without_credentials());
+        app.step_n(50);
+        assert_eq!(state(&app, "main"), Some(WsState::Disconnected));
+        assert!(refused(&app).is_empty());
+    }
+
+    #[test]
+    fn disconnect_and_exit_while_waiting_answer_once() {
+        let fake = FakeWsTransport::new();
+        fake.reject_next(unauthorized());
+        let mut app = logged_in(&fake);
+        ws(&app).connect("main", refreshing());
+        let id = ws(&app).request_raw("main", WsOutgoing::new("echo", b"1".to_vec()));
+        app.step_n(3);
+        ws(&app).disconnect("main");
+        app.step_n(3);
+        assert!(matches!(one_error(&app, id), BackendError::Disconnected { .. }));
+        set_token(&mut app, "fake-token-new");
+        app.step_n(20);
+        assert_eq!(fake.opened().len(), 1, "a disconnected connection does not come back on new credentials");
+
+        let fake = FakeWsTransport::new();
+        fake.reject_next(unauthorized());
+        let mut app = logged_in(&fake);
+        ws(&app).connect("main", refreshing());
+        let id = ws(&app).request_raw("main", WsOutgoing::new("echo", b"1".to_vec()));
+        app.step_n(3);
+        app.world_mut().write_message(AppExit::Success);
+        app.step_n(2);
+        assert_eq!(one_error(&app, id), BackendError::Shutdown);
+    }
+
+    #[test]
+    fn the_settings_and_debug_output() {
+        let refresh = WsCredentialsRefresh::new().with_timeout(Duration::ZERO).with_close_code(4001).with_close_code(4001);
+        assert_eq!(refresh.timeout(), Duration::from_millis(1));
+        assert_eq!(refresh.close_codes(), &[4001]);
+        assert_eq!(WsCredentialsRefresh::new().with_timeout(Duration::from_secs(1_000_000)).timeout(), MAX_TIMEOUT);
+        let settings = settings().with_credentials_refresh(refresh.clone());
+        assert_eq!(settings.credentials_refresh(), Some(&refresh));
+        assert!(format!("{settings:?}").contains("credentials_refresh"));
+        assert_eq!(WsSettings::new(URL).credentials_refresh(), None);
     }
 }

@@ -19,8 +19,9 @@
 //!
 //! `--password PW` also accepts that password, `--kbd PW:CODE` a keyboard-interactive login
 //! (`Password:` then `Verification code:`): throwaway test values only (they are visible in the
-//! process list). In tests it can also skip strict key exchange, restrict its ciphers and offer
-//! several host key types ([`MockOptions`]).
+//! process list). In tests it can also skip strict key exchange, restrict its ciphers, offer
+//! several host key types, and answer SFTP reads short, slowly or with an error from an offset on
+//! ([`MockOptions`]).
 //!
 //! Limits: 16 connections at once (more are dropped), 10 minutes per connection, 60 s without any
 //! traffic, 10 channels per connection; `flood` at most 64 MiB, `sleep` at most 60 s, stdin at most
@@ -112,6 +113,8 @@ pub struct Stats {
     pub signals: AtomicUsize,
     /// Channels closed by the client.
     pub closes: AtomicUsize,
+    /// SFTP file / directory handles open right now (opened and not closed by the client).
+    pub sftp_handles: AtomicUsize,
 }
 
 /// How a test mock behaves (all off by default: key login only, strict key exchange, the default
@@ -130,6 +133,13 @@ pub struct MockOptions {
     pub ecdsa_host_key: bool,
     /// Offer ONLY the ECDSA host key.
     pub only_ecdsa_host_key: bool,
+    /// SFTP reads answer fewer bytes than asked (a varying length), as servers may.
+    pub sftp_short_reads: bool,
+    /// SFTP reads at or after this offset fail with `Failure` (a server error in the middle of a
+    /// download).
+    pub sftp_fail_reads_at: Option<u64>,
+    /// Every SFTP read waits this long first (a slow server).
+    pub sftp_read_delay: Option<Duration>,
 }
 
 /// A running mock SSH server; stops when dropped.
@@ -184,6 +194,8 @@ impl MockSshServer {
             stats: Arc::clone(&stats),
             #[cfg(feature = "sftp")]
             files: Arc::clone(&files),
+            #[cfg(feature = "sftp")]
+            sftp: sftp::Behaviour { short_reads: options.sftp_short_reads, fail_reads_at: options.sftp_fail_reads_at, read_delay: options.sftp_read_delay },
         };
         let mut preferred = russh::Preferred::default();
         if options.no_strict_kex {
@@ -292,6 +304,8 @@ struct Shared {
     stats: Arc<Stats>,
     #[cfg(feature = "sftp")]
     files: Arc<Mutex<sftp::Fs>>,
+    #[cfg(feature = "sftp")]
+    sftp: sftp::Behaviour,
 }
 
 async fn accept_loop(listener: std::net::TcpListener, config: Arc<russh::server::Config>, shared: Shared, mut stopped: tokio::sync::oneshot::Receiver<()>) {
@@ -520,7 +534,11 @@ impl russh::server::Handler for Handler {
         if name == "sftp" {
             if let Some(open) = self.channels.remove(&channel) {
                 session.channel_success(channel)?;
-                russh_sftp::server::run(open.into_stream(), sftp::Session::new(Arc::clone(&self.shared.files))).await;
+                russh_sftp::server::run(
+                    open.into_stream(),
+                    sftp::Session::new(Arc::clone(&self.shared.files), self.shared.sftp, Arc::clone(&self.shared.stats)),
+                )
+                .await;
                 return Ok(());
             }
         }
@@ -599,15 +617,32 @@ mod sftp {
         Dir { entries: Vec<File>, sent: bool },
     }
 
+    /// Test behaviour of the SFTP side (see `MockOptions`).
+    #[derive(Clone, Copy, Default)]
+    pub struct Behaviour {
+        pub short_reads: bool,
+        pub fail_reads_at: Option<u64>,
+        pub read_delay: Option<std::time::Duration>,
+    }
+
     pub struct Session {
         fs: Arc<Mutex<Fs>>,
         handles: HashMap<String, Open>,
         next: u64,
+        behaviour: Behaviour,
+        stats: Arc<super::Stats>,
+    }
+
+    impl Drop for Session {
+        /// Handles still open when the SFTP channel ends are gone with it.
+        fn drop(&mut self) {
+            self.stats.sftp_handles.fetch_sub(self.handles.len(), std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     impl Session {
-        pub fn new(fs: Arc<Mutex<Fs>>) -> Self {
-            Self { fs, handles: HashMap::new(), next: 1 }
+        pub fn new(fs: Arc<Mutex<Fs>>, behaviour: Behaviour, stats: Arc<super::Stats>) -> Self {
+            Self { fs, handles: HashMap::new(), next: 1, behaviour, stats }
         }
 
         fn handle(&mut self, open: Open) -> Result<String, StatusCode> {
@@ -617,6 +652,7 @@ mod sftp {
             let handle = format!("h{}", self.next);
             self.next = self.next.saturating_add(1);
             self.handles.insert(handle.clone(), open);
+            self.stats.sftp_handles.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(handle)
         }
     }
@@ -667,10 +703,20 @@ mod sftp {
         }
 
         async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
-            self.handles.remove(&handle).map(|_| ok(id)).ok_or(StatusCode::Failure)
+            let closed = self.handles.remove(&handle).map(|_| ok(id)).ok_or(StatusCode::Failure);
+            if closed.is_ok() {
+                self.stats.sftp_handles.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            closed
         }
 
         async fn read(&mut self, id: u32, handle: String, offset: u64, len: u32) -> Result<Data, Self::Error> {
+            if let Some(delay) = self.behaviour.read_delay {
+                tokio::time::sleep(delay).await;
+            }
+            if self.behaviour.fail_reads_at.is_some_and(|at| offset >= at) {
+                return Err(StatusCode::Failure);
+            }
             let Some(Open::File(path)) = self.handles.get(&handle) else { return Err(StatusCode::Failure) };
             let fs = self.fs.lock().unwrap_or_else(PoisonError::into_inner);
             let data = fs.files.get(path).ok_or(StatusCode::NoSuchFile)?;
@@ -678,7 +724,13 @@ mod sftp {
             if start >= data.len() {
                 return Err(StatusCode::Eof);
             }
-            let end = start.saturating_add(usize::try_from(len.min(64 * 1024)).unwrap_or(0)).min(data.len());
+            let mut len = len.min(64 * 1024);
+            if self.behaviour.short_reads && len > 1 {
+                // A varying shorter answer (1..len bytes), the same for the same offset.
+                let mixed = offset.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(23);
+                len = 1 + u32::try_from(mixed % u64::from(len - 1)).unwrap_or(0);
+            }
+            let end = start.saturating_add(usize::try_from(len).unwrap_or(0)).min(data.len());
             Ok(Data { id, data: data.get(start..end).unwrap_or_default().to_vec() })
         }
 

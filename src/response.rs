@@ -2,9 +2,10 @@
 //! `JsonResponse` (feature `json`).
 
 use std::fmt;
+use std::time::Duration;
 
 use bevy_ecs::message::Message;
-use http::header::{HeaderMap, HeaderName, HeaderValue};
+use http::header::{HeaderMap, HeaderName, HeaderValue, RETRY_AFTER};
 use http::StatusCode;
 
 use crate::RequestId;
@@ -75,7 +76,7 @@ impl RawResponse {
 
 /// Why a request did not succeed. Every request gets exactly one answer; this is the error half.
 ///
-/// The kinds are transport-neutral and `#[non_exhaustive]`: later versions may add kinds. The
+/// The kinds are transport-neutral and `#[non_exhaustive]`: keep a catch-all arm. The
 /// texts are what the dependency (ureq, rustls, serde_json) reported, never a guess.
 ///
 /// `Debug` and `Display` never show a body, a header value or `Decode`'s message (which can
@@ -86,7 +87,7 @@ pub enum BackendError {
     /// The request could not be built (bad path, header, base URL, unregistered response type…);
     /// it was never sent.
     InvalidRequest(String),
-    /// Plain text (`http://`, later also `ws://`) to a host that is not loopback, without
+    /// Plain text (`http://` or `ws://`) to a host that is not loopback, without
     /// [`allow_insecure_http`](crate::HttpConfig::allow_insecure_http); never sent.
     #[non_exhaustive]
     InsecureHttp {
@@ -273,6 +274,22 @@ impl BackendError {
         }
     }
 
+    /// How long the server asked to wait before trying again: the `Retry-After` header of a
+    /// [`Status`](Self::Status) answer (a 429 or a 503, say) in its delta-seconds form (`"120"`).
+    /// `None` for every other error, without the header, or for a value that is not a whole number
+    /// of seconds (an HTTP-date). Anything above [`MAX_TIMEOUT`](crate::MAX_TIMEOUT) is lowered to it.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            BackendError::Status(response) => response
+                .headers
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .map(|seconds| Duration::from_secs(seconds).min(crate::config::MAX_TIMEOUT)),
+            _ => None,
+        }
+    }
+
     /// Whether the request never left the machine because it was invalid (invalid request,
     /// insecure http, encode error, request too large).
     pub fn is_invalid_request(&self) -> bool {
@@ -395,6 +412,24 @@ pub struct HttpResponse {
     pub id: RequestId,
     /// The response, or the error.
     pub result: Result<RawResponse, BackendError>,
+}
+
+/// Upload progress of an HTTP request's body: the bytes read for sending so far (handed to the
+/// connection; the server may not have received all of them yet). Only for requests with
+/// [`OutgoingRequest::with_upload_progress`](crate::OutgoingRequest::with_upload_progress) (on
+/// for multipart forms). The built-in transport writes at most about 10 per second per request,
+/// plus one when the whole body is out; the answer ([`HttpResponse`] / `JsonResponse<T>`) follows
+/// as usual. Written in `First` ([`BackendSystems::Receive`](crate::BackendSystems::Receive)),
+/// before the answers of that frame, and only while the request waits for its answer.
+#[derive(Message, Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct HttpProgress {
+    /// The request.
+    pub id: RequestId,
+    /// Bytes of the body read for sending so far.
+    pub sent: u64,
+    /// The body's size, when known.
+    pub total: Option<u64>,
 }
 
 /// The answer to a typed JSON request (`get_json::<T>`, `post_json::<T>`, `send_json::<T>`):

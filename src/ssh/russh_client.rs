@@ -1215,7 +1215,11 @@ async fn sftp_session(ctx: &Ctx) -> Result<Arc<russh_sftp::client::RawSftpSessio
             Some(_) => {}
         }
     }
-    let config = russh_sftp::client::Config { request_timeout_secs: 30, ..russh_sftp::client::Config::default() };
+    // Each SFTP request may wait as long as a whole operation (`with_sftp_timeout`): with 16 reads
+    // in flight the last one is answered only after 1 MiB crossed the link, so a fixed 30 s would
+    // fail links slower than about 35 KB/s. The operation's own deadline still bounds it.
+    let request_timeout_secs = ctx.sftp_timeout.as_secs().max(1);
+    let config = russh_sftp::client::Config { request_timeout_secs, ..russh_sftp::client::Config::default() };
     let session = russh_sftp::client::RawSftpSession::new_with_config(channel.into_stream(), config);
     session.init().await.map_err(sftp_ops::map_error)?;
     let session = Arc::new(session);

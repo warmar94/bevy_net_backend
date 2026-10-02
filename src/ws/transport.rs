@@ -99,7 +99,7 @@ pub enum WsLinkEvent {
 
 /// Opens links and moves frames. The plugin owns reconnects, requests and every answer; a
 /// transport only delivers. `send`, `close` and `poll` run on the main thread and must never
-/// block. Methods added later always come with a default implementation.
+/// block. Methods are only ever added to this trait with a default implementation.
 pub trait WsTransport: Send + Sync + 'static {
     /// Start a connection attempt. Report `Opened`, then frames, then exactly one `Closed` or
     /// `Failed` (or just `Failed`).

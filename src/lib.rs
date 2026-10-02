@@ -1,7 +1,7 @@
 //! Call your game's own HTTPS JSON API from Bevy.
 //!
 //! A system fires a request through [`HttpClient`] and gets a [`RequestId`]; a few frames
-//! later exactly one answer arrives as a Bevy message: `JsonResponse<T>` for typed JSON
+//! after that exactly one answer arrives as a Bevy message: `JsonResponse<T>` for typed JSON
 //! (feature `json`) or [`HttpResponse`] for raw bytes. The answer is the decoded value or a
 //! [`BackendError`]: network, TLS, timeout, an HTTP status with the server's body, a decode
 //! error, cancelled, or shutdown on `AppExit`. Nothing is ever dropped silently.
@@ -52,6 +52,7 @@ fn main() {
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+mod body;
 mod client;
 mod config;
 mod credentials;
@@ -76,6 +77,7 @@ mod tests;
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
+pub use body::{StreamingBody, StreamingReader};
 pub use client::{BackendAppExt, HttpClient};
 pub use config::{ConfigError, HttpConfig, DEFAULT_MAX_BODY_BYTES, DEFAULT_TIMEOUT, DEFAULT_WORKERS, MAX_TIMEOUT, MAX_WORKERS};
 #[cfg(feature = "json")]
@@ -90,7 +92,7 @@ pub use multipart::{Multipart, DEFAULT_MULTIPART_MAX_BYTES, DEFAULT_MULTIPART_MA
 pub use request::{OutgoingRequest, PreparedRequest, RequestId, RequestPurpose};
 #[cfg(feature = "json")]
 pub use response::JsonResponse;
-pub use response::{BackendError, HostKeyProblem, HttpResponse, RawResponse, Rejection};
+pub use response::{BackendError, HostKeyProblem, HttpProgress, HttpResponse, RawResponse, Rejection};
 #[cfg(feature = "ssh")]
 pub use ssh::{
     FakeSshTransport, RusshTransport, SshAuth, SshClient, SshCommand, SshConnId, SshConnectionInfo, SshConnections, SshEvent, SshExit, SshFinished, SshName,
@@ -106,9 +108,9 @@ pub use transport::http_pool::UreqTransport;
 pub use transport::{HttpTransport, HttpTransportRes, HttpTransportResult};
 #[cfg(feature = "ws")]
 pub use ws::{
-    FakeWsTransport, TungsteniteTransport, WsClient, WsConnectionInfo, WsConnections, WsFrame, WsHandshake, WsIncoming, WsLinkEvent, WsLinkId, WsMessage,
-    WsName, WsOutgoing, WsProtocol, WsRawResponse, WsReconnect, WsSettings, WsState, WsStateChanged, WsTransport, WsTransportRes, DEFAULT_WS_MAX_MESSAGE_BYTES,
-    DEFAULT_WS_READ_TIMEOUT,
+    FakeWsTransport, TungsteniteTransport, WsClient, WsConnectionInfo, WsConnections, WsCredentialsRefresh, WsCredentialsRefused, WsFrame, WsHandshake,
+    WsIncoming, WsLinkEvent, WsLinkId, WsMessage, WsName, WsOutgoing, WsProtocol, WsRawResponse, WsReconnect, WsSettings, WsState, WsStateChanged, WsTransport,
+    WsTransportRes, DEFAULT_WS_MAX_MESSAGE_BYTES, DEFAULT_WS_READ_TIMEOUT,
 };
 #[cfg(all(feature = "ws", feature = "json"))]
 pub use ws::{JsonEnvelope, WsPush, WsPushMessage, WsRequest, WsResponse};
@@ -120,15 +122,15 @@ pub mod prelude {
     #[cfg(feature = "http")]
     pub use crate::Multipart;
     pub use crate::{
-        BackendAppExt, BackendCredentials, BackendError, BackendPlugin, BackendSystems, BearerToken, HttpClient, HttpConfig, HttpResponse, InFlight,
-        OutgoingRequest, RequestId,
+        BackendAppExt, BackendCredentials, BackendError, BackendPlugin, BackendSystems, BearerToken, HttpClient, HttpConfig, HttpProgress, HttpResponse,
+        InFlight, OutgoingRequest, RequestId,
     };
     #[cfg(feature = "sftp")]
     pub use crate::{SftpFinished, SftpOutcome, SftpProgress};
     #[cfg(feature = "ssh")]
     pub use crate::{SshClient, SshConnections, SshFinished, SshOutput, SshState, SshStateChanged};
     #[cfg(feature = "ws")]
-    pub use crate::{WsClient, WsConnections, WsFrame, WsMessage, WsSettings, WsState, WsStateChanged};
+    pub use crate::{WsClient, WsConnections, WsCredentialsRefused, WsFrame, WsMessage, WsSettings, WsState, WsStateChanged};
     #[cfg(all(feature = "ws", feature = "json"))]
     pub use crate::{WsPush, WsPushMessage, WsRequest, WsResponse};
 }
@@ -145,7 +147,7 @@ use bevy_time::TimeSystems;
 /// It inserts the [`HttpConfig`] it was given, [`HttpClient`], [`InFlight`], an empty
 /// [`BackendCredentials`] (unless one exists), the [`HttpResponse`] message, and with feature
 /// `http` a `UreqTransport` as the [`HttpTransportRes`] (unless one exists; replacing it
-/// later is fine, its threads only start on the first request). With feature `ws` it also adds
+/// afterwards is fine, its threads only start on the first request). With feature `ws` it also adds
 /// the WebSocket side (`WsClient`, `WsConnections`, the `Ws*` messages and a
 /// `TungsteniteTransport` unless a `WsTransportRes` exists). With feature `ssh` it adds the SSH side
 /// (`SshClient`, `SshConnections`, the `Ssh*` / `Sftp*` messages and a `RusshTransport` unless an
@@ -192,8 +194,7 @@ impl BackendPlugin {
 }
 
 /// The plugin's system sets, named after phases: HTTP, WebSocket (feature `ws`) and SSH (feature
-/// `ssh`) systems all run in them (in that order within a set). `#[non_exhaustive]`: a later
-/// version may add a set.
+/// `ssh`) systems all run in them (in that order within a set). `#[non_exhaustive]`.
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum BackendSystems {
@@ -230,6 +231,7 @@ impl Plugin for BackendPlugin {
         }
         app.init_resource::<BackendCredentials>()
             .add_message::<HttpResponse>()
+            .add_message::<HttpProgress>()
             .configure_sets(First, BackendSystems::Receive.after(TimeSystems).before(MessageUpdateSystems))
             .configure_sets(PostUpdate, BackendSystems::Send)
             .configure_sets(Last, BackendSystems::Exit)

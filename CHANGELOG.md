@@ -5,6 +5,59 @@ All notable changes to this crate are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (before 1.0: a minor bump for any API
 change or a Bevy / key dependency bump).
 
+## [Unreleased]
+
+### Added
+
+- WebSocket credentials refresh (feature `ws`, off by default):
+  `WsSettings::with_credentials_refresh(WsCredentialsRefresh)`. When the server refuses the
+  credentials (a `401` handshake, a refused first-message authentication, or a close code added
+  with `WsCredentialsRefresh::with_close_code`, e.g. 4001), the connection goes
+  `WsState::WaitingForCredentials` and the plugin writes one `WsCredentialsRefused { name, error }`
+  message per refused credentials, however many connections wait. New credentials set with
+  `BackendCredentials::set` start ONE new connection; a second refusal, cleared credentials or
+  no new credentials within the timeout (default 30 s) end it `Disconnected` with the server's
+  refusal. A further refresh is allowed only after a connection stayed up for the reconnect
+  policy's `stable_after`. Credentials that changed since the refused handshake reconnect at once
+  without a message. The crate never calls a refresh route itself.
+- `Multipart::file_from_path(name, filename, content_type, path)`: a file part read from disk on
+  the HTTP worker thread while the request is sent (64 KiB at a time, exact `Content-Length`); a
+  file that cannot be opened is `InvalidRequest` and a form over `with_max_bytes`
+  `RequestTooLarge`, both before anything is sent; a file that changes size while it is sent cuts
+  the request off with a `Network` error.
+- `Multipart::part(name, content_type, bytes)` (a non-file part with its own content type) and
+  `Multipart::json(name, &value)` (feature `json`: `Content-Type: application/json`).
+- Upload progress: the `HttpProgress { id, sent, total }` message (at most about 10 per second per
+  request, plus one when the whole body is out), on for multipart forms,
+  `OutgoingRequest::with_upload_progress(bool)` / `upload_progress()` for any body.
+- `StreamingBody` / `StreamingReader` (a body read while it is sent), `OutgoingRequest::streaming_body()`,
+  `PreparedRequest::streaming_body` and `PreparedRequest::upload_progress`;
+  `HttpTransport::streams_bodies()` (default `false`: such a request is answered `InvalidRequest`
+  and never handed over) and `HttpTransport::poll_progress()` (default: none);
+  `FakeHttpTransport::progress(id, sent, total)`.
+- `BackendError::retry_after()`: the `Retry-After` header of a `Status` answer (delta-seconds) as a
+  `Duration` (at most `MAX_TIMEOUT`), else `None`.
+- WebSocket (feature `ws`): a handshake refused with `429` or `503` and a `Retry-After` header waits
+  at least that long before the next reconnect attempt (`WsState::Reconnecting::retry_in` shows it;
+  above the backoff cap too, at most `MAX_TIMEOUT`). The attempt limit is unchanged.
+- `mock_ws_server`: a path ending in `/busy` refuses the handshake with `503` and `Retry-After: 2`.
+- The mock server's `/upload` echo names the content type of a field part that has one; the mock
+  SSH server's `MockOptions` can answer SFTP reads short, slowly or with an error from an offset.
+
+### Changed
+
+- SFTP downloads are pipelined: 64 KiB reads go out ahead of the answers, up to 1 MiB requested or
+  received and not written at once, written in file order; short reads ask again for the rest; a
+  file the server reports larger than the transfer limit is refused before any data is read.
+  Measured over loopback in a debug build: 256 MiB to a file in 1.5 s.
+- An SFTP transfer that is cancelled or times out closes its remote file handle in the background.
+- Each SFTP request may wait for its answer as long as the whole operation (`with_sftp_timeout`)
+  instead of a fixed 30 s, so a slow link is not cut off while 1 MiB of reads is in flight.
+- `Secret` overwrites its whole allocation with zeros when it is dropped, and `BearerToken` wipes
+  its temporary `Bearer …` text (copies that become part of a request are not wiped) (`zeroize`, now a dependency of every feature set; rustls already
+  used it, so the default build has the same 90 crates, `default-features = false` one more).
+- Documentation states what the crate does, without plans.
+
 ## [0.1.0] - 2026-10-01
 
 ### Added

@@ -17,14 +17,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ureq::tls::{TlsConfig, TlsProvider};
-use ureq::{Agent, AsSendBody};
+use ureq::{Agent, AsSendBody, SendBody};
 
 use super::{HttpTransport, HttpTransportResult};
+use crate::body::LocalFileChanged;
 use crate::config::HttpConfig;
 use crate::request::{PreparedRequest, RequestId};
 use crate::response::{BackendError, RawResponse};
 
 type Answer = (RequestId, HttpTransportResult);
+type Progress = (RequestId, u64, Option<u64>);
+
+/// Upload progress is reported at most this often per request (plus once at the end).
+const PROGRESS_EVERY: Duration = Duration::from_millis(100);
 
 /// Waiting for a free worker shorter than this does not shorten ureq's timeout (a request-level
 /// timeout costs ureq a rebuild of its TLS config per new connection).
@@ -42,6 +47,7 @@ struct Shared {
     default_timeout: Duration,
     jobs: Mutex<Receiver<Job>>,
     results: Sender<Answer>,
+    progress: Sender<Progress>,
     cancelled: Arc<Mutex<HashSet<RequestId>>>,
     stopping: Arc<AtomicBool>,
 }
@@ -61,8 +67,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// The real HTTP transport: ureq 3.4 (HTTP/1.1, blocking) with rustls (ring crypto) and the
 /// Mozilla root certificates, on [`HttpConfig::workers`] threads. The plugin creates it from the
-/// config when the app has no [`HttpTransportRes`](crate::HttpTransportRes); create one yourself
-/// to install it later.
+/// config when the app has no [`HttpTransportRes`](crate::HttpTransportRes); insert your own
+/// to use other settings.
 ///
 /// - TLS crypto is ring's, handed to ureq explicitly (never a process-wide default), so another
 ///   crate's rustls setup cannot change or break it.
@@ -88,6 +94,8 @@ pub struct UreqTransport {
     pool: Option<Pool>,
     results_tx: Sender<Answer>,
     results_rx: Mutex<Receiver<Answer>>,
+    progress_tx: Sender<Progress>,
+    progress_rx: Mutex<Receiver<Progress>>,
     immediate: Vec<Answer>,
     running: usize,
 }
@@ -110,6 +118,7 @@ impl UreqTransport {
         let agent =
             Agent::config_builder().http_status_as_error(false).max_redirects(0).timeout_global(Some(config.timeout())).tls_config(tls).build().new_agent();
         let (results_tx, results_rx) = mpsc::channel();
+        let (progress_tx, progress_rx) = mpsc::channel();
         Self {
             agent,
             default_timeout: config.timeout(),
@@ -117,6 +126,8 @@ impl UreqTransport {
             pool: None,
             results_tx,
             results_rx: Mutex::new(results_rx),
+            progress_tx,
+            progress_rx: Mutex::new(progress_rx),
             immediate: Vec::new(),
             running: 0,
         }
@@ -137,6 +148,7 @@ impl UreqTransport {
             default_timeout: self.default_timeout,
             jobs: Mutex::new(jobs_rx),
             results: self.results_tx.clone(),
+            progress: self.progress_tx.clone(),
             cancelled: Arc::clone(&cancelled),
             stopping: Arc::clone(&stopping),
         });
@@ -227,6 +239,19 @@ impl HttpTransport for UreqTransport {
     fn shutdown(&mut self) {
         self.stop_pool();
     }
+
+    fn streams_bodies(&self) -> bool {
+        true
+    }
+
+    fn poll_progress(&mut self) -> Vec<Progress> {
+        let rx = lock(&self.progress_rx);
+        let mut out = Vec::new();
+        while let Ok(progress) = rx.try_recv() {
+            out.push(progress);
+        }
+        out
+    }
 }
 
 fn worker(shared: &Shared) {
@@ -245,7 +270,7 @@ fn worker(shared: &Shared) {
             Err(BackendError::Timeout(format!("not sent: no free worker within {:?}", request.timeout)))
         } else {
             let timeout = if waited < QUEUE_SLACK { request.timeout } else { request.timeout.saturating_sub(waited) };
-            catch_unwind(AssertUnwindSafe(|| execute(&shared.agent, shared.default_timeout, request, timeout)))
+            catch_unwind(AssertUnwindSafe(|| execute(shared, id, request, timeout)))
                 .unwrap_or_else(|panic| Err(BackendError::Network(format!("the HTTP client panicked: {}", panic_text(panic.as_ref())))))
         };
         if shared.results.send((id, result)).is_err() {
@@ -258,12 +283,69 @@ fn panic_text(panic: &(dyn Any + Send)) -> &str {
     panic.downcast_ref::<&str>().copied().or_else(|| panic.downcast_ref::<String>().map(String::as_str)).unwrap_or("no message")
 }
 
-fn execute(agent: &Agent, default_timeout: Duration, request: PreparedRequest, timeout: Duration) -> HttpTransportResult {
-    let PreparedRequest { method, uri, headers, body, max_body_bytes, .. } = request;
+fn execute(shared: &Shared, id: RequestId, request: PreparedRequest, timeout: Duration) -> HttpTransportResult {
+    let PreparedRequest { method, uri, mut headers, body, streaming_body, upload_progress, max_body_bytes, .. } = request;
+    let (agent, default_timeout) = (&shared.agent, shared.default_timeout);
     let loopback = uri.host().is_some_and(crate::request::is_loopback_host);
-    match body {
-        Some(body) => run(agent, default_timeout, http_request(method, uri, headers, body), timeout, loopback, max_body_bytes),
-        None => run(agent, default_timeout, http_request(method, uri, headers, ()), timeout, loopback, max_body_bytes),
+    let report = upload_progress.then(|| (id, shared.progress.clone()));
+    match (streaming_body, body) {
+        (Some(stream), _) => {
+            // The files are opened and measured here, on the worker: nothing is sent if one is
+            // missing or the form is over its limit.
+            let (len, reader) = stream.open()?;
+            headers.insert(http::header::CONTENT_LENGTH, http::HeaderValue::from(len));
+            let body = SendBody::from_owned_reader(Counting::new(reader, len, report));
+            run(agent, default_timeout, http_request(method, uri, headers, body), timeout, loopback, max_body_bytes)
+        }
+        (None, Some(body)) if report.is_some() => {
+            let len = u64::try_from(body.len()).unwrap_or(u64::MAX);
+            headers.insert(http::header::CONTENT_LENGTH, http::HeaderValue::from(len));
+            let body = SendBody::from_owned_reader(Counting::new(std::io::Cursor::new(body), len, report));
+            run(agent, default_timeout, http_request(method, uri, headers, body), timeout, loopback, max_body_bytes)
+        }
+        (None, Some(body)) => run(agent, default_timeout, http_request(method, uri, headers, body), timeout, loopback, max_body_bytes),
+        (None, None) => run(agent, default_timeout, http_request(method, uri, headers, ()), timeout, loopback, max_body_bytes),
+    }
+}
+
+/// A body reader that counts what ureq reads for sending and reports it (throttled, and once
+/// when the whole body is read).
+struct Counting<R> {
+    inner: R,
+    sent: u64,
+    total: u64,
+    report: Option<(RequestId, Sender<Progress>)>,
+    last: Option<Instant>,
+}
+
+impl<R: Read> Counting<R> {
+    fn new(inner: R, total: u64, report: Option<(RequestId, Sender<Progress>)>) -> Self {
+        Self { inner, sent: 0, total, report, last: None }
+    }
+}
+
+impl<R: Read> Read for Counting<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n == 0 && self.total == 0 && self.last.is_none() {
+            // An empty body: its one "whole body is out" report.
+            self.last = Some(Instant::now());
+            if let Some((id, sender)) = &self.report {
+                let _ = sender.send((*id, 0, Some(0)));
+            }
+        }
+        if n > 0 {
+            self.sent = self.sent.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+            if let Some((id, sender)) = &self.report {
+                let now = Instant::now();
+                if self.sent >= self.total || self.last.is_none_or(|last| now.saturating_duration_since(last) >= PROGRESS_EVERY) {
+                    self.last = Some(now);
+                    // The plugin may be gone (exit): progress is only a report.
+                    let _ = sender.send((*id, self.sent, Some(self.total)));
+                }
+            }
+        }
+        Ok(n)
     }
 }
 
@@ -315,6 +397,10 @@ fn map_error(error: ureq::Error, limit: u64) -> BackendError {
         ureq::Error::Timeout(which) => BackendError::Timeout(format!("{which} limit")),
         ureq::Error::BodyExceedsLimit(_) => BackendError::BodyTooLarge { limit },
         ureq::Error::Tls(_) | ureq::Error::Rustls(_) | ureq::Error::Pem(_) => BackendError::Tls(error.to_string()),
+        // A local file of a streamed form changed while it was sent: our own words.
+        ureq::Error::Io(ref io) if io.get_ref().is_some_and(|inner| inner.is::<LocalFileChanged>()) => {
+            BackendError::Network(io.get_ref().map(ToString::to_string).unwrap_or_default())
+        }
         ureq::Error::Io(ref io) if io.kind() == std::io::ErrorKind::TimedOut => BackendError::Timeout(format!("socket: {io}")),
         ureq::Error::Io(ref io) if io.get_ref().is_some_and(|inner| inner.is::<rustls::Error>()) => BackendError::Tls(error.to_string()),
         ureq::Error::Http(_) => BackendError::InvalidRequest(error.to_string()),

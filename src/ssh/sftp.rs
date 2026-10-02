@@ -332,9 +332,12 @@ impl SshClient {
 /// The russh-sftp side, run on the SSH thread. Local file I/O runs on tokio's blocking pool
 /// (capped at 2 threads), never on the SSH thread itself.
 pub(super) mod ops {
+    use std::collections::BTreeMap;
+    use std::future::Future;
     use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use russh_sftp::client::error::Error as SftpError;
@@ -352,6 +355,9 @@ pub(super) mod ops {
     const WRITE_CHUNK: usize = 32 * 1024;
     /// Writes in flight at once for an upload.
     const WRITE_WINDOW: usize = 16;
+    /// A download keeps at most this many bytes requested or received but not yet written: 16
+    /// reads of 64 KiB in flight (the memory a download uses, whatever the file size).
+    const READ_WINDOW_BYTES: u64 = 16 * READ_CHUNK as u64;
     const PROGRESS_EVERY: Duration = Duration::from_millis(100);
 
     /// What an operation reports while it runs.
@@ -597,8 +603,9 @@ pub(super) mod ops {
     ) -> Result<u64, BackendError> {
         let flags = OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE;
         let handle = session.open(remote, flags, FileAttributes::empty()).await.map_err(map_error)?.handle;
+        let guard = HandleGuard::new(session, &handle);
         let result = write_all(session, &handle, total, report, &mut source).await;
-        let closed = session.close(handle).await.map_err(map_error);
+        let closed = guard.close().await.map_err(map_error);
         let written = check_written(result?, total)?;
         closed?;
         report.progress(written, Some(total));
@@ -664,37 +671,172 @@ pub(super) mod ops {
         }
     }
 
-    /// Sequential reads until end of file into `sink`. Returns the bytes read.
-    async fn download(session: &RawSftpSession, remote: &str, max_bytes: u64, report: &mut impl Reporter, sink: &mut Sink) -> Result<u64, BackendError> {
-        let handle = session.open(remote, OpenFlags::READ, FileAttributes::empty()).await.map_err(map_error)?.handle;
-        let total = session.fstat(handle.as_str()).await.ok().and_then(|attrs| attrs.attrs.size);
-        let mut offset: u64 = 0;
-        let mut throttle = Throttle { last: None };
-        let result = loop {
-            match session.read(handle.as_str(), offset, READ_CHUNK).await {
-                Ok(data) if data.data.is_empty() => break Ok(offset),
-                Ok(data) => {
-                    let len = u64::try_from(data.data.len()).unwrap_or(u64::MAX);
-                    offset = offset.saturating_add(len);
-                    if offset > max_bytes {
-                        break Err(too_large(max_bytes));
-                    }
-                    if let Err(error) = sink.put(data.data).await {
-                        break Err(error);
-                    }
-                    if throttle.due() {
-                        report.progress(offset, total);
-                    }
-                }
-                Err(SftpError::Status(status)) if status.status_code == StatusCode::Eof => break Ok(offset),
-                Err(error) => break Err(map_error(error)),
+    /// An open remote handle that is closed when the operation ends, also when the operation is
+    /// cancelled or times out (its future is dropped): then the close is sent from a task of its
+    /// own, so the server never keeps handles of abandoned transfers.
+    struct HandleGuard {
+        session: Arc<RawSftpSession>,
+        handle: Option<String>,
+    }
+
+    impl HandleGuard {
+        fn new(session: &Arc<RawSftpSession>, handle: &str) -> Self {
+            Self { session: Arc::clone(session), handle: Some(handle.to_string()) }
+        }
+
+        async fn close(mut self) -> Result<(), SftpError> {
+            match self.handle.take() {
+                Some(handle) => self.session.close(handle).await.map(|_| ()),
+                None => Ok(()),
             }
+        }
+    }
+
+    impl Drop for HandleGuard {
+        fn drop(&mut self) {
+            // Dropped on the SSH thread, inside its runtime. Without a runtime (the thread is
+            // already ending) there is nothing to send the close with: the session closes anyway.
+            if let (Some(handle), Ok(runtime)) = (self.handle.take(), tokio::runtime::Handle::try_current()) {
+                let session = Arc::clone(&self.session);
+                drop(runtime.spawn(async move {
+                    let _ = session.close(handle).await;
+                }));
+            }
+        }
+    }
+
+    /// What one read at an offset gave.
+    enum ReadOutcome {
+        /// Bytes (at most the length asked for; fewer is a short read, not the end).
+        Data(Vec<u8>),
+        /// Nothing at this offset: the end of the file.
+        Eof,
+    }
+
+    /// Reads a remote file at an offset: an open SFTP handle (tests: an in-memory file).
+    trait ReadAt: Clone + Send + Sync + 'static {
+        fn read_at(&self, offset: u64, len: u32) -> impl Future<Output = Result<ReadOutcome, BackendError>> + Send + 'static;
+    }
+
+    /// An open SFTP handle.
+    #[derive(Clone)]
+    struct SftpFile {
+        session: Arc<RawSftpSession>,
+        handle: Arc<str>,
+    }
+
+    impl ReadAt for SftpFile {
+        fn read_at(&self, offset: u64, len: u32) -> impl Future<Output = Result<ReadOutcome, BackendError>> + Send + 'static {
+            let (session, handle) = (Arc::clone(&self.session), self.handle.to_string());
+            async move {
+                match session.read(handle, offset, len).await {
+                    Ok(data) if data.data.is_empty() => Ok(ReadOutcome::Eof),
+                    Ok(data) => Ok(ReadOutcome::Data(data.data)),
+                    Err(SftpError::Status(status)) if status.status_code == StatusCode::Eof => Ok(ReadOutcome::Eof),
+                    Err(error) => Err(map_error(error)),
+                }
+            }
+        }
+    }
+
+    /// Download `remote` into `sink`. Returns the bytes written.
+    async fn download(session: &Arc<RawSftpSession>, remote: &str, max_bytes: u64, report: &mut impl Reporter, sink: &mut Sink) -> Result<u64, BackendError> {
+        let handle = session.open(remote, OpenFlags::READ, FileAttributes::empty()).await.map_err(map_error)?.handle;
+        let guard = HandleGuard::new(session, &handle);
+        let total = session.fstat(handle.as_str()).await.ok().and_then(|attrs| attrs.attrs.size);
+        let result = if total.is_some_and(|total| total > max_bytes) {
+            // The server says it is too large: refused before any data is read.
+            Err(too_large(max_bytes))
+        } else {
+            let file = SftpFile { session: Arc::clone(session), handle: Arc::from(handle.as_str()) };
+            read_pipelined(&file, max_bytes, total, report, sink, READ_WINDOW_BYTES).await.map(|(written, _)| written)
         };
-        let _ = session.close(handle).await;
+        let _ = guard.close().await;
         if let Ok(done) = result {
             report.progress(done, total);
         }
         result
+    }
+
+    /// Pipelined reads into `sink`, in file order: reads of [`READ_CHUNK`] bytes go out ahead of
+    /// the answers, as long as the bytes requested plus the bytes received but not yet written stay
+    /// within `window` (bounded memory). Answers may arrive in any order; they are written to the
+    /// sink in order. A short read (fewer bytes than asked, not at the end) asks again for the rest
+    /// of its range. The file ends at the lowest offset the server answered with end of file; once
+    /// that is known, no new reads go out. At most `max_bytes + 1` bytes are asked for (one byte
+    /// more proves the file is too large). The first error stops everything (reads still in
+    /// flight are dropped and their answers ignored).
+    ///
+    /// Returns the bytes written and the largest number of bytes that were requested or waiting
+    /// at once.
+    async fn read_pipelined<R: ReadAt>(
+        reader: &R,
+        max_bytes: u64,
+        total: Option<u64>,
+        report: &mut impl Reporter,
+        sink: &mut Sink,
+        window: u64,
+    ) -> Result<(u64, u64), BackendError> {
+        let chunk = u64::from(READ_CHUNK).min(window.max(1));
+        let limit = max_bytes.saturating_add(1);
+        let mut in_flight: JoinSet<(u64, u64, Result<ReadOutcome, BackendError>)> = JoinSet::new();
+        let spawn = |in_flight: &mut JoinSet<(u64, u64, Result<ReadOutcome, BackendError>)>, offset: u64, len: u64| {
+            let read = reader.read_at(offset, u32::try_from(len).unwrap_or(READ_CHUNK));
+            in_flight.spawn(async move { (offset, len, read.await) });
+        };
+        // Received, not yet written, by offset.
+        let mut waiting: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        let (mut next, mut written, mut outstanding, mut peak) = (0u64, 0u64, 0u64, 0u64);
+        let mut end: Option<u64> = None;
+        let mut throttle = Throttle { last: None };
+        loop {
+            while end.is_none() && next < limit && outstanding.saturating_add(chunk) <= window {
+                let len = chunk.min(limit - next);
+                spawn(&mut in_flight, next, len);
+                next = next.saturating_add(len);
+                outstanding = outstanding.saturating_add(len);
+            }
+            peak = peak.max(outstanding);
+            let Some(joined) = in_flight.join_next().await else { break };
+            let (offset, asked, result) = joined.map_err(|e| BackendError::Ssh(format!("an SFTP read task failed: {e}")))?;
+            outstanding = outstanding.saturating_sub(asked);
+            match result? {
+                ReadOutcome::Eof => end = Some(end.map_or(offset, |end| end.min(offset))),
+                ReadOutcome::Data(data) => {
+                    let got = u64::try_from(data.len()).unwrap_or(u64::MAX);
+                    if got > asked {
+                        return Err(BackendError::Ssh("SFTP: the server sent more bytes than were asked for".into()));
+                    }
+                    if got < asked {
+                        // A short read: the rest of the range.
+                        spawn(&mut in_flight, offset.saturating_add(got), asked - got);
+                        outstanding = outstanding.saturating_add(asked - got);
+                    }
+                    outstanding = outstanding.saturating_add(got);
+                    waiting.insert(offset, data);
+                    while let Some(data) = waiting.remove(&written) {
+                        let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+                        outstanding = outstanding.saturating_sub(len);
+                        let after = written.saturating_add(len);
+                        if after > max_bytes {
+                            return Err(too_large(max_bytes));
+                        }
+                        sink.put(data).await?;
+                        written = after;
+                        if throttle.due() {
+                            report.progress(written, total);
+                        }
+                    }
+                }
+            }
+        }
+        // Every read is answered. Bytes the server sent beyond the end it reported (the file
+        // grew meanwhile) are dropped; everything before the end must have been written.
+        match end {
+            Some(end) if end == written => Ok((written, peak)),
+            Some(_) => Err(BackendError::Ssh("SFTP: the remote file changed size during the download".into())),
+            None => Err(BackendError::Ssh("SFTP: the download ended without reaching the end of the file".into())),
+        }
     }
 
     async fn list(session: &RawSftpSession, path: &str) -> Result<Vec<SftpEntry>, BackendError> {
@@ -748,6 +890,196 @@ pub(super) mod ops {
         result?;
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(entries)
+    }
+
+    /// The download pipeline against an in-memory file that answers out of order, with short
+    /// reads, slowly, or with an error.
+    #[cfg(test)]
+    mod pipeline_tests {
+        use std::sync::Mutex;
+
+        use super::*;
+
+        #[derive(Default)]
+        struct Seen {
+            running: usize,
+            peak_running: usize,
+            asked: Vec<(u64, u32)>,
+        }
+
+        #[derive(Clone)]
+        struct FakeFile {
+            data: Arc<Mutex<Vec<u8>>>,
+            short_reads: bool,
+            fail_at: Option<u64>,
+            /// Grow the file by this many bytes on the first read past its end.
+            grow_once: Arc<Mutex<Option<usize>>>,
+            seen: Arc<Mutex<Seen>>,
+        }
+
+        impl FakeFile {
+            fn new(data: Vec<u8>) -> Self {
+                Self { data: Arc::new(Mutex::new(data)), short_reads: false, fail_at: None, grow_once: Arc::default(), seen: Arc::default() }
+            }
+        }
+
+        /// A deterministic scramble of an offset (answer order, short-read lengths).
+        fn mix(offset: u64) -> u64 {
+            offset.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(17)
+        }
+
+        impl ReadAt for FakeFile {
+            fn read_at(&self, offset: u64, len: u32) -> impl Future<Output = Result<ReadOutcome, BackendError>> + Send + 'static {
+                let me = self.clone();
+                async move {
+                    {
+                        let mut seen = me.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        seen.running += 1;
+                        seen.peak_running = seen.peak_running.max(seen.running);
+                        seen.asked.push((offset, len));
+                    }
+                    // Answers come back in a scrambled order.
+                    tokio::time::sleep(Duration::from_micros(mix(offset) % 3000)).await;
+                    let outcome = (|| {
+                        if me.fail_at.is_some_and(|at| offset >= at) {
+                            return Err(BackendError::Ssh("SFTP: Failure".into()));
+                        }
+                        let mut data = me.data.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+                        if start >= data.len() {
+                            if let Some(grow) = me.grow_once.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
+                                let len = data.len();
+                                data.resize(len + grow, 0xEE);
+                            }
+                            return Ok(ReadOutcome::Eof);
+                        }
+                        let mut want = usize::try_from(len).unwrap_or(0);
+                        if me.short_reads {
+                            want = 1 + usize::try_from(mix(offset) % u64::from(len)).unwrap_or(0);
+                        }
+                        let end = start.saturating_add(want).min(data.len());
+                        Ok(ReadOutcome::Data(data[start..end].to_vec()))
+                    })();
+                    me.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).running -= 1;
+                    outcome
+                }
+            }
+        }
+
+        #[derive(Default)]
+        struct Collect {
+            started: bool,
+            progress: Vec<(u64, Option<u64>)>,
+        }
+
+        impl Reporter for Collect {
+            fn started(&mut self) {
+                self.started = true;
+            }
+            fn progress(&mut self, done: u64, total: Option<u64>) {
+                self.progress.push((done, total));
+            }
+        }
+
+        fn content(len: usize) -> Vec<u8> {
+            (0..len).map(|i| u8::try_from(mix(i as u64) >> 56).unwrap_or(0)).collect()
+        }
+
+        fn run(file: &FakeFile, max_bytes: u64, window: u64) -> (Result<(u64, u64), BackendError>, Vec<u8>, Collect) {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap_or_else(|e| panic!("{e}"));
+            let mut sink = Sink::Memory(Vec::new());
+            let mut report = Collect::default();
+            let total = u64::try_from(file.data.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()).ok();
+            let result = runtime.block_on(read_pipelined(file, max_bytes, total, &mut report, &mut sink, window));
+            let Sink::Memory(bytes) = sink else { panic!("wrong sink") };
+            (result, bytes, report)
+        }
+
+        #[test]
+        fn every_size_arrives_whole_and_in_order() {
+            let chunk = usize::try_from(READ_CHUNK).unwrap_or(0);
+            for len in [0, 1, chunk - 1, chunk, chunk + 1, 3 * chunk, 16 * chunk, 16 * chunk + 7, 40 * chunk + 12_345] {
+                for short_reads in [false, true] {
+                    let data = content(len);
+                    let mut file = FakeFile::new(data.clone());
+                    file.short_reads = short_reads;
+                    let (result, bytes, _) = run(&file, u64::MAX - 1, READ_WINDOW_BYTES);
+                    let (written, peak) = result.unwrap_or_else(|e| panic!("{len} bytes, short reads {short_reads}: {e}"));
+                    assert_eq!(written, len as u64);
+                    assert!(bytes == data, "{len} bytes, short reads {short_reads}: content differs");
+                    assert!(peak <= READ_WINDOW_BYTES, "memory bound: {peak}");
+                }
+            }
+        }
+
+        #[test]
+        fn reads_really_run_in_parallel_within_the_window() {
+            let file = FakeFile::new(content(64 * usize::try_from(READ_CHUNK).unwrap_or(0)));
+            let (result, _, _) = run(&file, u64::MAX - 1, READ_WINDOW_BYTES);
+            let (_, peak) = result.unwrap_or_else(|e| panic!("{e}"));
+            let seen = file.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(seen.peak_running, 16, "16 reads of 64 KiB in flight");
+            assert_eq!(peak, READ_WINDOW_BYTES);
+            // Never more than the file + the one read that finds its end per slot of the window.
+            assert!(seen.asked.len() <= 64 + 16, "{} reads", seen.asked.len());
+        }
+
+        #[test]
+        fn a_smaller_window_bounds_memory_with_short_reads() {
+            let mut file = FakeFile::new(content(5_000_000));
+            file.short_reads = true;
+            let window = 3 * u64::from(READ_CHUNK);
+            let (result, bytes, _) = run(&file, u64::MAX - 1, window);
+            let (written, peak) = result.unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(written, 5_000_000);
+            assert!(bytes == content(5_000_000));
+            assert!(peak <= window, "{peak} > {window}");
+        }
+
+        #[test]
+        fn the_size_limit_holds_exactly() {
+            let file = FakeFile::new(content(300_000));
+            let (result, _, _) = run(&file, 300_000, READ_WINDOW_BYTES);
+            assert_eq!(result.map(|(w, _)| w).ok(), Some(300_000), "exactly the limit is fine");
+            let (result, _, _) = run(&file, 299_999, READ_WINDOW_BYTES);
+            assert!(matches!(result, Err(BackendError::BodyTooLarge { limit: 299_999 })), "{result:?}");
+            let seen = file.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(seen.asked.iter().all(|(offset, len)| offset + u64::from(*len) <= 300_000 + 300_000), "never asks past the limit + 1");
+        }
+
+        #[test]
+        fn an_error_midway_stops_the_download() {
+            let mut file = FakeFile::new(content(2_000_000));
+            file.fail_at = Some(1_000_000);
+            let (result, bytes, _) = run(&file, u64::MAX - 1, READ_WINDOW_BYTES);
+            assert!(matches!(&result, Err(BackendError::Ssh(why)) if why.contains("Failure")), "{result:?}");
+            assert!(bytes.len() <= 1_000_000 + usize::try_from(READ_CHUNK).unwrap_or(0), "nothing past the read that failed is written");
+            assert!(bytes == content(2_000_000)[..bytes.len()], "what was written is the file's start");
+        }
+
+        #[test]
+        fn progress_only_grows_and_ends_at_the_written_size() {
+            let file = FakeFile::new(content(3_000_000));
+            let (result, _, report) = run(&file, u64::MAX - 1, READ_WINDOW_BYTES);
+            assert!(result.is_ok());
+            assert!(report.progress.windows(2).all(|w| w[0].0 <= w[1].0), "{:?}", report.progress);
+            assert!(report.progress.iter().all(|(done, total)| *done <= 3_000_000 && *total == Some(3_000_000)));
+        }
+
+        #[test]
+        fn a_file_that_grows_while_it_is_read_gives_a_consistent_prefix_or_an_honest_error() {
+            let data = content(200_000);
+            let file = FakeFile::new(data.clone());
+            *file.grow_once.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(100_000);
+            let (result, bytes, _) = run(&file, u64::MAX - 1, READ_WINDOW_BYTES);
+            match result {
+                Ok((written, _)) => {
+                    assert_eq!(written, bytes.len() as u64);
+                    assert!(bytes[..200_000] == data[..], "the original bytes first");
+                }
+                Err(error) => assert!(matches!(&error, BackendError::Ssh(why) if why.contains("changed size")), "{error:?}"),
+            }
+        }
     }
 }
 

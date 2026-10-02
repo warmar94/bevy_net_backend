@@ -15,6 +15,7 @@ struct FakeState {
     submitted: Vec<(RequestId, PreparedRequest)>,
     answered: HashSet<RequestId>,
     outbox: Vec<(RequestId, HttpTransportResult)>,
+    progress: Vec<(RequestId, u64, Option<u64>)>,
     cancelled: Vec<RequestId>,
     shutdowns: usize,
 }
@@ -83,7 +84,14 @@ impl FakeHttpTransport {
         state.outbox.push((id, result));
     }
 
-    /// Every request submitted so far, in order.
+    /// Report upload progress for `id` on the next poll (an `HttpProgress` message while the
+    /// request waits for its answer).
+    pub fn progress(&self, id: RequestId, sent: u64, total: Option<u64>) {
+        self.lock().progress.push((id, sent, total));
+    }
+
+    /// Every request submitted so far, in order. A form with files from disk is in
+    /// `PreparedRequest::streaming_body` (`read_all` gives its bytes).
     pub fn requests(&self) -> Vec<(RequestId, PreparedRequest)> {
         self.lock().submitted.clone()
     }
@@ -93,7 +101,7 @@ impl FakeHttpTransport {
         self.lock().submitted.last().cloned()
     }
 
-    /// Submitted requests that no route or [`reply`](Self::reply) has answered yet.
+    /// Submitted requests that no route or [`reply`](Self::reply) has answered so far.
     pub fn waiting(&self) -> Vec<RequestId> {
         let state = self.lock();
         state.submitted.iter().map(|(id, _)| *id).filter(|id| !state.answered.contains(id)).collect()
@@ -131,5 +139,14 @@ impl HttpTransport for FakeHttpTransport {
 
     fn shutdown(&mut self) {
         self.lock().shutdowns += 1;
+    }
+
+    /// It records streamed bodies like any other (it never reads them).
+    fn streams_bodies(&self) -> bool {
+        true
+    }
+
+    fn poll_progress(&mut self) -> Vec<(RequestId, u64, Option<u64>)> {
+        std::mem::take(&mut self.lock().progress)
     }
 }

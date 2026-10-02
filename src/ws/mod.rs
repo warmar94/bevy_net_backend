@@ -165,14 +165,117 @@ pub enum WsState {
     Connected,
     /// The connection was lost (or an attempt failed); the next attempt starts after `retry_in`.
     Reconnecting {
-        /// The attempt that is coming (1 for the first retry).
+        /// The next attempt (1 for the first retry).
         attempt: u32,
-        /// How long until it starts (backoff with jitter).
+        /// How long until it starts (backoff with jitter; at least the `Retry-After` of a 429 / 503
+        /// handshake answer).
         retry_in: Duration,
     },
     /// Not connected and not trying: closed by the game, refused for good (401/403, a policy
     /// close code, invalid settings), out of attempts, or the app is exiting.
     Disconnected,
+    /// The server refused the credentials and the connection waits for the game to refresh them
+    /// (only with [`WsSettings::with_credentials_refresh`]): a [`WsCredentialsRefused`] message
+    /// asked for it. New credentials in [`BackendCredentials`](crate::BackendCredentials) start
+    /// one new connection; cleared credentials or the refresh timeout end it (`Disconnected`).
+    WaitingForCredentials,
+}
+
+/// Credentials refresh for one connection (off unless given to
+/// [`WsSettings::with_credentials_refresh`]).
+///
+/// When the server refuses the credentials (a `401` answer to the handshake, a refused
+/// first-message authentication, or a close with one of the [close codes](Self::with_close_code)
+/// added here), the connection does not end at once: it goes
+/// [`WsState::WaitingForCredentials`] and the plugin writes ONE [`WsCredentialsRefused`]
+/// message, however many connections were refused with the same credentials. The game refreshes
+/// with its own call (for example its refresh route through `HttpClient`) and sets the new
+/// credentials with [`BackendCredentials::set`](crate::BackendCredentials::set); every waiting
+/// connection then makes ONE new connection with them. The crate never calls a refresh route
+/// itself.
+///
+/// It ends in `Disconnected` (with the server's refusal as the error) when:
+/// - the new connection is refused again (one refresh per refusal, never a loop; a further
+///   refresh is allowed only after a connection stayed up for the reconnect policy's
+///   `stable_after`),
+/// - the game clears the credentials ([`BackendCredentials::clear`](crate::BackendCredentials::clear),
+///   e.g. because its refresh was refused),
+/// - no new credentials arrive within the [timeout](Self::with_timeout) (default 30 s).
+///
+/// If the credentials already changed since the refused handshake (the game refreshed on its own
+/// meanwhile), no message is written and the connection connects again with the new ones at once.
+/// Any [`BackendCredentials::set`](crate::BackendCredentials::set) counts as a change, also one
+/// with the same token.
+///
+/// ```
+/// use std::time::Duration;
+/// use bevy_net_backend::{WsCredentialsRefresh, WsSettings};
+///
+/// let settings = WsSettings::new("wss://game.example.com/ws")
+///     .with_credentials_refresh(WsCredentialsRefresh::new().with_timeout(Duration::from_secs(20)).with_close_code(4001));
+/// # let _ = settings;
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WsCredentialsRefresh {
+    pub(crate) timeout: Duration,
+    pub(crate) close_codes: Vec<u16>,
+}
+
+impl Default for WsCredentialsRefresh {
+    fn default() -> Self {
+        Self { timeout: Duration::from_secs(30), close_codes: Vec::new() }
+    }
+}
+
+impl WsCredentialsRefresh {
+    /// A refresh after a `401` handshake answer or a refused first-message authentication,
+    /// waiting up to 30 s for new credentials.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How long a refused connection waits for new credentials (default 30 s, clamped to
+    /// 1 ms..=1 h).
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout.clamp(Duration::from_millis(1), crate::config::MAX_TIMEOUT);
+        self
+    }
+
+    /// Also refresh when the server closes an open connection with `code` (for example a server
+    /// that closes with 4001 when it revokes a session). Codes the protocol would retry anyway
+    /// are refreshed too. Call it once per code.
+    pub fn with_close_code(mut self, code: u16) -> Self {
+        if !self.close_codes.contains(&code) {
+            self.close_codes.push(code);
+        }
+        self
+    }
+
+    /// The timeout.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// The close codes that also start a refresh.
+    pub fn close_codes(&self) -> &[u16] {
+        &self.close_codes
+    }
+}
+
+/// The server refused the credentials of a WebSocket connection that has
+/// [`WsSettings::with_credentials_refresh`]: refresh them and set the new ones with
+/// [`BackendCredentials::set`](crate::BackendCredentials::set) (or clear them to give up). ONE
+/// message per refresh, however many connections wait for it; every waiting connection is in
+/// [`WsState::WaitingForCredentials`]. If your game already refreshes on its own and a refresh is
+/// in flight, finish that one instead of starting a second. Written in `First`.
+#[derive(Message, Clone, Debug)]
+#[non_exhaustive]
+pub struct WsCredentialsRefused {
+    /// The connection that was refused first.
+    pub name: WsName,
+    /// The server's refusal (`Status` 401, `Disconnected` for a refused authentication message,
+    /// or `Closed`).
+    pub error: BackendError,
 }
 
 /// Reconnect policy: exponential backoff with full jitter, a cap and optional maximum attempts.
@@ -180,6 +283,9 @@ pub enum WsState {
 /// The delay before attempt `n` (1, 2, …) is a random value in `0..=min(cap, base · 2^(n-1))`
 /// (without jitter: exactly that bound). The counter resets once a connection stays up for
 /// `stable_after`. Defaults: base 500 ms, cap 30 s, unlimited attempts, stable after 10 s, jitter on.
+/// A handshake refused with 429 or 503 and a `Retry-After` header (delta-seconds) waits at least
+/// that long ([`BackendError::retry_after`](crate::BackendError::retry_after)), even above the cap
+/// (at most [`MAX_TIMEOUT`](crate::MAX_TIMEOUT)).
 #[derive(Clone, Debug)]
 pub struct WsReconnect {
     base: Duration,
@@ -298,6 +404,7 @@ pub struct WsSettings {
     pub(crate) resend_limit: usize,
     pub(crate) waiting_limit: usize,
     pub(crate) auth_ack: Option<Duration>,
+    pub(crate) refresh: Option<WsCredentialsRefresh>,
 }
 
 impl fmt::Debug for WsSettings {
@@ -317,6 +424,7 @@ impl fmt::Debug for WsSettings {
             .field("allow_insecure", &self.allow_insecure)
             .field("credentials", &self.credentials)
             .field("protocol", &self.protocol.is_some())
+            .field("credentials_refresh", &self.refresh)
             .finish_non_exhaustive()
     }
 }
@@ -353,6 +461,7 @@ impl WsSettings {
             resend_limit: 32,
             waiting_limit: 64,
             auth_ack: None,
+            refresh: None,
         }
     }
 
@@ -471,6 +580,20 @@ impl WsSettings {
     pub fn with_auth_ack(mut self, timeout: Duration) -> Self {
         self.auth_ack = Some(timeout.clamp(Duration::from_millis(1), crate::config::MAX_TIMEOUT));
         self
+    }
+
+    /// Refresh refused credentials once instead of ending the connection (off by default: a
+    /// refused handshake or authentication ends it at once). See [`WsCredentialsRefresh`]. Has no
+    /// effect on a connection [`without_credentials`](Self::without_credentials) or while no
+    /// credentials are set.
+    pub fn with_credentials_refresh(mut self, refresh: WsCredentialsRefresh) -> Self {
+        self.refresh = Some(refresh);
+        self
+    }
+
+    /// The credentials refresh, if enabled.
+    pub fn credentials_refresh(&self) -> Option<&WsCredentialsRefresh> {
+        self.refresh.as_ref()
     }
 
     /// The connect timeout.
@@ -597,7 +720,7 @@ impl fmt::Debug for WsRawResponse {
 /// answered with [`WsResponse<Self::Response>`](WsResponse). Register with
 /// [`add_ws_request`](crate::BackendAppExt::add_ws_request).
 ///
-/// Methods added later always come with a default implementation.
+/// Methods are only ever added to this trait with a default implementation.
 #[cfg(feature = "json")]
 pub trait WsRequest: serde::Serialize + Send + Sync + 'static {
     /// The decoded answer.
@@ -917,6 +1040,7 @@ pub(crate) fn build(app: &mut App) {
     app.init_resource::<WsConnections>()
         .init_resource::<systems::WsRuntime>()
         .add_message::<WsStateChanged>()
+        .add_message::<WsCredentialsRefused>()
         .add_message::<WsMessage>()
         .add_message::<WsRawResponse>()
         .add_systems(First, systems::ws_receive.in_set(BackendSystems::Receive).after(crate::inflight::receive_answers))

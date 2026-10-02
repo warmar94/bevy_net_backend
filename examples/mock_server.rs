@@ -35,7 +35,7 @@
 //! | `GET /gzip` | `{"compressed":true}`, gzip-encoded when the client accepts gzip |
 //! | `GET /gzip-bomb?bytes=N` | always gzip-encoded: N zero bytes (default 1 MiB, at most 16 MiB); about 6.6 KB of gzip per MiB (16 MiB ≈ 106 KB) |
 //! | `POST /purchase` | `201 {"ok":true}` (counts hits, for "sent exactly once" tests) |
-//! | `POST /upload` (`multipart/form-data`) | `200` with what it parsed: `{"fields":[{"name":…,"value":…}],"files":[{"name":…,"filename":…,"content_type":…,"size":N,"crc32":"8 hex"}]}` in body order (counts hits); a body that is not valid multipart `400`, over 8 MiB `413` |
+//! | `POST /upload` (`multipart/form-data`) | `200` with what it parsed: `{"fields":[{"name":…,"value":…}],"files":[{"name":…,"filename":…,"content_type":…,"size":N,"crc32":"8 hex"}]}` in body order (counts hits; a field part with a `Content-Type` also has `"content_type":…`); a body that is not valid multipart `400`, over 8 MiB `413` |
 //! | `GET /empty` | `204` with no body |
 //! | `GET /redirect` | `302` to `/characters/1` |
 //! | anything else | `404 {"message":"not found"}` |
@@ -604,7 +604,11 @@ mod multipart {
         let mut files = Vec::new();
         for part in parts {
             match &part.filename {
-                None => fields.push(format!(r#"{{"name":{},"value":{}}}"#, json_string(&part.name), json_string(&String::from_utf8_lossy(part.data)))),
+                None => {
+                    // A field with its own Content-Type (e.g. a JSON part) says so.
+                    let content_type = part.content_type.as_deref().map(|t| format!(r#","content_type":{}"#, json_string(t))).unwrap_or_default();
+                    fields.push(format!(r#"{{"name":{},"value":{}{content_type}}}"#, json_string(&part.name), json_string(&String::from_utf8_lossy(part.data))))
+                }
                 Some(filename) => files.push(format!(
                     r#"{{"name":{},"filename":{},"content_type":{},"size":{},"crc32":"{:08x}"}}"#,
                     json_string(&part.name),

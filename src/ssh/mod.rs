@@ -270,7 +270,7 @@ impl SshPrompt {
 
 /// Answers keyboard-interactive prompts ([`SshAuth::keyboard_interactive`]). Called on the SSH
 /// thread: never block. Return one answer per prompt, or `None` to give up (the method then
-/// fails). Methods added later always come with a default implementation.
+/// fails). Methods are only ever added to it with a default implementation.
 pub trait SshPromptResponder: Send + Sync + 'static {
     /// Answer one round.
     fn respond(&self, request: &SshPromptRequest) -> Option<Vec<Secret>>;
@@ -300,7 +300,7 @@ impl fmt::Debug for SshPromptAnswers {
 }
 
 impl SshPromptAnswers {
-    /// No answers yet.
+    /// An empty set of answers.
     pub fn new() -> Self {
         Self::default()
     }
@@ -329,7 +329,7 @@ impl SshPromptResponder for SshPromptAnswers {
 /// Automatic reconnect of an SSH connection ([`SshTarget::with_reconnect`]; OFF unless set):
 /// exponential backoff with full jitter, as for WebSocket. A reconnect **never re-runs a
 /// command**: commands that were running when the connection was lost are answered
-/// `Disconnected` (with their honest `started`); commands that had not been sent yet wait for the
+/// `Disconnected` (with their honest `started`); commands that were never sent wait for the
 /// new connection. Not retried: host key, authentication, protocol (`Ssh`) and invalid-settings
 /// errors. The delay before attempt `n` is a random value in `0..=min(cap, base · 2^(n-1))`;
 /// the counter resets after the connection stayed up for `stable_after`.
@@ -497,8 +497,8 @@ impl SshTarget {
 
     /// A `Host` alias of the user's `~/.ssh/config`: `HostName`, `Port`, `User`, `IdentityFile`
     /// (no passphrase) and `ConnectTimeout` are taken from it when connecting (on the SSH thread).
-    /// Settings given here win over the file. `Match` blocks and `%` tokens are not supported;
-    /// `ProxyJump` / `ProxyCommand` are ignored (the connection goes straight to the host). Without
+    /// Settings given here win over the file. `Match` blocks, `%` tokens and `ProxyJump` /
+    /// `ProxyCommand` are ignored (the connection goes straight to the host). Without
     /// an `IdentityFile` and without [`with_auth`](Self::with_auth) the connection fails.
     pub fn from_ssh_config(alias: impl Into<String>) -> Self {
         Self::blank(alias.into(), TargetSource::Config(None), None)
@@ -886,7 +886,7 @@ pub enum SshState {
     /// The connection was lost (or an attempt failed) and [`SshTarget::with_reconnect`] is set:
     /// the next attempt starts after `retry_in`. New commands wait for it; none is re-run.
     Reconnecting {
-        /// The attempt that is coming (1 for the first retry).
+        /// The next attempt (1 for the first retry).
         attempt: u32,
         /// How long until it starts.
         retry_in: Duration,

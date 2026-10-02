@@ -46,7 +46,7 @@ impl std::error::Error for ConfigError {}
 /// (for example [`set_base_url`](Self::set_base_url) after reading its own settings file).
 ///
 /// Build it with [`new`](Self::new) and the `with_*` methods; every field is private so that
-/// adding a setting later is not a breaking change.
+/// a new setting is not a breaking change.
 ///
 /// ```
 /// use std::time::Duration;
