@@ -13,6 +13,8 @@ use crate::response::{BackendError, RawResponse};
 pub(crate) mod fake;
 #[cfg(feature = "http")]
 pub(crate) mod http_pool;
+#[cfg(feature = "http")]
+pub(crate) mod tls_connector;
 
 /// What a transport reports for one request: the server's answer (any status; the plugin turns
 /// a non-2xx status into [`BackendError::Status`]) or the error that stopped it.
@@ -44,8 +46,22 @@ pub trait HttpTransport: Send + Sync + 'static {
         let _ = id;
     }
 
-    /// The app is exiting: the plugin has answered everything. Release threads and connections;
-    /// never wait for work in progress. Default: nothing.
+    /// The plugin wants to answer `id` without the transport (a cancel, or its deadline passed).
+    /// Return `true` when that is fine (as [`cancel`](Self::cancel)), `false` when it is too late:
+    /// the request already completed in a way the answer must report (a download whose file was
+    /// already put in place) and its result follows from [`poll`](Self::poll); the plugin then
+    /// keeps waiting for that result. The plugin calls this instead of `cancel`. Default: calls
+    /// `cancel`, `true`.
+    fn try_cancel(&mut self, id: RequestId) -> bool {
+        self.cancel(id);
+        true
+    }
+
+    /// The app is exiting. Called in `Last` before the plugin answers what is still open:
+    /// results [`poll`](Self::poll) returns afterwards are delivered as they are, the rest is
+    /// answered `Shutdown`. Release threads and connections; never wait for a network timeout
+    /// (the built-in transport waits at most 1 s for running downloads to remove their part
+    /// files). Default: nothing.
     fn shutdown(&mut self) {}
 
     /// Whether this transport sends a [`PreparedRequest::streaming_body`] (a multipart form with
@@ -59,6 +75,21 @@ pub trait HttpTransport: Send + Sync + 'static {
     /// [`PreparedRequest::upload_progress`]. Called once per frame in `First`, before
     /// [`poll`](Self::poll). Default: none.
     fn poll_progress(&mut self) -> Vec<(RequestId, u64, Option<u64>)> {
+        Vec::new()
+    }
+
+    /// Whether this transport writes a [`PreparedRequest::download`] to its file (with
+    /// [`HttpDownload::receive`](crate::HttpDownload) for a 2xx answer, the result in
+    /// [`RawResponse::file`](crate::RawResponse::file)). Default `false`: the plugin then answers
+    /// such a request `InvalidRequest` and never hands it over.
+    fn downloads_to_files(&self) -> bool {
+        false
+    }
+
+    /// Download progress since the last call: `(request, bytes written, total)`, for requests
+    /// whose [`PreparedRequest::download`] has progress on. Called once per frame in `First`,
+    /// before [`poll`](Self::poll). Default: none.
+    fn poll_download_progress(&mut self) -> Vec<(RequestId, u64, Option<u64>)> {
         Vec::new()
     }
 }

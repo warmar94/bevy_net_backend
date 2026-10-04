@@ -41,8 +41,8 @@ pub use link::TungsteniteTransport;
 #[cfg(feature = "json")]
 pub use protocol::JsonEnvelope;
 pub use protocol::{WsIncoming, WsProtocol};
-/// The WebSocket systems, for ordering the SSH systems after them.
-#[cfg(feature = "ssh")]
+/// The WebSocket systems, for ordering the SSH and OAuth systems after them.
+#[cfg(any(feature = "ssh", feature = "oauth"))]
 pub(crate) use systems::{ws_exit, ws_receive, ws_send};
 pub use transport::{FakeWsTransport, WsHandshake, WsLinkEvent, WsLinkId, WsTransport, WsTransportRes};
 
@@ -1029,8 +1029,8 @@ pub(crate) fn register_push<P: WsPushMessage>(app: &mut App) {
 }
 
 /// Plugin part of `ws`: resources, messages, the three systems, and the real transport unless one
-/// is installed.
-pub(crate) fn build(app: &mut App) {
+/// is installed (with the plugin's TLS settings).
+pub(crate) fn build(app: &mut App, tls: &crate::TlsSettings, proxy: &crate::ProxySettings) {
     app.init_resource::<WsClient>();
     let cancels = app.world().resource::<crate::InFlight>().cancel_list();
     if let Some(mut client) = app.world_mut().get_resource_mut::<WsClient>() {
@@ -1048,6 +1048,6 @@ pub(crate) fn build(app: &mut App) {
         .add_systems(PostUpdate, systems::ws_send.in_set(BackendSystems::Send).after(crate::inflight::send_requests))
         .add_systems(Last, systems::ws_exit.in_set(BackendSystems::Exit).after(crate::inflight::shutdown_on_exit).run_if(on_message::<bevy_app::AppExit>));
     if !app.world().contains_resource::<WsTransportRes>() {
-        app.insert_resource(WsTransportRes::new(TungsteniteTransport::new()));
+        app.insert_resource(WsTransportRes::new(TungsteniteTransport::with_settings(tls, proxy)));
     }
 }

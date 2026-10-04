@@ -258,6 +258,66 @@ fn a_secret_overwrites_its_whole_allocation_with_zeros() {
 }
 
 #[test]
+fn a_request_body_overwrites_its_whole_allocation_with_zeros() {
+    let mut bytes = Vec::with_capacity(64);
+    bytes.extend_from_slice(br#"{"password":"fake-password-to-wipe"}"#);
+    let mut body = WipedBytes::from(bytes);
+    assert_eq!(body.as_slice(), br#"{"password":"fake-password-to-wipe"}"#);
+    assert_eq!(format!("{body:?}"), "WipedBytes(36 bytes)");
+    body.wipe();
+    let (len, capacity, zeroed) = body.allocation();
+    assert_eq!(len, 0);
+    assert!(capacity >= 64, "the allocation is kept until the drop: {capacity}");
+    assert!(zeroed, "every byte of the allocation is zero after the wipe");
+}
+
+/// The body a request carries to the transport is the wiped buffer itself (moved, never copied
+/// into a plain `Vec`), and JSON is written into an exactly sized one (no reallocation copy).
+#[test]
+fn request_bodies_reach_the_transport_in_wiped_buffers() {
+    let mut raw = Vec::with_capacity(32);
+    raw.extend_from_slice(b"fake-raw-secret");
+    let pointer = raw.as_ptr();
+    let prepared = prepare(OutgoingRequest::post("/a").with_body(raw), &cfg("https://api.example.com"), None);
+    let mut body = prepared.ok().and_then(|p| p.body).unwrap_or_default();
+    assert_eq!((body.as_ptr(), body.as_slice()), (pointer, &b"fake-raw-secret"[..]), "moved, not copied");
+    body.wipe();
+    assert!(body.allocation().2);
+
+    #[cfg(feature = "json")]
+    {
+        let login = serde_json::json!({"user": "ayla", "password": "fake-password", "list": [1, "two", {"k": "v"}]});
+        let parts = OutgoingRequest::post("/login").with_json(&login).into_parts();
+        let mut body = parts.body.unwrap_or_default();
+        let (len, capacity, _) = body.allocation();
+        assert_eq!(len, capacity, "the JSON buffer is exactly sized");
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).ok(), Some(login));
+        body.wipe();
+        assert!(body.allocation().2);
+
+        // The body a JsonBodyField rewrites is exactly sized and wiped too.
+        let mut request = OutgoingRequest::post("/a").with_json(&serde_json::json!({"score": 10}));
+        JsonBodyField::new("token", SECRET).apply(&mut request);
+        let mut body = request.into_parts().body.unwrap_or_default();
+        let (len, capacity, _) = body.allocation();
+        assert_eq!(len, capacity);
+        body.wipe();
+        assert!(body.allocation().2);
+    }
+
+    #[cfg(feature = "json")]
+    {
+        let mut value = serde_json::json!({"password": "fake-password", "nested": [{"token": "fake-token"}], "n": 1});
+        crate::credentials::wipe_json(&mut value);
+        // Every key and string was wiped as it was taken out: an empty object is left.
+        assert_eq!(value, serde_json::json!({}));
+        let mut list = serde_json::json!(["fake-token", 2]);
+        crate::credentials::wipe_json(&mut list);
+        assert_eq!(list, serde_json::json!(["", 2]));
+    }
+}
+
+#[test]
 fn secrets_never_show_in_debug_or_display() {
     let secret = Secret::new(SECRET);
     assert_eq!(format!("{secret}"), "<redacted>");

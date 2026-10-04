@@ -336,7 +336,6 @@ pub(super) mod ops {
     use std::future::Future;
     use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -401,7 +400,7 @@ pub(super) mod ops {
     pub(super) fn check_downloaded(written: u64, total: Option<u64>) -> Result<u64, BackendError> {
         match total {
             Some(total) if total > 0 && written < total => Err(BackendError::Ssh(format!(
-                "SFTP: the remote file ended after {written} bytes, but it had {total} bytes when it was opened (it was cut short during the download)"
+                "SFTP: the remote file was cut short during the download (expected {total} bytes, its size when it was opened; received {written})"
             ))),
             _ => Ok(written),
         }
@@ -411,8 +410,17 @@ pub(super) mod ops {
         BackendError::BodyTooLarge { limit }
     }
 
+    /// A local file problem before the transfer started (opening or creating the local file):
+    /// nothing was sent, `InvalidRequest`.
     fn local_error(what: &str, path: &Path, error: &std::io::Error) -> BackendError {
         BackendError::InvalidRequest(format!("{what} `{}`: {error}", super::file_name(path)))
+    }
+
+    /// A local file problem after the transfer started (reading the file mid-upload, writing,
+    /// syncing or renaming the download): bytes already went over the connection, so `Ssh`, never
+    /// `InvalidRequest` (that would say "never sent").
+    fn local_error_during(what: &str, path: &Path, error: &std::io::Error) -> BackendError {
+        BackendError::Ssh(format!("{what} `{}`: {error}", super::file_name(path)))
     }
 
     /// Run blocking local file work on the blocking pool.
@@ -423,10 +431,7 @@ pub(super) mod ops {
     /// A part file next to `local` with a name no other download uses:
     /// `<name>.<process>-<request>-<n>.part`.
     pub(in crate::ssh) fn part_path(local: &Path, id: RequestId) -> PathBuf {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        let mut name = local.file_name().map(std::ffi::OsStr::to_os_string).unwrap_or_default();
-        name.push(format!(".{}-{}-{}.part", std::process::id(), id.to_string().trim_start_matches('#'), NEXT.fetch_add(1, Ordering::Relaxed)));
-        local.with_file_name(name)
+        crate::download::part_path(local, id)
     }
 
     struct Throttle {
@@ -487,9 +492,14 @@ pub(super) mod ops {
             }
             SftpOp::DownloadFile { remote, local } => {
                 let part = part.unwrap_or_else(|| part_path(&local, crate::request::RequestId::next()));
-                let path = part.clone();
-                // `create_new`: never truncate a file that happens to have that name.
+                let (path, target) = (part.clone(), local.clone());
                 let file = blocking(move || {
+                    if target.is_dir() {
+                        return Err(BackendError::InvalidRequest(format!("`{}` is a folder, not a file", super::file_name(&target))));
+                    }
+                    // Part files of this target that an earlier run left (it ended mid-download).
+                    crate::download::remove_stale_parts(&target);
+                    // `create_new`: never truncate a file that happens to have that name.
                     std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| local_error("could not create the local file", &path, &e))
                 })
                 .await?;
@@ -502,16 +512,27 @@ pub(super) mod ops {
                 };
                 let (part_for_io, local_for_io) = (part.clone(), local.clone());
                 blocking(move || {
-                    let flushed = match file {
-                        Some(mut file) => file.flush().map_err(|e| local_error("could not write the local file", &part_for_io, &e)),
+                    // Flushed and synced to disk before the rename, as the HTTP download and
+                    // `SecretFile`: a power cut never leaves a renamed but empty or partial file.
+                    let synced = match file {
+                        Some(mut file) => {
+                            file.flush().and_then(|()| file.sync_all()).map_err(|e| local_error_during("could not write the local file", &part_for_io, &e))
+                        }
                         None => Ok(()),
                     };
-                    match result.and_then(|bytes| flushed.map(|()| bytes)) {
+                    match result.and_then(|bytes| synced.map(|()| bytes)) {
                         Ok(bytes) => match std::fs::rename(&part_for_io, &local_for_io) {
-                            Ok(()) => Ok(SftpOutcome::Downloaded { bytes }),
+                            Ok(()) => {
+                                let folder = match local_for_io.parent() {
+                                    Some(parent) if !parent.as_os_str().is_empty() => parent,
+                                    _ => Path::new("."),
+                                };
+                                crate::secret_file::sync_dir(folder);
+                                Ok(SftpOutcome::Downloaded { bytes })
+                            }
                             Err(e) => {
                                 let _ = std::fs::remove_file(&part_for_io);
-                                Err(local_error("could not move the download into place", &local_for_io, &e))
+                                Err(local_error_during("could not move the download into place", &local_for_io, &e))
                             }
                         },
                         Err(error) => {
@@ -576,7 +597,7 @@ pub(super) mod ops {
                                 Ok(0) => break,
                                 Ok(n) => filled = filled.saturating_add(n),
                                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                                Err(e) => return Err(local_error("could not read the local file", &path, &e)),
+                                Err(e) => return Err(local_error_during("could not read the local file", &path, &e)),
                             }
                         }
                         chunk.truncate(filled);
@@ -607,7 +628,7 @@ pub(super) mod ops {
                     let Some(mut handle) = file.take() else { return Err(BackendError::Ssh("internal: the local file is gone".into())) };
                     let path = path.clone();
                     let handle = blocking(move || {
-                        handle.write_all(&chunk).map_err(|e| local_error("could not write the local file", &path, &e))?;
+                        handle.write_all(&chunk).map_err(|e| local_error_during("could not write the local file", &path, &e))?;
                         Ok(handle)
                     })
                     .await?;
@@ -772,6 +793,12 @@ pub(super) mod ops {
             // The server says it is too large: refused before any data is read.
             Err(too_large(max_bytes))
         } else {
+            if let (Sink::Memory(data), Some(size)) = (&mut *sink, total) {
+                // Into memory: the reported size once (at most the transfer limit), instead of a
+                // Vec that doubles while it grows (up to about twice the file at the peak).
+                // Best effort: without the memory the Vec grows as usual.
+                let _ = data.try_reserve_exact(usize::try_from(size).unwrap_or(0));
+            }
             let file = SftpFile { session: Arc::clone(session), handle: Arc::from(handle.as_str()) };
             read_pipelined(&file, max_bytes, total, report, sink, READ_WINDOW_BYTES).await.and_then(|(written, _)| check_downloaded(written, total))
         };
@@ -1104,6 +1131,33 @@ pub(super) mod ops {
                 Err(error) => assert!(matches!(&error, BackendError::Ssh(why) if why.contains("changed size")), "{error:?}"),
             }
         }
+
+        /// Local file errors once a transfer runs (reading the file mid-upload, writing the
+        /// download) are `Ssh`: bytes already went out, so never "never sent".
+        #[test]
+        fn local_file_errors_during_a_transfer_are_not_never_sent() {
+            let dir = std::env::temp_dir().join(format!("bnb-sftp-local-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+            let path = dir.join("local.bin");
+            std::fs::write(&path, vec![5u8; 100_000]).unwrap_or_else(|e| panic!("{e}"));
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap_or_else(|e| panic!("{e}"));
+
+            // A file that cannot be read (opened for writing only) fails on its first chunk.
+            let write_only = std::fs::OpenOptions::new().write(true).open(&path).unwrap_or_else(|e| panic!("{e}"));
+            let mut source = ChunkSource::File { file: Some(write_only), path: path.clone() };
+            let error = runtime.block_on(source.next()).err();
+            assert!(matches!(&error, Some(BackendError::Ssh(why)) if why.contains("could not read the local file")), "{error:?}");
+            assert_ne!(error.as_ref().and_then(BackendError::was_sent), Some(false));
+
+            // A file that cannot be written (opened for reading only) fails on its first chunk.
+            let read_only = std::fs::File::open(&path).unwrap_or_else(|e| panic!("{e}"));
+            let mut sink = Sink::File { file: Some(read_only), path: path.clone() };
+            let error = runtime.block_on(sink.put(vec![1u8; 10])).err();
+            assert!(matches!(&error, Some(BackendError::Ssh(why)) if why.contains("could not write the local file")), "{error:?}");
+            assert_ne!(error.as_ref().and_then(BackendError::was_sent), Some(false));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
 
@@ -1127,7 +1181,7 @@ mod tests {
     fn a_remote_file_cut_short_is_an_error_with_both_sizes_and_no_size_reads_to_the_end() {
         let error = super::ops::check_downloaded(1_000, Some(4_096)).err();
         assert!(
-            matches!(&error, Some(BackendError::Ssh(why)) if why.contains("ended after 1000 bytes") && why.contains("had 4096 bytes") && why.contains("cut short")),
+            matches!(&error, Some(BackendError::Ssh(why)) if why == "SFTP: the remote file was cut short during the download (expected 4096 bytes, its size when it was opened; received 1000)"),
             "{error:?}"
         );
         assert_eq!(super::ops::check_downloaded(0, Some(1)).ok(), None);

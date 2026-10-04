@@ -22,21 +22,29 @@ pub struct RawResponse {
     pub status: StatusCode,
     /// The response headers.
     pub headers: HeaderMap,
-    /// The body, as received (decompressed with feature `gzip`).
+    /// The body, as received (decompressed with feature `gzip`). Empty for a download to a file.
     pub body: Vec<u8>,
+    /// For a download to a file ([`HttpClient::download`](crate::HttpClient::download)): the file
+    /// the transport wrote (see [`HttpDownload::receive`](crate::HttpDownload)). `None` otherwise.
+    pub file: Option<crate::DownloadedFile>,
 }
 
 impl fmt::Debug for RawResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let headers: Vec<&str> = self.headers.keys().map(HeaderName::as_str).collect();
-        f.debug_struct("RawResponse").field("status", &self.status).field("header_names", &headers).field("body_bytes", &self.body.len()).finish()
+        f.debug_struct("RawResponse")
+            .field("status", &self.status)
+            .field("header_names", &headers)
+            .field("body_bytes", &self.body.len())
+            .field("file", &self.file)
+            .finish()
     }
 }
 
 impl RawResponse {
     /// A response with this status and body and no headers (for custom transports and tests).
     pub fn new(status: StatusCode, body: impl Into<Vec<u8>>) -> Self {
-        Self { status, headers: HeaderMap::new(), body: body.into() }
+        Self { status, headers: HeaderMap::new(), body: body.into(), file: None }
     }
 
     /// Add a header (builder style).
@@ -196,6 +204,11 @@ pub enum BackendError {
     /// a server that does not support strict key exchange with a cipher that needs it, an SFTP
     /// error status, … (the dependency's or the server's words).
     Ssh(String),
+    /// A sign-in at an OAuth 2.0 / OpenID Connect provider did not succeed (feature `oauth`): the
+    /// provider sent the player back with an error (`access_denied` when the player declined), the
+    /// token endpoint refused the code, or its answer had no ID token. The text holds the
+    /// provider's error code, never a code or a token.
+    OAuth(String),
 }
 
 /// Why an SSH host key was refused ([`BackendError::HostKey`]). `#[non_exhaustive]`.
@@ -361,6 +374,7 @@ impl fmt::Debug for BackendError {
             }
             BackendError::AuthFailed(why) => f.debug_tuple("AuthFailed").field(why).finish(),
             BackendError::Ssh(why) => f.debug_tuple("Ssh").field(why).finish(),
+            BackendError::OAuth(why) => f.debug_tuple("OAuth").field(why).finish(),
         }
     }
 }
@@ -393,6 +407,7 @@ impl fmt::Display for BackendError {
             BackendError::HostKey { host, fingerprint, problem } => write!(f, "SSH host key check failed for `{host}`: {problem} ({fingerprint})"),
             BackendError::AuthFailed(why) => write!(f, "SSH authentication failed: {why}"),
             BackendError::Ssh(why) => write!(f, "SSH error: {why}"),
+            BackendError::OAuth(why) => write!(f, "sign-in failed: {why}"),
         }
     }
 }

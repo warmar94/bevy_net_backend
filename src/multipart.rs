@@ -38,6 +38,12 @@ enum Data {
     File(PathBuf),
 }
 
+/// One step of [`Multipart::walk`].
+enum Walk<'a> {
+    Bytes(&'a [u8]),
+    File(&'a Part),
+}
+
 impl Data {
     /// The bytes in memory (none for a file read later).
     fn bytes(&self) -> &[u8] {
@@ -299,29 +305,53 @@ impl Multipart {
         Err(BackendError::InvalidRequest("could not find a multipart boundary that does not occur in the content".into()))
     }
 
-    /// The body as pieces: bytes in memory (merged) and the files read while sending.
+    /// The body as pieces: bytes in memory (merged, each run in a buffer of its exact size that is
+    /// wiped on drop) and the files read while sending.
     pub(crate) fn segments_with(&self, boundary: &str) -> Vec<Segment> {
+        // Pass 1: the length of every run of in-memory bytes; pass 2: fill exactly sized buffers
+        // (no reallocation leaves a copy of a text field behind).
+        let mut lengths = vec![0usize];
+        self.walk(boundary, &mut |piece| match piece {
+            Walk::Bytes(bytes) => {
+                if let Some(last) = lengths.last_mut() {
+                    *last = last.saturating_add(bytes.len());
+                }
+            }
+            Walk::File(_) => lengths.push(0),
+        });
+        let mut lengths = lengths.into_iter();
         let mut segments = Vec::new();
-        let mut bytes = Vec::new();
-        for part in &self.parts {
-            bytes.extend_from_slice(b"--");
-            bytes.extend_from_slice(boundary.as_bytes());
-            bytes.extend_from_slice(b"\r\n");
-            bytes.extend_from_slice(part_head(part).as_bytes());
-            match &part.data {
-                Data::Bytes(data) => bytes.extend_from_slice(data),
-                Data::File(path) => {
-                    segments.push(Segment::Bytes(std::mem::take(&mut bytes)));
+        let mut bytes = Vec::with_capacity(lengths.next().unwrap_or(0));
+        self.walk(boundary, &mut |piece| match piece {
+            Walk::Bytes(more) => bytes.extend_from_slice(more),
+            Walk::File(part) => {
+                let next = Vec::with_capacity(lengths.next().unwrap_or(0));
+                segments.push(Segment::Bytes(std::mem::replace(&mut bytes, next).into()));
+                if let Data::File(path) = &part.data {
                     segments.push(Segment::File { path: path.clone(), field: part.name.clone() });
                 }
             }
-            bytes.extend_from_slice(b"\r\n");
-        }
-        bytes.extend_from_slice(b"--");
-        bytes.extend_from_slice(boundary.as_bytes());
-        bytes.extend_from_slice(b"--\r\n");
-        segments.push(Segment::Bytes(bytes));
+        });
+        segments.push(Segment::Bytes(bytes.into()));
         segments
+    }
+
+    /// The body in order: in-memory bytes and the file parts (whose data is read later).
+    fn walk(&self, boundary: &str, out: &mut dyn FnMut(Walk<'_>)) {
+        for part in &self.parts {
+            out(Walk::Bytes(b"--"));
+            out(Walk::Bytes(boundary.as_bytes()));
+            out(Walk::Bytes(b"\r\n"));
+            out(Walk::Bytes(part_head(part).as_bytes()));
+            match &part.data {
+                Data::Bytes(data) => out(Walk::Bytes(data)),
+                Data::File(_) => out(Walk::File(part)),
+            }
+            out(Walk::Bytes(b"\r\n"));
+        }
+        out(Walk::Bytes(b"--"));
+        out(Walk::Bytes(boundary.as_bytes()));
+        out(Walk::Bytes(b"--\r\n"));
     }
 
     fn check(&self) -> Result<(), BackendError> {

@@ -16,6 +16,7 @@ struct FakeState {
     answered: HashSet<RequestId>,
     outbox: Vec<(RequestId, HttpTransportResult)>,
     progress: Vec<(RequestId, u64, Option<u64>)>,
+    download_progress: Vec<(RequestId, u64, Option<u64>)>,
     cancelled: Vec<RequestId>,
     shutdowns: usize,
 }
@@ -38,6 +39,10 @@ struct FakeState {
 ///   copy of the route's result on the next poll (the next frame's `First`).
 /// - Any other request waits until [`reply`](Self::reply) answers it, or forever (the plugin's
 ///   deadline then answers it with a timeout).
+/// - A download ([`HttpClient::download`](crate::HttpClient::download), feature `http`): a 2xx
+///   result's body is written to the download's file with
+///   [`HttpDownload::receive`](crate::HttpDownload) when the route or reply answers it (its
+///   progress included), and the result carries the file instead of the body.
 #[derive(Clone, Default)]
 pub struct FakeHttpTransport {
     state: Arc<Mutex<FakeState>>,
@@ -80,6 +85,11 @@ impl FakeHttpTransport {
     /// (a late or duplicate report is how tests prove the plugin discards them).
     pub fn reply(&self, id: RequestId, result: HttpTransportResult) {
         let mut state = self.lock();
+        let request = state.submitted.iter().find(|(submitted, _)| *submitted == id).map(|(_, request)| request.clone());
+        let result = match request {
+            Some(request) => written(&mut state, id, &request, result),
+            None => result,
+        };
         state.answered.insert(id);
         state.outbox.push((id, result));
     }
@@ -123,6 +133,7 @@ impl HttpTransport for FakeHttpTransport {
         let mut state = self.lock();
         let route = state.routes.iter().rev().find(|(method, path, _)| *method == request.method && path == request.path()).map(|(_, _, r)| r.clone());
         if let Some(result) = route {
+            let result = written(&mut state, id, &request, result);
             state.answered.insert(id);
             state.outbox.push((id, result));
         }
@@ -149,4 +160,33 @@ impl HttpTransport for FakeHttpTransport {
     fn poll_progress(&mut self) -> Vec<(RequestId, u64, Option<u64>)> {
         std::mem::take(&mut self.lock().progress)
     }
+
+    /// With feature `http`: a 2xx answer to a download is written to its file.
+    fn downloads_to_files(&self) -> bool {
+        cfg!(feature = "http")
+    }
+
+    fn poll_download_progress(&mut self) -> Vec<(RequestId, u64, Option<u64>)> {
+        std::mem::take(&mut self.lock().download_progress)
+    }
+}
+
+/// A download's 2xx result: its body written to the download's file (feature `http`).
+#[cfg(feature = "http")]
+fn written(state: &mut FakeState, id: RequestId, request: &PreparedRequest, result: HttpTransportResult) -> HttpTransportResult {
+    let Some(download) = &request.download else { return result };
+    match result {
+        Ok(response) if response.is_success() && response.file.is_none() => {
+            let length = u64::try_from(response.body.len()).ok();
+            let progress = &mut state.download_progress;
+            let file = download.receive(id, &mut response.body.as_slice(), length, &mut |received, total| progress.push((id, received, total)))?;
+            Ok(crate::RawResponse { body: Vec::new(), file: Some(file), ..response })
+        }
+        other => other,
+    }
+}
+
+#[cfg(not(feature = "http"))]
+fn written(_: &mut FakeState, _: RequestId, _: &PreparedRequest, result: HttpTransportResult) -> HttpTransportResult {
+    result
 }

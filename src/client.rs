@@ -24,6 +24,8 @@ pub(crate) enum Route {
     /// [`JsonResponse<T>`](crate::JsonResponse), decoded on delivery.
     #[cfg(feature = "json")]
     Json(Box<dyn JsonRoute>),
+    /// [`HttpDownloadResponse`](crate::HttpDownloadResponse).
+    Download,
 }
 
 /// Decodes and delivers one typed JSON answer (type-erased `T`).
@@ -112,6 +114,30 @@ impl HttpClient {
     /// `GET path`; the answer is a [`HttpResponse`](crate::HttpResponse).
     pub fn get(&self, path: &str) -> RequestId {
         self.send(OutgoingRequest::get(path))
+    }
+
+    /// Download: send `request` and write a 2xx answer body to the file `download` names, streamed
+    /// as it arrives (never held in memory as a whole); the answer is a
+    /// [`HttpDownloadResponse`](crate::HttpDownloadResponse), progress arrives as
+    /// [`HttpDownloadProgress`](crate::HttpDownloadProgress). Large files may need a longer
+    /// [`OutgoingRequest::with_timeout`]: the timeout covers the whole transfer. Cancel works like
+    /// for any request: the transfer stops at the next piece and the part file is removed (a cancel
+    /// that comes after the file was put in place is too late: the answer is the file).
+    ///
+    /// The installed transport must write files
+    /// ([`HttpTransport::downloads_to_files`](crate::HttpTransport::downloads_to_files): the built-in
+    /// one and [`FakeHttpTransport`](crate::FakeHttpTransport) with feature `http` do); with another
+    /// one the request is answered `InvalidRequest` and never sent.
+    pub fn download(&self, request: OutgoingRequest, download: crate::HttpDownload) -> RequestId {
+        let mut request = request;
+        request.set_download(download);
+        self.push(request, Route::Download)
+    }
+
+    /// `GET path` written to the local file `file` (see [`download`](Self::download)); the answer is
+    /// a [`HttpDownloadResponse`](crate::HttpDownloadResponse).
+    pub fn download_to(&self, path: &str, file: impl Into<std::path::PathBuf>) -> RequestId {
+        self.download(OutgoingRequest::get(path), crate::HttpDownload::to(file))
     }
 
     /// Upload `form` as `multipart/form-data` with `POST path`; the answer is a

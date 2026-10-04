@@ -39,6 +39,8 @@ mod russh_client;
 mod sftp;
 mod ssh_config;
 mod systems;
+#[cfg(feature = "oauth")]
+pub(crate) use systems::{ssh_exit, ssh_receive, ssh_send};
 mod transport;
 
 pub use russh_client::RusshTransport;

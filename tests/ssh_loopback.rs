@@ -925,8 +925,12 @@ mod sftp {
         // Truncated on the server while it is read (the handle stays open).
         setup.mock.put_file("cut.bin", &data[..1024 * 1024]);
         let answer = op_within(&mut app, id, Duration::from_secs(60));
-        let expected = format!("had {} bytes when it was opened", data.len());
-        assert!(matches!(&answer.result, Err(BackendError::Ssh(why)) if why.contains(&expected) && why.contains("cut short")), "{:?}", answer.result);
+        let expected = format!("expected {} bytes, its size when it was opened; received ", data.len());
+        assert!(
+            matches!(&answer.result, Err(BackendError::Ssh(why)) if why.contains(&expected) && why.contains("cut short during the download")),
+            "{:?}",
+            answer.result
+        );
         assert_eq!(answer.started, Some(true));
         assert!(!local.exists(), "no file under the final name");
         assert!(wait_until(|| part_files(&setup.dir).is_empty(), Duration::from_secs(5)), "{:?}", part_files(&setup.dir));

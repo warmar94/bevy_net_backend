@@ -5,7 +5,12 @@
 //! wrong passphrase, a command line, stdin and output holding secrets); with `ws` + `json` also
 //! real WebSocket connections to the mock with a bearer token, an API key header, an API key in
 //! the URL and a first-message authentication. Records written on the in-process mock servers'
-//! threads (`mock-*`) are left out: they are the server side. (Debug / Display redaction is
+//! threads (`mock-*`) are left out: they are the server side. A `SecretFile` save / load / damaged
+//! load / remove runs too, and downloads to a file whose answer holds a secret. With `oauth` a
+//! whole desktop sign-in against the mock provider (client secret, code, PKCE verifier, `state`,
+//! nonce, ID / access / refresh tokens): none of them may be in an event or a `log` record, except
+//! the HTTP client's raw byte dumps at `trace` (`ureq_proto`, documented in the README: keep it
+//! below `trace`). (Debug / Display redaction is
 //! unit-tested in the crate.) Own test binary: it installs a process-wide subscriber and logger.
 
 use std::fmt::{self, Write as _};
@@ -21,12 +26,18 @@ use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Metadata, Subscriber};
 
 const SECRETS: [&str; 4] = ["fake-bearer-7f3a", "fake-header-9c2e", "fake-query-41bd", "fake-field-d00d"];
+const FILE_SECRET: &str = "fake-file-2b2b";
 #[cfg(feature = "ssh")]
 const SSH_SECRETS: [&str; 4] = ["fake-ssh-pass-5e1f", "fake-ssh-cmd-77aa", "fake-ssh-stdin-9b9b", "fake-ssh-wrong-0a0a"];
 #[cfg(feature = "ws")]
 const WS_SECRETS: [&str; 2] = ["fake-ws-old-3c3c", "fake-ws-new-4d4d"];
 #[cfg(all(feature = "ws", feature = "json"))]
 const WS_LINK_SECRETS: [&str; 4] = ["fake-ws-bearer-6e6e", "fake-ws-header-7f7f", "fake-ws-query-8a8a", "fake-ws-first-9b9b"];
+
+#[cfg(feature = "oauth")]
+#[allow(dead_code)]
+#[path = "support/oauth_provider.rs"]
+mod oauth_provider;
 
 #[cfg(feature = "ssh")]
 #[allow(dead_code)]
@@ -112,6 +123,8 @@ fn no_secret_is_ever_logged() {
     let fake = FakeHttpTransport::new();
     fake.route(Method::GET, "/ok", Ok(RawResponse::new(StatusCode::OK, format!(r#"{{"token":"{}"}}"#, SECRETS[0]))));
     fake.route(Method::POST, "/ok", Ok(RawResponse::new(StatusCode::UNAUTHORIZED, SECRETS[1])));
+    let download_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("redaction-download-{}", std::process::id()));
+    std::fs::create_dir_all(&download_dir).unwrap_or_else(|e| panic!("{e}"));
     let mut app = TestApp::new();
     app.insert_resource(HttpTransportRes::new(fake.clone())).add_plugins(BackendPlugin::new(
         HttpConfig::new("https://api.example.com").with_header("X-Api-Key", SECRETS[1]).with_timeout(Duration::from_millis(1)),
@@ -133,6 +146,8 @@ fn no_secret_is_ever_logged() {
         backend.send(OutgoingRequest::post("/ok").with_body(br#"{"a":1}"#.to_vec()).with_query("q", SECRETS[2]));
         let never = backend.get("/never");
         backend.get("/timeout");
+        backend.download_to("/ok", download_dir.join("answer.json"));
+        backend.download(OutgoingRequest::post("/ok").with_query("q", SECRETS[2]), HttpDownload::to(download_dir.join("refused.json")));
         app.step();
         app.world().resource::<HttpClient>().cancel(never);
         app.step_n(400);
@@ -145,11 +160,16 @@ fn no_secret_is_ever_logged() {
     ws_part();
     #[cfg(all(feature = "ws", feature = "json"))]
     ws_link_part();
+    secret_file_part();
+    let _ = std::fs::remove_dir_all(&download_dir);
+    #[cfg(feature = "oauth")]
+    let oauth_secrets = oauth_part();
 
     let logs = capture.0.lock().unwrap_or_else(PoisonError::into_inner).clone();
     let log_records = records.client.lock().unwrap_or_else(PoisonError::into_inner).clone();
     #[cfg_attr(not(any(feature = "ws", feature = "ssh")), allow(unused_mut))]
     let mut every_secret: Vec<&str> = SECRETS.to_vec();
+    every_secret.push(FILE_SECRET);
     #[cfg(feature = "ws")]
     every_secret.extend(WS_SECRETS);
     #[cfg(all(feature = "ws", feature = "json"))]
@@ -175,11 +195,28 @@ fn no_secret_is_ever_logged() {
     }
     #[cfg(feature = "ssh")]
     assert!(log_records.contains("russh"), "no russh record captured:\n{log_records}");
+    #[cfg(feature = "oauth")]
+    {
+        // The HTTP client's raw byte dumps at `trace` (`ureq_proto`) hold request and answer bytes:
+        // the documented exception. They are captured (the exchange really ran through ureq), and
+        // every other record is clean.
+        assert!(log_records.contains("ureq_proto"), "no ureq_proto record captured:\n{log_records}");
+        let other: String = log_records.lines().filter(|line| !line.starts_with("ureq_proto")).map(|line| format!("{line}\n")).collect();
+        for secret in &oauth_secrets {
+            assert!(secret.len() >= 8, "a sign-in value was not captured: `{secret}`");
+            assert!(!leaked(&other, secret), "`{secret}` was in a `log` record:\n{other}");
+            assert!(!logs.contains(secret.as_str()), "`{secret}` was logged:\n{logs}");
+        }
+        assert!(logs.contains("sign-in") && logs.contains("tokens received"), "the sign-in part logged nothing:\n{logs}");
+    }
     assert!(logs.contains(">>> NET-BACKEND"), "nothing captured:\n{logs}");
     assert!(logs.contains("not sent"), "the refused request is logged:\n{logs}");
-    for secret in SECRETS {
+    for secret in SECRETS.iter().chain([&FILE_SECRET]) {
         assert!(!logs.contains(secret), "`{secret}` was logged:\n{logs}");
     }
+    assert!(logs.contains("from SecretFile"), "the secret file part logged nothing:\n{logs}");
+    #[cfg(unix)]
+    assert!(logs.contains("can be read by other users"), "the loose secret file was not warned about:\n{logs}");
     #[cfg(feature = "ws")]
     {
         assert!(logs.contains("refused the credentials"), "the WebSocket part logged nothing:\n{logs}");
@@ -194,6 +231,73 @@ fn no_secret_is_ever_logged() {
             assert!(!logs.contains(secret), "`{secret}` was logged:\n{logs}");
         }
     }
+}
+
+/// A whole desktop sign-in against the mock provider; returns every secret value of it (client
+/// secret, code, verifier, state, nonce, the three tokens).
+#[cfg(feature = "oauth")]
+fn oauth_part() -> Vec<String> {
+    let provider = oauth_provider::Provider::start();
+    let mut app = TestApp::builder().frame_duration(Duration::from_millis(1)).real_pause(Duration::from_millis(2)).build();
+    app.add_plugins(BackendPlugin::default());
+    app.watch::<OAuthSignInUrl>().watch::<OAuthSignedIn>();
+    let id = app.world().resource::<OAuthClient>().sign_in(&provider.flow());
+    let mut url = None;
+    for _ in 0..3000 {
+        app.step();
+        url = app.all_messages::<OAuthSignInUrl>().into_iter().find(|p| p.id == id).map(|p| p.url);
+        if url.is_some() {
+            break;
+        }
+    }
+    let url = url.unwrap_or_else(|| panic!("no sign-in URL"));
+    tracing::info!("sign-in page {:?}", app.all_messages::<OAuthSignInUrl>().first());
+    let query = oauth_provider::query_of(&url);
+    let location = oauth_provider::browse(&url);
+    let code = oauth_provider::query_of(&location).get("code").cloned().unwrap_or_default();
+    let mut tokens = None;
+    for _ in 0..3000 {
+        app.step();
+        tokens = app.all_messages::<OAuthSignedIn>().into_iter().find(|a| a.id == id).map(|a| a.result);
+        if tokens.is_some() {
+            break;
+        }
+    }
+    let tokens = tokens.unwrap_or_else(|| panic!("no answer")).unwrap_or_else(|e| panic!("{e}"));
+    tracing::info!("signed in: {tokens:?}");
+    app.world_mut().write_message(AppExit::Success);
+    app.step();
+    let mut secrets = vec![
+        oauth_provider::CLIENT_SECRET.to_string(),
+        code,
+        tokens.id_token.expose().to_string(),
+        tokens.access_token.as_ref().map(|t| t.expose().to_string()).unwrap_or_default(),
+        tokens.refresh_token.as_ref().map(|t| t.expose().to_string()).unwrap_or_default(),
+        tokens.nonce.expose().to_string(),
+        query.get("state").cloned().unwrap_or_default(),
+    ];
+    secrets.extend(provider.with(|s| s.verifiers.clone()));
+    secrets
+}
+
+/// `SecretFile`: a save, a load (on Unix of a file other users can read: a warning), a damaged
+/// file holding the secret (an error), a remove. Nothing may log the secret.
+fn secret_file_part() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("redaction-secret-file-{}", std::process::id()));
+    let file = SecretFile::new(dir.join("token"));
+    file.save(&Secret::new(FILE_SECRET)).unwrap_or_else(|e| panic!("{e}"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o644)).unwrap_or_else(|e| panic!("{e}"));
+    }
+    let loaded = file.load().unwrap_or_else(|e| panic!("{e}"));
+    tracing::info!("loaded {loaded:?} from {file:?}");
+    std::fs::write(file.path(), FILE_SECRET).unwrap_or_else(|e| panic!("{e}"));
+    let error = file.load().err().unwrap_or_else(|| panic!("a damaged file loaded"));
+    tracing::warn!("{error} / {error:?}");
+    file.remove().unwrap_or_else(|e| panic!("{e}"));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A real SSH connection (to the mock) whose passphrase, command line, stdin and output are

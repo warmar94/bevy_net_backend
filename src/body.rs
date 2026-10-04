@@ -9,12 +9,98 @@ use std::sync::Arc;
 
 use crate::response::BackendError;
 
+/// Request body bytes that are overwritten with zeros (the whole allocation) when they are
+/// dropped: [`PreparedRequest::body`](crate::PreparedRequest::body) and the in-memory pieces of a
+/// [`StreamingBody`]. A request body can hold a password or a refresh token (a login request, a
+/// [`JsonBodyField`](crate::Credentials)), so the crate never leaves one behind in freed memory.
+///
+/// Read it as `&[u8]` (`Deref`, [`as_slice`](Self::as_slice)). Each clone is its own copy and is
+/// wiped when it is dropped. `Debug` shows the length only. Made from a `Vec<u8>` (moved, not
+/// copied: `From<Vec<u8>>`).
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct WipedBytes(Vec<u8>);
+
+impl WipedBytes {
+    /// The bytes.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// `value` as JSON in one exactly sized buffer (a counting pass first), so no reallocation
+    /// leaves a copy behind.
+    #[cfg(feature = "json")]
+    pub(crate) fn json<T: serde::Serialize + ?Sized>(value: &T) -> Result<Self, serde_json::Error> {
+        struct Count(usize);
+        impl io::Write for Count {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0 = self.0.saturating_add(buf.len());
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut count = Count(0);
+        serde_json::to_writer(&mut count, value)?;
+        let mut body = Self(Vec::with_capacity(count.0));
+        serde_json::to_writer(&mut body.0, value)?;
+        Ok(body)
+    }
+
+    /// Overwrite the whole allocation (spare capacity included) with zeros and empty it.
+    pub(crate) fn wipe(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+
+    /// The length, capacity and whether the whole allocation is zero (for the wipe tests).
+    #[cfg(test)]
+    pub(crate) fn allocation(&mut self) -> (usize, usize, bool) {
+        let spare = self.0.spare_capacity_mut();
+        // SAFETY: only reads; `wipe` wrote every byte of the spare capacity (zeroize does), so
+        // reading it as initialized bytes is sound.
+        let zeroed = spare.iter().all(|b| unsafe { b.assume_init() } == 0);
+        (self.0.len(), self.0.capacity(), zeroed)
+    }
+}
+
+impl Drop for WipedBytes {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
+impl std::ops::Deref for WipedBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AsRef<[u8]> for WipedBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl From<Vec<u8>> for WipedBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+}
+
+impl fmt::Debug for WipedBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "WipedBytes({} bytes)", self.0.len())
+    }
+}
+
 /// One piece of a streamed body.
 #[derive(Clone)]
 #[cfg_attr(not(feature = "http"), allow(dead_code))]
 pub(crate) enum Segment {
-    /// Bytes already in memory (boundaries, part headers, in-memory parts).
-    Bytes(Vec<u8>),
+    /// Bytes already in memory (boundaries, part headers, in-memory parts), wiped on drop.
+    Bytes(WipedBytes),
     /// A local file, read when the body is sent. `field` names the form field in errors.
     File { path: PathBuf, field: String },
 }
@@ -113,7 +199,7 @@ impl StreamingBody {
 }
 
 enum Piece {
-    Bytes { bytes: Vec<u8>, at: usize },
+    Bytes { bytes: WipedBytes, at: usize },
     File { file: File, left: u64, size: u64, name: String, field: String },
 }
 
@@ -203,7 +289,11 @@ mod tests {
 
     fn body(path: &std::path::Path, max: u64) -> StreamingBody {
         StreamingBody::new(
-            vec![Segment::Bytes(b"head-".to_vec()), Segment::File { path: path.to_path_buf(), field: "f".into() }, Segment::Bytes(b"-tail".to_vec())],
+            vec![
+                Segment::Bytes(b"head-".to_vec().into()),
+                Segment::File { path: path.to_path_buf(), field: "f".into() },
+                Segment::Bytes(b"-tail".to_vec().into()),
+            ],
             max,
         )
     }

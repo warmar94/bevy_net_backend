@@ -1,7 +1,7 @@
 //! [`TungsteniteTransport`]: every link on its own std thread (tungstenite, sync).
 //!
-//! The thread connects (TCP, through an `http://` proxy's `CONNECT` tunnel when the environment
-//! sets one, then rustls with the crate's explicit ring config for `wss://`, then the WebSocket
+//! The thread connects (TCP, through an `http://` proxy's `CONNECT` tunnel when the transport's
+//! `ProxySettings` name one, then rustls with the crate's explicit ring config for `wss://`, then the WebSocket
 //! handshake), all within ONE absolute deadline (the connect timeout), then loops:
 //! apply commands (send / close), heartbeat ping, flush, one read with a budget of one read
 //! timeout, dead-peer check. The budget is enforced below rustls and tungstenite
@@ -34,11 +34,13 @@ use tungstenite::protocol::{CloseFrame, Role, WebSocketConfig};
 use tungstenite::{Message, WebSocket};
 use zeroize::Zeroizing;
 
-use super::proxy::{self, ProxyEnv};
+use super::proxy;
 use super::transport::{WsHandshake, WsLinkEvent, WsLinkId, WsTransport};
 use super::WsFrame;
 use crate::config::MAX_TIMEOUT;
+use crate::proxy::{ProxyRoute, ProxySettings, Via};
 use crate::response::{BackendError, RawResponse};
+use crate::tls::TlsSettings;
 
 type Event = (WsLinkId, WsLinkEvent);
 
@@ -73,13 +75,15 @@ struct LinkHandle {
 
 /// The real WebSocket transport (feature `ws`): tungstenite 0.30 (no permessage-deflate) on one
 /// std thread per link, named `net-backend-ws-link#N`. TLS is rustls with ring, passed explicitly,
-/// and Mozilla's roots, exactly like the HTTP transport. No async runtime.
+/// and Mozilla's roots (or the trust of a [`TlsSettings`], see [`with_tls`](Self::with_tls)),
+/// exactly like the HTTP transport. No async runtime.
 ///
-/// The proxy comes from the same environment variables as for HTTP (`HTTPS_PROXY` / `HTTP_PROXY` /
-/// `ALL_PROXY`, with `NO_PROXY`), read when the transport is created; loopback hosts never use
-/// it. An `http://` proxy carries the connection through a `CONNECT` tunnel (with
-/// `Proxy-Authorization: Basic` when the proxy URL has a user); a connection that should go through
-/// an `https://` or SOCKS proxy fails with [`BackendError::InvalidRequest`].
+/// The proxy comes from a [`ProxySettings`] (default: the same environment variables as for HTTP,
+/// `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` with `NO_PROXY`, read when the transport is created);
+/// loopback hosts never use it. An `http://` proxy carries the connection through a `CONNECT`
+/// tunnel (with `Proxy-Authorization: Basic` when the proxy URL has a user); a connection that
+/// would have to go through an `https://` or SOCKS proxy fails with
+/// [`BackendError::InvalidRequest`] and is never made around the proxy.
 ///
 /// The handshake request and the first-message authentication frame are written by the crate,
 /// not by tungstenite, so the credentials in them never reach tungstenite's `trace` log lines.
@@ -89,7 +93,10 @@ struct LinkHandle {
 /// in progress; received frames waiting for the game are limited to 32 times the message limit
 /// (then the link closes with 1008).
 pub struct TungsteniteTransport {
-    proxy: Arc<ProxyEnv>,
+    proxy: Arc<ProxyRoute>,
+    /// `None`: the default trust (built per connection). Else the config of the `TlsSettings`,
+    /// built once, or why they cannot be used.
+    tls: Option<Result<Arc<rustls::ClientConfig>, BackendError>>,
     links: HashMap<WsLinkId, LinkHandle>,
     events_tx: Sender<Event>,
     events_rx: Mutex<Receiver<Event>>,
@@ -98,7 +105,11 @@ pub struct TungsteniteTransport {
 
 impl fmt::Debug for TungsteniteTransport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TungsteniteTransport").field("links", &self.links.len()).field("proxy", &self.proxy).finish_non_exhaustive()
+        f.debug_struct("TungsteniteTransport")
+            .field("links", &self.links.len())
+            .field("proxy", &self.proxy)
+            .field("custom_tls", &self.tls.as_ref().map(Result::is_ok))
+            .finish_non_exhaustive()
     }
 }
 
@@ -109,16 +120,43 @@ impl Default for TungsteniteTransport {
 }
 
 impl TungsteniteTransport {
-    /// A transport with no links; each `open` starts a thread. Reads the proxy environment
-    /// variables now.
+    /// A transport with no links and the default TLS trust (Mozilla's root certificates); each
+    /// `open` starts a thread. Reads the proxy environment variables now.
     pub fn new() -> Self {
+        Self::with_tls(&TlsSettings::default())
+    }
+
+    /// A transport that trusts the server certificates `tls` names (extra root certificates, the
+    /// operating system's store). The PEM files are read now; when `tls` cannot be used, a warning
+    /// is logged and every `wss://` connection fails with its error (`InvalidRequest` or `Tls`,
+    /// not retried unless `WsReconnect::with_tls_retry` asks for a `Tls` one), before anything is
+    /// sent. Reads the proxy environment variables now.
+    pub fn with_tls(tls: &TlsSettings) -> Self {
+        Self::with_settings(tls, &ProxySettings::from_env())
+    }
+
+    /// A transport with these TLS settings (see [`with_tls`](Self::with_tls)) and this proxy
+    /// (see [`ProxySettings`]; `from_env` reads the environment variables now).
+    pub fn with_settings(tls: &TlsSettings, proxy: &ProxySettings) -> Self {
+        let tls = tls.build();
+        if let Some(Err(error)) = &tls {
+            tracing::warn!(">>> NET-BACKEND: the TLS settings cannot be used, every wss:// connection fails: {error}");
+        }
         let (events_tx, events_rx) = mpsc::channel();
-        Self { proxy: Arc::new(ProxyEnv::from_env()), links: HashMap::new(), events_tx, events_rx: Mutex::new(events_rx), immediate: Vec::new() }
+        Self { proxy: Arc::new(proxy.resolve()), tls, links: HashMap::new(), events_tx, events_rx: Mutex::new(events_rx), immediate: Vec::new() }
     }
 }
 
 impl WsTransport for TungsteniteTransport {
     fn open(&mut self, link: WsLinkId, handshake: WsHandshake) {
+        let tls = match &self.tls {
+            Some(Err(error)) if handshake.is_secure() => {
+                self.immediate.push((link, WsLinkEvent::Failed(error.clone())));
+                return;
+            }
+            Some(Ok(config)) => Some(Arc::clone(config)),
+            _ => None,
+        };
         let (commands_tx, commands_rx) = mpsc::channel();
         let events = self.events_tx.clone();
         let queued_bytes = Arc::new(AtomicUsize::new(0));
@@ -126,7 +164,7 @@ impl WsTransport for TungsteniteTransport {
         let proxy = Arc::clone(&self.proxy);
         let spawned = thread::Builder::new().name(format!("net-backend-ws-{link}")).spawn(move || {
             let sink = EventSink { link, events, queued_bytes: counter };
-            let last = catch_unwind(AssertUnwindSafe(|| session(&handshake, &commands_rx, &sink, None, &proxy)))
+            let last = catch_unwind(AssertUnwindSafe(|| session(&handshake, &commands_rx, &sink, tls, &proxy)))
                 .unwrap_or_else(|panic| WsLinkEvent::Failed(BackendError::Network(format!("the WebSocket thread panicked: {}", panic_text(panic.as_ref())))));
             let _ = sink.events.send((link, last));
         });
@@ -323,13 +361,23 @@ fn map_error(error: tungstenite::Error) -> BackendError {
     match error {
         tungstenite::Error::Http(response) => {
             let (parts, body) = (*response).into_parts();
-            BackendError::Status(Box::new(RawResponse { status: parts.status, headers: parts.headers, body: body.unwrap_or_default() }))
+            BackendError::Status(Box::new(RawResponse { status: parts.status, headers: parts.headers, body: body.unwrap_or_default(), file: None }))
         }
         tungstenite::Error::Io(ref io) if is_no_data(io) => BackendError::Timeout(format!("socket: {io}")),
         tungstenite::Error::Io(ref io) if io.get_ref().is_some_and(|inner| inner.is::<rustls::Error>()) => BackendError::Tls(error.to_string()),
         tungstenite::Error::Capacity(_) => BackendError::disconnected("a message was larger than the limit (closed with 1009)", None),
         tungstenite::Error::Url(_) | tungstenite::Error::HttpFormat(_) => BackendError::InvalidRequest(error.to_string()),
         _ => BackendError::Network(error.to_string()),
+    }
+}
+
+/// A handshake answer that is not valid HTTP (a bad status, a header value, too many headers).
+/// The upgrade request already went out, so this is a `Network` error (sent unknown, retried by the
+/// reconnect policy), never `InvalidRequest` ("never sent", permanent).
+fn answer_error(error: tungstenite::Error) -> BackendError {
+    match error {
+        tungstenite::Error::Capacity(_) => BackendError::Network(format!("the WebSocket handshake answer has too many headers ({error})")),
+        _ => BackendError::Network(format!("the WebSocket handshake answer is not valid HTTP ({error})")),
     }
 }
 
@@ -372,13 +420,13 @@ fn connect(
     handshake: &WsHandshake,
     commands: &Receiver<Command>,
     tls: Option<Arc<rustls::ClientConfig>>,
-    proxy: &ProxyEnv,
+    proxy: &ProxyRoute,
 ) -> Result<Option<WebSocket<Stream>>, BackendError> {
     let deadline = deadline_after(handshake.connect_timeout);
     let host = host_for_connect(&handshake.uri).ok_or_else(|| BackendError::InvalidRequest("the URL has no host".into()))?;
     let secure = handshake.is_secure();
     let port = handshake.uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
-    let route = proxy.route(&handshake.uri)?;
+    let route = proxy.route(&handshake.uri, Via::WebSocket)?;
     let tcp = match route {
         None => tcp_connect(&host, port, deadline, false)?,
         Some(proxy) => {
@@ -473,7 +521,7 @@ fn upgrade(stream: &mut Stream, handshake: &WsHandshake, deadline: Instant) -> R
     let mut received = Vec::with_capacity(1024);
     let mut chunk = [0u8; 4096];
     let (size, response) = loop {
-        if let Some(parsed) = tungstenite::handshake::client::Response::try_parse(&received).map_err(map_error)? {
+        if let Some(parsed) = tungstenite::handshake::client::Response::try_parse(&received).map_err(answer_error)? {
             break parsed;
         }
         if received.len() > MAX_ANSWER_HEADER {
@@ -501,7 +549,7 @@ fn check_answer(response: tungstenite::handshake::client::Response, key: &str, h
     let protocol_error = |error: ProtocolError| map_error(tungstenite::Error::Protocol(error));
     if response.status() != http::StatusCode::SWITCHING_PROTOCOLS {
         let (parts, _) = response.into_parts();
-        return Err(BackendError::Status(Box::new(RawResponse { status: parts.status, headers: parts.headers, body: tail })));
+        return Err(BackendError::Status(Box::new(RawResponse { status: parts.status, headers: parts.headers, body: tail, file: None })));
     }
     let headers = response.headers();
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
@@ -603,7 +651,7 @@ fn close_with(ws: &mut WebSocket<Stream>, code: CloseCode) {
 /// together stop after `read_timeout` (a trickling peer cannot hold the read longer). So a frame
 /// the game sends goes out within about one read timeout, plus the time the socket needs to take
 /// earlier outgoing data.
-fn session(handshake: &WsHandshake, commands: &Receiver<Command>, sink: &EventSink, tls: Option<Arc<rustls::ClientConfig>>, proxy: &ProxyEnv) -> WsLinkEvent {
+fn session(handshake: &WsHandshake, commands: &Receiver<Command>, sink: &EventSink, tls: Option<Arc<rustls::ClientConfig>>, proxy: &ProxyRoute) -> WsLinkEvent {
     let closed_by_game = || WsLinkEvent::Closed { code: None, reason: "closed by the game".into() };
     let mut ws = match connect(handshake, commands, tls, proxy) {
         Ok(Some(ws)) => ws,
@@ -852,7 +900,7 @@ mod tests {
         let (commands_tx, commands_rx) = mpsc::channel();
         let (events_tx, events_rx) = mpsc::channel();
         let sink = EventSink { link: WsLinkId::next(), events: events_tx, queued_bytes: Arc::default() };
-        let thread = thread::spawn(move || session(&handshake, &commands_rx, &sink, tls, &ProxyEnv::default()));
+        let thread = thread::spawn(move || session(&handshake, &commands_rx, &sink, tls, &ProxyRoute::default()));
         (commands_tx, events_rx, thread)
     }
 
@@ -1155,9 +1203,9 @@ mod tests {
         (port, handle)
     }
 
-    fn proxy_env(proxy_url: &str) -> ProxyEnv {
+    fn proxy_env(proxy_url: &str) -> ProxyRoute {
         let url = proxy_url.to_string();
-        ProxyEnv::from_vars(move |name| (name == "HTTPS_PROXY").then(|| url.clone()))
+        ProxyRoute::from_vars(move |name| (name == "HTTPS_PROXY").then(|| url.clone()))
     }
 
     /// `wss://` to a host only the proxy "knows" (never resolved locally), through an
@@ -1262,6 +1310,13 @@ mod tests {
         assert!(matches!(&wrong_key, WsLinkEvent::Failed(BackendError::Network(why)) if why.contains("Sec-WebSocket-Accept")), "{wrong_key:?}");
         let no_upgrade = answer_with(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\r\n");
         assert!(matches!(&no_upgrade, WsLinkEvent::Failed(BackendError::Network(_))), "{no_upgrade:?}");
+        // Answers that are not valid HTTP: retried as network errors, never "never sent".
+        let bad_status = answer_with(b"HTTP/1.1 000 x\r\n\r\n");
+        assert!(matches!(&bad_status, WsLinkEvent::Failed(BackendError::Network(why)) if why.contains("not valid HTTP")), "{bad_status:?}");
+        let many: &'static [u8] =
+            Box::leak([&b"HTTP/1.1 101 Switching Protocols\r\n"[..], &b"X-A: b\r\n".repeat(130), &b"\r\n"[..]].concat().into_boxed_slice());
+        let too_many = answer_with(many);
+        assert!(matches!(&too_many, WsLinkEvent::Failed(BackendError::Network(why)) if why.contains("too many headers")), "{too_many:?}");
         let refused = answer_with(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\nContent-Length: 4\r\n\r\nslow");
         match refused {
             WsLinkEvent::Failed(BackendError::Status(raw)) => {

@@ -18,6 +18,7 @@ use http::Method;
 use crate::client::{HttpClient, Queued, Route};
 use crate::config::HttpConfig;
 use crate::credentials::BackendCredentials;
+use crate::download::{HttpDownloadProgress, HttpDownloadResponse};
 use crate::request::{build_uri, OutgoingRequest, PreparedRequest, RequestId};
 use crate::response::{BackendError, HttpProgress, HttpResponse};
 use crate::transport::{HttpTransportRes, HttpTransportResult};
@@ -39,6 +40,8 @@ pub enum RequestKind {
     Ssh,
     /// A file operation on an SSH connection (feature `sftp`).
     Sftp,
+    /// A desktop sign-in at an OAuth / OpenID Connect provider (feature `oauth`).
+    OAuth,
 }
 
 /// What a pending request is, for display (a "saving…" list, a debug overlay). Never holds a
@@ -74,11 +77,14 @@ pub(crate) enum Protocol {
     WebSocket,
     #[cfg(feature = "ssh")]
     Ssh,
+    #[cfg(feature = "oauth")]
+    OAuth,
 }
 
-/// The cancel list every client shares: `HttpClient::cancel`, `WsClient::cancel` and
-/// `SshClient::cancel` push into it. Each protocol's systems CLAIM only the ids they own (a request
-/// they hold or have queued), in any order, and leave the rest. An id nobody claimed during two
+/// The cancel list every client shares: `HttpClient::cancel`, `WsClient::cancel`,
+/// `SshClient::cancel` and `OAuthClient::cancel` push into it. Each protocol's systems CLAIM only
+/// the ids they own (a request they hold or have queued), in any order, and leave the rest. An id
+/// nobody claimed during two
 /// `Send` phases in a row (an unknown or already answered id) is dropped by the core `Send`
 /// system, which runs first; two phases, so an id pushed by a game system while a phase was
 /// running still gets one full phase.
@@ -124,12 +130,12 @@ impl CancelList {
     }
 }
 
-/// Every request waiting for its answer, HTTP, WebSocket and SSH alike (optional read-only
-/// tracking, e.g. for a "saving…" spinner). An HTTP request appears here in `PostUpdate`
-/// ([`BackendSystems::Send`](crate::BackendSystems::Send)) of the frame it was made in, a
-/// WebSocket request or SSH command in the same place (also while it waits for its connection). A
-/// request leaves it when it is answered; the answer message follows in `First` (of that frame, or
-/// of the next one for answers decided in `PostUpdate`, such as a cancel).
+/// Every request waiting for its answer, HTTP, WebSocket, SSH and sign-ins alike (optional
+/// read-only tracking, e.g. for a "saving…" spinner). An HTTP request appears here in
+/// `PostUpdate` ([`BackendSystems::Send`](crate::BackendSystems::Send)) of the frame it was made
+/// in, a WebSocket request, SSH command or sign-in in the same place (also while it waits for its
+/// connection). A request leaves it when it is answered; the answer message follows in `First`
+/// (of that frame, or of the next one for answers decided in `PostUpdate`, such as a cancel).
 #[derive(Resource)]
 pub struct InFlight {
     entries: HashMap<RequestId, Entry>,
@@ -190,14 +196,14 @@ impl InFlight {
 
     /// Take the cancel ids `owns` recognises (see [`CancelList`]); the others stay for the other
     /// protocols.
-    #[cfg_attr(not(any(feature = "ws", feature = "ssh")), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "ws", feature = "ssh", feature = "oauth")), allow(dead_code))]
     pub(crate) fn claim_cancels(&self, owns: impl FnMut(RequestId) -> bool) -> Vec<RequestId> {
         self.cancels.claim(owns)
     }
 
     /// Replace the rows of `protocol` (its systems call this after every change); the rows of the
     /// other protocols are untouched.
-    #[cfg_attr(not(any(feature = "ws", feature = "ssh")), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "ws", feature = "ssh", feature = "oauth")), allow(dead_code))]
     pub(crate) fn set_rows(&mut self, protocol: Protocol, rows: impl IntoIterator<Item = (RequestId, RequestInfo)>) {
         let map = self.rows.entry(protocol).or_default();
         map.clear();
@@ -227,6 +233,9 @@ pub(crate) fn prepare(request: OutgoingRequest, config: &HttpConfig, credentials
     if let Some(error) = request.take_error() {
         return Err(error);
     }
+    if let Some(download) = request.download() {
+        download.check()?;
+    }
     let uri = build_uri(config.base_url(), request.path(), request.query(), config.insecure_http_allowed())?;
     let parts = request.into_parts();
     Ok(PreparedRequest {
@@ -239,6 +248,7 @@ pub(crate) fn prepare(request: OutgoingRequest, config: &HttpConfig, credentials
         timeout: parts.timeout.unwrap_or(config.timeout()),
         max_body_bytes: config.max_body_bytes(),
         purpose: parts.purpose,
+        download: parts.download,
     })
 }
 
@@ -310,6 +320,11 @@ pub(crate) fn send_requests(
                                 "the installed HTTP transport does not send streamed bodies (a multipart form with files from disk)".into(),
                             )),
                         )),
+                        Some(transport) if prepared.download.is_some() && !transport.get().downloads_to_files() => inflight.ready.push((
+                            id,
+                            route,
+                            Err(BackendError::InvalidRequest("the installed HTTP transport does not write downloads to files".into())),
+                        )),
                         Some(transport) => {
                             let allowed = prepared.timeout.saturating_add(DEADLINE_GRACE);
                             if let Some(method) = &info.method {
@@ -326,29 +341,40 @@ pub(crate) fn send_requests(
         }
     }
     for id in cancels {
-        if claimed.contains(&id) {
+        if claimed.contains(&id) || !inflight.entries.contains_key(&id) {
             continue;
         }
-        if let Some(entry) = inflight.entries.remove(&id) {
-            if let Some(transport) = transport.as_mut() {
-                transport.get_mut().cancel(id);
+        // Too late when the transport already finished it (a download already put in place): its
+        // result follows and is the answer.
+        if transport.as_mut().is_none_or(|transport| transport.get_mut().try_cancel(id)) {
+            if let Some(entry) = inflight.entries.remove(&id) {
+                inflight.ready.push((id, entry.route, Err(BackendError::Cancelled)));
             }
-            inflight.ready.push((id, entry.route, Err(BackendError::Cancelled)));
         }
     }
+}
+
+/// The message writers answers go to.
+#[derive(bevy_ecs::system::SystemParam)]
+pub(crate) struct AnswerWriters<'w, 's> {
+    raw: MessageWriter<'w, HttpResponse>,
+    downloads: MessageWriter<'w, HttpDownloadResponse>,
+    #[cfg_attr(not(feature = "json"), allow(dead_code))]
+    commands: Commands<'w, 's>,
 }
 
 /// `First` ([`BackendSystems::Receive`](crate::BackendSystems::Receive)): collect what the
 /// transport reports, answer requests that can no longer be answered by it (deadline passed,
 /// transport gone), and write every answer as a message for this frame.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn receive_answers(
     mut inflight: ResMut<InFlight>,
     mut transport: Option<ResMut<HttpTransportRes>>,
     config: Res<HttpConfig>,
     time: Option<Res<Time<Real>>>,
-    mut raw: MessageWriter<HttpResponse>,
+    mut writers: AnswerWriters,
     mut progress: MessageWriter<HttpProgress>,
-    mut commands: Commands,
+    mut download_progress: MessageWriter<HttpDownloadProgress>,
 ) {
     let mut answers = std::mem::take(&mut inflight.ready);
     let generation = transport.as_ref().map(|t| t.generation());
@@ -360,6 +386,11 @@ pub(crate) fn receive_answers(
         for (id, sent, total) in transport.get_mut().poll_progress() {
             if inflight.entries.get(&id).is_some_and(|entry| Some(entry.generation) == generation) {
                 progress.write(HttpProgress { id, sent, total });
+            }
+        }
+        for (id, received, total) in transport.get_mut().poll_download_progress() {
+            if inflight.entries.get(&id).is_some_and(|entry| Some(entry.generation) == generation) {
+                download_progress.write(HttpDownloadProgress { id, received, total });
             }
         }
         for (id, result) in results {
@@ -379,25 +410,29 @@ pub(crate) fn receive_answers(
         answers.extend(gone.into_iter().map(|(id, entry)| (id, entry.route, Err(BackendError::NoTransport))));
         let late: Vec<(RequestId, Entry)> = inflight.entries.extract_if(|_, entry| entry.deadline <= now).collect();
         for (id, entry) in late {
-            if let Some(transport) = transport.as_mut() {
-                transport.get_mut().cancel(id);
+            if transport.as_mut().is_none_or(|transport| transport.get_mut().try_cancel(id)) {
+                answers.push((id, entry.route, Err(BackendError::Timeout(format!("no answer from the transport within {:?}", entry.allowed)))));
+            } else {
+                // The transport already finished it (a download already put in place): wait for
+                // its result.
+                inflight.entries.insert(id, entry);
             }
-            answers.push((id, entry.route, Err(BackendError::Timeout(format!("no answer from the transport within {:?}", entry.allowed)))));
         }
     }
-    deliver(answers, config.max_body_bytes(), &mut raw, &mut commands);
+    deliver(answers, config.max_body_bytes(), &mut writers);
 }
 
-/// `Last` on `AppExit` ([`BackendSystems::Exit`](crate::BackendSystems::Exit)): answer
-/// everything still open (results that already arrived as they are, the rest with
-/// [`BackendError::Shutdown`]) and shut the transport down without waiting for it.
+/// `Last` on `AppExit` ([`BackendSystems::Exit`](crate::BackendSystems::Exit)): shut the
+/// transport down (the built-in one gives running downloads up to 1 s to remove their part
+/// files; nothing waits for a network timeout), then answer everything still open: results that
+/// arrived as they are (a download already put in place is answered with its file), the rest with
+/// [`BackendError::Shutdown`] (or `Cancelled` when the game cancelled it).
 pub(crate) fn shutdown_on_exit(
     client: Res<HttpClient>,
     mut inflight: ResMut<InFlight>,
     mut transport: Option<ResMut<HttpTransportRes>>,
     config: Res<HttpConfig>,
-    mut raw: MessageWriter<HttpResponse>,
-    mut commands: Commands,
+    mut writers: AnswerWriters,
 ) {
     let mut answers = std::mem::take(&mut inflight.ready);
     let queued = client.drain();
@@ -410,35 +445,43 @@ pub(crate) fn shutdown_on_exit(
         let error = if cancelled.contains(&id) { BackendError::Cancelled } else { BackendError::Shutdown };
         answers.push((id, route, Err(error)));
     }
-    for id in &cancelled {
-        if let Some(entry) = inflight.entries.remove(id) {
-            answers.push((*id, entry.route, Err(BackendError::Cancelled)));
-        }
-    }
     let generation = transport.as_ref().map(|t| t.generation());
     if let Some(transport) = transport.as_mut() {
+        // First the stop: from here on no download puts its file in place, so every result
+        // polled below is final and matches what happened to the target.
+        transport.get_mut().shutdown();
         for (id, result) in transport.get_mut().poll() {
             if inflight.entries.get(&id).is_some_and(|e| Some(e.generation) == generation) {
                 if let Some(entry) = inflight.entries.remove(&id) {
+                    // A cancel by the game wins, except over a download already put in place. A
+                    // transfer the shutdown stopped reports `Cancelled`: the game did not ask.
+                    let result = match result {
+                        Ok(raw) if cancelled.contains(&id) && raw.file.is_none() => Err(BackendError::Cancelled),
+                        Err(_) if cancelled.contains(&id) => Err(BackendError::Cancelled),
+                        Err(BackendError::Cancelled) => Err(BackendError::Shutdown),
+                        other => other,
+                    };
                     answers.push((id, entry.route, result));
                 }
             }
         }
     }
+    for id in &cancelled {
+        if let Some(entry) = inflight.entries.remove(id) {
+            answers.push((*id, entry.route, Err(BackendError::Cancelled)));
+        }
+    }
     let open = inflight.entries.len();
     answers.extend(inflight.entries.drain().map(|(id, entry)| (id, entry.route, Err(BackendError::Shutdown))));
-    if let Some(transport) = transport.as_mut() {
-        transport.get_mut().shutdown();
-    }
     if open > 0 {
         tracing::info!(">>> NET-BACKEND: app exit: {open} open request(s) answered with Shutdown");
     }
-    deliver(answers, config.max_body_bytes(), &mut raw, &mut commands);
+    deliver(answers, config.max_body_bytes(), &mut writers);
 }
 
 /// Turn transport results into final answers (status and body-limit rules) and write them, in
 /// request order.
-fn deliver(mut answers: Vec<Answer>, limit: u64, raw: &mut MessageWriter<HttpResponse>, commands: &mut Commands) {
+fn deliver(mut answers: Vec<Answer>, limit: u64, writers: &mut AnswerWriters) {
     answers.sort_by_key(|(id, _, _)| *id);
     for (id, route, result) in answers {
         let result = result.and_then(|response| {
@@ -465,12 +508,21 @@ fn deliver(mut answers: Vec<Answer>, limit: u64, raw: &mut MessageWriter<HttpRes
         }
         match route {
             Route::Raw => {
-                raw.write(HttpResponse { id, result });
+                writers.raw.write(HttpResponse { id, result });
             }
             #[cfg(feature = "json")]
-            Route::Json(json) => json.deliver(id, result, commands),
+            Route::Json(json) => json.deliver(id, result, &mut writers.commands),
+            Route::Download => {
+                let result = result.and_then(|response| match response.file {
+                    Some(mut file) => {
+                        file.status = response.status;
+                        file.headers = response.headers;
+                        Ok(file)
+                    }
+                    None => Err(BackendError::Network("the transport answered the download without writing the file".into())),
+                });
+                writers.downloads.write(HttpDownloadResponse { id, result });
+            }
         }
     }
-    #[cfg(not(feature = "json"))]
-    let _ = commands;
 }

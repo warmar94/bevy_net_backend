@@ -1,10 +1,10 @@
 [package]
 name = "bevy_net_backend"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # Bevy 0.19's own minimum.
 rust-version = "1.95"
-description = "Talk to your game's own backend from Bevy: HTTPS JSON requests, (feature `ws`) named WebSocket connections and (feature `ssh`, admin tools) SSH commands and SFTP, typed answers as Bevy messages, exactly one answer per request, game-supplied credentials with redacted secrets, no tokio unless you enable `ssh`, and fake transports for tests."
+description = "Talk to your game's own backend from Bevy: HTTPS JSON requests, uploads and downloads to a file, (feature `ws`) named WebSocket connections, (feature `oauth`) OpenID Connect desktop sign-in and (feature `ssh`, admin tools) SSH commands and SFTP, typed answers as Bevy messages, exactly one answer per request, game-supplied credentials with redacted secrets, proxy and certificate settings, no tokio unless you enable `ssh`, and fake transports for tests."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/warmar94/bevy_net_backend"
 readme = "README.md"
@@ -21,7 +21,8 @@ default = ["http", "json"]
 # The real transport: ureq 3 (blocking HTTP/1.1) on a small pool of worker threads, rustls for TLS
 # with ring's crypto (compiles C and assembly: a C compiler is needed at build time) and the Mozilla
 # root certificates (webpki-roots).
-http = ["dep:ureq", "dep:rustls"]
+# Downloads streamed to a file are checked with SHA-256 from ring (the same ring rustls uses).
+http = ["dep:ureq", "dep:rustls", "dep:webpki-roots", "dep:ring"]
 # Typed JSON requests and answers (`get_json`, `post_json`, `JsonResponse<T>`) over serde_json.
 json = ["dep:serde", "dep:serde_json"]
 # Accept gzip-compressed responses (ureq's gzip decoder, flate2).
@@ -29,6 +30,14 @@ gzip = ["http", "ureq/gzip"]
 # Named WebSocket connections: tungstenite (sync, no async runtime) on one dedicated thread per
 # connection, TLS through the same rustls + ring setup as `http`. No permessage-deflate.
 ws = ["dep:tungstenite", "dep:rustls", "dep:webpki-roots"]
+# The operating system's certificate store and certificate checks for `https://` and `wss://`,
+# opted into at runtime with `TlsSettings::with_os_certificates(true)` (rustls-platform-verifier,
+# given ring explicitly: no OpenSSL, no aws-lc). Acts together with `http` and / or `ws`.
+os-certificates = ["dep:rustls-platform-verifier"]
+# Desktop sign-in at an OAuth 2.0 / OpenID Connect provider (Google or any other): PKCE (S256),
+# `state` and nonce, a one-time loopback redirect listener on 127.0.0.1, the sign-in URL handed
+# to the game as a message, the code exchanged at the token endpoint over `http`. No new crate.
+oauth = ["http", "json"]
 # ADMIN / DEV BUILDS ONLY. Named SSH connections that run commands (russh, ring for the AEAD
 # ciphers, RustCrypto for the rest), strict known_hosts checking, key files / ssh-agent / the
 # user's ~/.ssh/config. The ONLY feature that brings tokio: one private current-thread runtime on
@@ -62,12 +71,19 @@ serde_json = { version = "1.0.140", optional = true }
 # that also links another rustls provider (e.g. aws-lc-rs) cannot trigger rustls' provider panic.
 ureq = { version = "=3.4.2", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"], optional = true }
 rustls = { version = "=0.23.45", default-features = false, features = ["std", "tls12", "ring"], optional = true }
+# SHA-256 of downloads (feature `http`) and the PKCE challenge (feature `oauth`): the ring rustls
+# already uses, so no crate is added.
+ring = { version = "0.17.14", default-features = false, optional = true }
 # The WebSocket protocol engine (feature `ws`): only its `handshake` feature, none of its TLS
 # features (they would call `ClientConfig::builder()` and bring a second webpki-roots).
 tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"], optional = true }
-# Mozilla's root certificates for `wss://` (the same crate ureq uses for `https://`). Caret: the root
-# list must be able to move forward.
+# Mozilla's root certificates for `wss://` and for `https://` with extra root certificates (the same
+# crate ureq uses for `https://`). Caret: the root list must be able to move forward.
 webpki-roots = { version = "1.0.9", optional = true }
+# Feature `os-certificates`: the operating system's certificate verifier (Windows CryptoAPI, macOS /
+# iOS Security framework, the system's CA files on Linux / BSD, Android's). Pinned exactly like
+# rustls: certificate checking is load-bearing.
+rustls-platform-verifier = { version = "=0.7.1", optional = true }
 # The SSH client (feature `ssh`). ring only (the same ring as TLS), never aws-lc; RSA only with
 # `ssh-rsa`. Pinned exactly: SSH security fixes arrive as patch releases, bumped deliberately.
 russh = { version = "=0.63.3", default-features = false, features = ["ring"], optional = true }
@@ -90,8 +106,8 @@ bevy_headless_test = { version = "0.1.0", default-features = false }
 serde = { version = "1", features = ["derive"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 # A throwaway test CA + localhost certificate generated in memory for the TLS tests (ring backend,
-# no aws-lc). Tests only: nothing key-shaped is in the repository or the package.
-rcgen = { version = "=0.14.10", default-features = false, features = ["ring"] }
+# no aws-lc; `pem` for the extra-root tests). Tests only: nothing key-shaped is in the repository or the package.
+rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem"] }
 # Random seeds for the throwaway SSH keys of the mock SSH server and the SSH tests (the same
 # getrandom russh already uses). Keys are generated at runtime; none is in the repository.
 getrandom = { version = "0.4", features = ["sys_rng"] }
@@ -166,6 +182,12 @@ required-features = ["ssh"]
 name = "live_ssh"
 required-features = ["ssh"]
 
+# HTTP requests and proxies: the environment, `ProxySettings`, a SOCKS proxy (sets environment
+# variables: its own binary).
+[[test]]
+name = "http_proxy"
+required-features = ["http"]
+
 [[test]]
 name = "fake"
 
@@ -175,6 +197,26 @@ name = "redaction"
 [[test]]
 name = "loopback"
 required-features = ["http"]
+
+# `https://` and `wss://` against loopback TLS servers with a throwaway CA: extra root
+# certificates, the default roots, the operating system's store (feature `os-certificates`).
+[[test]]
+name = "tls_roots"
+required-features = ["http", "ws"]
+
+# The credentials file (`SecretFile`): round trip, permissions, damaged files.
+[[test]]
+name = "secret_file"
+
+# Downloads streamed to a file: a server on 127.0.0.1 started by the test, and the fake transport.
+[[test]]
+name = "download"
+required-features = ["http"]
+
+# The desktop sign-in against a mock OpenID Connect provider on 127.0.0.1 (the test plays the browser).
+[[test]]
+name = "oauth"
+required-features = ["oauth"]
 
 [[test]]
 name = "multipart"

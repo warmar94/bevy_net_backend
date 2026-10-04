@@ -1,4 +1,4 @@
-//! WebSocket connections through an HTTP `CONNECT` proxy set in the environment (the same
+//! WebSocket connections through an HTTP `CONNECT` proxy set in the environment or in code (the same
 //! variables as for HTTP), with the real `TungsteniteTransport`, the mock from
 //! `examples/mock_ws_server.rs` and a small proxy, all on 127.0.0.1 in this process. The client asks
 //! for `game.test`, a name only the proxy "resolves" (it sends every tunnel to the mock), so a
@@ -161,5 +161,26 @@ fn websocket_connections_use_the_environment_proxy_except_for_loopback() {
     wait_for(&mut app, "socks", |s| s == Some(WsState::Disconnected));
     let error = app.world().resource::<WsConnections>().get("socks").and_then(|info| info.last_error.clone());
     assert!(matches!(&error, Some(BackendError::InvalidRequest(why)) if why.contains("socks5://")), "{error:?}");
+
+    // A proxy set in code (`ProxySettings::url`), with no proxy in the environment: through the
+    // tunnel, with the proxy's credentials.
+    std::env::remove_var("HTTPS_PROXY");
+    let in_code = ProxySettings::url(format!("http://user:secret@127.0.0.1:{proxy_port}"));
+    app.insert_resource(WsTransportRes::new(TungsteniteTransport::with_settings(&TlsSettings::default(), &in_code)));
+    ws(&app).connect("in-code", WsSettings::new(format!("ws://game.test:{mock_port}/secure")).allow_insecure_ws(true).with_reconnect(WsReconnect::never()));
+    wait_for(&mut app, "in-code", |s| s == Some(WsState::Connected));
+    assert_eq!(seen.lock().unwrap_or_else(PoisonError::into_inner).len(), 3);
+    // `direct()` with a proxy in the environment: the proxy is never asked.
+    set_proxy_env(&format!("http://user:secret@127.0.0.1:{proxy_port}"));
+    app.insert_resource(WsTransportRes::new(TungsteniteTransport::with_settings(&TlsSettings::default(), &ProxySettings::direct())));
+    ws(&app).connect("no-proxy", WsSettings::new(format!("ws://game.test:{mock_port}/")).allow_insecure_ws(true).with_reconnect(WsReconnect::never()));
+    wait_for(&mut app, "no-proxy", |s| s == Some(WsState::Disconnected));
+    assert_eq!(seen.lock().unwrap_or_else(PoisonError::into_inner).len(), 3, "direct() used the environment proxy");
+    // An https:// proxy set in code cannot carry a WebSocket connection: refused, never bypassed.
+    app.insert_resource(WsTransportRes::new(TungsteniteTransport::with_settings(&TlsSettings::default(), &ProxySettings::url("https://127.0.0.1:1"))));
+    ws(&app).connect("https-proxy", WsSettings::new(format!("ws://game.test:{mock_port}/")).allow_insecure_ws(true).with_reconnect(WsReconnect::never()));
+    wait_for(&mut app, "https-proxy", |s| s == Some(WsState::Disconnected));
+    let error = app.world().resource::<WsConnections>().get("https-proxy").and_then(|info| info.last_error.clone());
+    assert!(matches!(&error, Some(BackendError::InvalidRequest(why)) if why.contains("https://")), "{error:?}");
     std::env::remove_var("HTTPS_PROXY");
 }

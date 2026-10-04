@@ -5,7 +5,7 @@ All notable changes to this crate are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (before 1.0: a minor bump for any API
 change or a Bevy / key dependency bump).
 
-## [Unreleased]
+## [0.2.0] - 2026-10-04
 
 ### Added
 
@@ -41,14 +41,78 @@ change or a Bevy / key dependency bump).
   at least that long before the next reconnect attempt (`WsState::Reconnecting::retry_in` shows it;
   above the backoff cap too, at most `MAX_TIMEOUT`). The attempt limit is unchanged.
 - `mock_ws_server`: a path ending in `/busy` refuses the handshake with `503` and `Retry-After: 2`.
-- WebSocket connections (feature `ws`) use the proxy from the `HTTPS_PROXY` / `HTTP_PROXY` /
-  `ALL_PROXY` environment variables with the same `NO_PROXY` rules as HTTP requests (read when
-  `TungsteniteTransport::new` runs; loopback hosts always direct): a `CONNECT` tunnel through an
-  `http://` proxy, `Proxy-Authorization: Basic` from a user and password in its URL. A refused or
-  unreachable proxy is a `Network` error; with an `https://` or SOCKS proxy set, a connection that
-  would use it fails with `InvalidRequest`.
+- WebSocket connections (feature `ws`) go through a proxy like HTTP requests (`ProxySettings`
+  below; by default the `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` environment variables with the
+  same `NO_PROXY` rules, read when the transport is created; loopback hosts always direct): a
+  `CONNECT` tunnel through an `http://` proxy, `Proxy-Authorization: Basic` from a user and password
+  in its URL. A refused or unreachable proxy is a `Network` error; with an `https://` or SOCKS proxy
+  set, a connection that would use it fails with `InvalidRequest`.
 - `WsTransport::send_auth(link, text)`: sends the first-message authentication (default: `send`
   with `WsFrame::Text`).
+- `TlsSettings` (features `http` / `ws`), given with `BackendPlugin::with_tls` or to
+  `UreqTransport::with_tls` / `TungsteniteTransport::with_tls`: which server certificates
+  `https://` and `wss://` trust. `with_root_certificates_pem` / `with_root_certificates_file` add
+  root certificates (e.g. a self-signed development server's) next to Mozilla's; `validate()`
+  checks them (`ConfigError::Tls`). Settings that cannot be used answer every `https://` request
+  and `wss://` connection with `InvalidRequest`, never sent. The default is unchanged (Mozilla's
+  roots through ureq's own TLS step).
+- Feature `os-certificates` (off by default; rustls-platform-verifier with ring):
+  `TlsSettings::with_os_certificates(true)` uses the operating system's certificate store and
+  checks instead of Mozilla's roots, extra roots on top.
+- `SecretFile`: one `Secret` in a file between runs (`new`, `path`, `load`, `save`, `remove`):
+  written atomically (new file, flushed, renamed over the old one), owner-only on Unix (`0600`,
+  a new folder `0700`; Windows: the folder's inherited permissions), buffers wiped, the content
+  never in an error or a log line; a damaged or foreign file is `InvalidData`. The crate does not
+  log in or refresh with it.
+- Downloads streamed to a file (`http`): `HttpClient::download(request, HttpDownload)` and
+  `HttpClient::download_to(path, file)` write a 2xx answer body to a part file next to the target as
+  it arrives (never held in memory as a whole; the in-memory answer limit does not apply), sync it
+  and rename it over the target. `HttpDownload::to(path)` with `with_sha256`, `with_size`,
+  `with_max_bytes` (default `DEFAULT_DOWNLOAD_MAX_BYTES`, 256 MiB) and `with_progress`. The answer
+  is the `HttpDownloadResponse` message (`DownloadedFile`: `path`, `bytes`, `sha256`, `status`,
+  `headers`), progress the `HttpDownloadProgress` message (`received`, `total`). The part file
+  (`<name>.<process>-<request>-<n>.part`) is created before the request is sent (an unwritable
+  folder or a target that is a folder is `InvalidRequest`, never sent) and removed on any error,
+  cancel (the transfer stops at its next 64 KiB piece) or timeout; an existing target is replaced
+  only on success. The rename happens under the lock the cancel takes: a download answered
+  `Cancelled`, `Timeout` or `Shutdown` never replaced the target, and one whose file was already
+  put in place is answered with the file. On app exit the HTTP transport gives running downloads
+  up to 1 s to stop and remove their part files; a transfer still waiting for the server after
+  that can leave its part file when the process ends, and the next download to that target removes
+  part files other processes left. An answer outside 200–299 writes no file and arrives as
+  `Status`. Seam: `PreparedRequest::download`, `RawResponse::file`,
+  `HttpTransport::downloads_to_files()` (default `false`: such a request is answered
+  `InvalidRequest` and never handed over), `HttpTransport::poll_download_progress()` (default:
+  none) and `HttpTransport::try_cancel(id)` (`false` when the request already completed and its
+  result is the answer; default: `cancel`, then `true`), `HttpDownload::receive` (feature `http`)
+  for a transport's own writing, `OutgoingRequest::download()`. `FakeHttpTransport` writes a
+  scripted 2xx answer's body to the file.
+- Feature `oauth` (implies `http` and `json`; no new crate): the desktop sign-in at an OAuth 2.0 /
+  OpenID Connect provider. `OAuthClient::sign_in(&OAuthFlow)` runs the authorization code flow
+  with PKCE (S256), `state` and nonce on its own thread with a one-time loopback redirect listener
+  on `127.0.0.1` (a free port); the sign-in page URL arrives as `OAuthSignInUrl` (the game opens the
+  browser); the code is exchanged at the token endpoint over the crate's HTTP stack (the plugin's
+  `TlsSettings`); the answer is `OAuthSignedIn` with `OAuthTokens` (`id_token`, `access_token`,
+  `refresh_token` as `Secret`, `token_type`, `expires_in`, `scope`, `nonce`). A redirect with
+  another `state` gets an error page and is ignored; the listener closes after the redirect with
+  this sign-in's `state`; `OAuthClient::cancel` (or the shared `HttpClient::cancel`), the time
+  limit (`OAuthFlow::with_timeout`, default 5 minutes) and app exit end it. `OAuthFlow::google`,
+  `OAuthFlow::new` (any provider's endpoints; `https://`, `http://` only for loopback),
+  `with_client_secret`, `with_scopes`, `with_param`; `GOOGLE_AUTHORIZATION_ENDPOINT`,
+  `GOOGLE_TOKEN_ENDPOINT`, `DEFAULT_SIGN_IN_TIMEOUT`. Codes, tokens, the verifier and the client
+  secret are never logged. The crate does not check the ID token or log in to a server with it.
+- `BackendError::OAuth` (a sign-in the provider or its token endpoint ended) and
+  `RequestKind::OAuth` (a running sign-in in `InFlight`).
+- `ProxySettings` (features `http` / `ws`), given with `BackendPlugin::with_proxy` or to
+  `UreqTransport::with_settings(&config, &tls, &proxy)` / `TungsteniteTransport::with_settings(&tls,
+  &proxy)`: the proxy HTTP requests, WebSocket connections and the sign-in's code exchange use.
+  `from_env()` (the default: `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` with `NO_PROXY`, read when
+  the transport is created), `url("http://user:password@host:port")` (this proxy, the environment
+  not read), `direct()` (none); loopback hosts always direct; `validate()` (`ConfigError::Proxy`);
+  `Debug` without the user or password. A `url` that is not a proxy URL answers every request that
+  would use it with `InvalidRequest`, never sent.
+- `WipedBytes`: request body bytes overwritten with zeros (the whole allocation) when dropped
+  (`Deref<Target = [u8]>`, `as_slice`, `From<Vec<u8>>`, `Debug` with the length only).
 - The mock server's `/upload` echo names the content type of a field part that has one; the mock
   SSH server's `MockOptions` can answer SFTP reads short, slowly or with an error from an offset,
   close the SFTP channel from an offset, or report another size (or none) for open files, and
@@ -56,28 +120,66 @@ change or a Bevy / key dependency bump).
 
 ### Changed
 
-- SFTP downloads are pipelined: 64 KiB reads go out ahead of the answers, up to 1 MiB requested or
-  received and not written at once, written in file order; short reads ask again for the rest; a
-  file the server reports larger than the transfer limit is refused before any data is read.
-  Measured over loopback in a debug build: 256 MiB to a file in 1.5 s.
-- An SFTP transfer that is cancelled or times out closes its remote file handle in the background.
-- Each SFTP request may wait for its answer as long as the whole operation (`with_sftp_timeout`)
-  instead of a fixed 30 s, so a slow link is not cut off while 1 MiB of reads is in flight.
+- **Breaking:** request bodies are wiped: `OutgoingRequest` holds its body (`with_body`, `with_json`,
+  `set_body`, an in-memory `with_multipart` form, the body `JsonBodyField` rewrites) in a
+  `WipedBytes`, and so do the in-memory pieces of a streamed form; they are overwritten with zeros
+  once the request is answered and dropped. JSON is written into an exactly sized buffer (no
+  reallocation copy), and `JsonBodyField` wipes the parsed copy it edits. `PreparedRequest::body` is
+  now `Option<WipedBytes>` (it was `Option<Vec<u8>>`; read it as `&[u8]`, e.g.
+  `request.body.as_deref()`).
+- **Changed (behaviour):** WebSocket connections follow the proxy environment variables
+  (`HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` with `NO_PROXY`) like HTTP requests; in 0.1.0 they
+  always connected directly. A SOCKS proxy in the environment now answers HTTP requests and
+  WebSocket connections that would use it `InvalidRequest` (never sent) instead of going around
+  it. `BackendPlugin::with_proxy(ProxySettings::direct())` restores 0.1.0's direct connections.
+- On `AppExit` the plugin calls `HttpTransport::shutdown` first and then polls the transport's
+  last results (a result that arrived is delivered as it is, the rest answered `Shutdown`); it
+  polled before the shutdown in 0.1.0. A cancel or deadline the transport reports as too late
+  (`try_cancel`) leaves the request waiting for its result.
 - `Secret` overwrites its whole allocation with zeros when it is dropped, and `BearerToken` wipes
-  its temporary `Bearer …` text (copies that become part of a request are not wiped) (`zeroize`, now a dependency of every feature set; rustls already
-  used it, so the default build has the same 90 crates, `default-features = false` one more).
+  its temporary `Bearer …` text (copies that become part of a request are not wiped) (`zeroize`, now
+  a dependency of every feature set; rustls already used it, so the default build has the same 90
+  crates, `default-features = false` one more).
 - `TungsteniteTransport` writes the WebSocket handshake request and the first-message
   authentication frame itself (from buffers it wipes after the write) and hands the stream to
   tungstenite after the `101` answer, which it checks as tungstenite does. Credential headers, an
   `ApiKeyQuery` key in the URL and the first-message authentication no longer appear in
-  tungstenite's `trace` log lines. The log-capture test also records `log` records at `trace`.
+  tungstenite's `trace` log lines.
+- The HTTP transport resolves the proxy itself (the same variables and `NO_PROXY` rules as before)
+  and hands ureq an explicit proxy or none; ureq no longer reads the environment.
+- SFTP downloads are pipelined: 64 KiB reads go out ahead of the answers, up to 1 MiB requested or
+  received and not written at once, written in file order; short reads ask again for the rest; a
+  file the server reports larger than the transfer limit is refused before any data is read.
+- An SFTP download into memory reserves the size the server reports for the file once (at most
+  the transfer limit) instead of growing by doubling.
+- SFTP `download_file` syncs the part file to disk before the rename (and, on Unix, the folder
+  after it), as the HTTP download and `SecretFile` do; refuses a local target that is a folder
+  before the transfer (`InvalidRequest`); and removes part files of that target other processes
+  left.
+- Each SFTP request may wait for its answer as long as the whole operation (`with_sftp_timeout`)
+  instead of a fixed 30 s, so a slow link is not cut off while 1 MiB of reads is in flight.
 - An SFTP operation whose connection or SFTP channel is lost while it runs is answered
   `Disconnected` (`sent: Some(true)` once it had started, `Some(false)` when it never went out)
   instead of `Ssh("SFTP: sender dropped")`; the next operation opens a new SFTP channel.
+- Documentation states what the crate does.
+
+### Fixed
+
+- HTTP requests with a SOCKS proxy in the environment (`ALL_PROXY=socks5://…`,
+  `HTTPS_PROXY=socks5h://…`) were sent directly, around the proxy. A request that would use a SOCKS
+  proxy is now answered `InvalidRequest` and never sent, as WebSocket connections already were.
 - An SFTP download whose remote file ends before the size the server reported when it was opened
-  is an error (`Ssh`, naming both sizes) instead of a shorter success; no final file is written and
+  is an error (`Ssh("SFTP: the remote file was cut short during the download (expected N bytes, its
+  size when it was opened; received M)")`) instead of a shorter success; no final file is written and
   the part file is removed. Files that report size 0 or no size are read to their end as before.
-- Documentation states what the crate does, without plans.
+- An SFTP transfer that is cancelled or times out closes its remote file handle in the background.
+- A local file error after an SFTP transfer started (reading the file during `upload_file`;
+  writing, syncing or renaming the file of `download_file`) is `Ssh` with the file's name; it was
+  `InvalidRequest`, whose `was_sent()` said `Some(false)` although data had already gone over the
+  connection. Opening or creating the local file before the transfer stays `InvalidRequest`.
+- A WebSocket handshake answer that is not valid HTTP (a status or header value the parser
+  refuses, more than 124 headers) is a `Network` error, retried by the reconnect policy; it was
+  `InvalidRequest` (permanent, "never sent") or a message about a 1009 close that never happened.
 
 ## [0.1.0] - 2026-10-01
 

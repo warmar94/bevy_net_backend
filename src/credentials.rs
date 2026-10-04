@@ -16,12 +16,12 @@ use crate::request::OutgoingRequest;
 ///
 /// When a `Secret` is dropped, its memory (the whole allocation) is overwritten with zeros first
 /// (the `zeroize` crate). Each clone is its own copy and is wiped when it is dropped. The crate also
-/// wipes its temporary `Bearer …` header text and the SSH key file text it reads. Not wiped: the
+/// wipes its temporary `Bearer …` header text, the SSH key file text it reads, and request bodies
+/// ([`WipedBytes`](crate::WipedBytes), the body `JsonBodyField` writes included). Not wiped: the
 /// copies that become part of a request (an `ApiKeyHeader` / `BearerToken` header value, the query
-/// value of `ApiKeyQuery` and the URL built from it, the body `JsonBodyField` writes,
-/// keyboard-interactive answers and passwords handed to russh, the first-message authentication
-/// frame), a `String` you built the secret from, and what the HTTP, WebSocket and SSH libraries
-/// copy while sending.
+/// value of `ApiKeyQuery` and the URL built from it, keyboard-interactive answers and passwords
+/// handed to russh), a `String` you built the secret from, and what the HTTP, WebSocket and SSH
+/// libraries copy while sending.
 /// There is no comparison (compare `expose()` yourself if you must). At `trace` level the HTTP
 /// client's own logging (ureq / ureq_proto) writes raw request bytes, secrets included: keep those
 /// targets below `trace`.
@@ -353,10 +353,31 @@ impl Credentials for JsonBodyField {
             return;
         };
         object.insert(self.name.clone(), serde_json::Value::String(self.value.expose().to_string()));
-        match serde_json::to_vec(&object) {
-            Ok(body) => request.set_body(Some(body)),
+        let encoded = crate::body::WipedBytes::json(&object);
+        // The parsed copy holds the body's text and the secret: wiped before it is freed.
+        let mut parsed = serde_json::Value::Object(object);
+        wipe_json(&mut parsed);
+        match encoded {
+            Ok(body) => request.set_wiped_body(body),
             Err(_) => request.reject("could not re-encode the JSON body with the credential field"),
         }
+    }
+}
+
+/// Overwrite every string (object keys included) of a parsed JSON value with zeros.
+#[cfg(feature = "json")]
+pub(crate) fn wipe_json(value: &mut serde_json::Value) {
+    use zeroize::Zeroize;
+    match value {
+        serde_json::Value::String(text) => text.zeroize(),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(wipe_json),
+        serde_json::Value::Object(map) => {
+            for (mut key, mut item) in std::mem::take(map) {
+                key.zeroize();
+                wipe_json(&mut item);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
 }
 

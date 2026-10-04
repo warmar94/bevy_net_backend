@@ -28,6 +28,12 @@ pub enum ConfigError {
     BadBaseUrl(String),
     /// A default header name or value is not valid HTTP; the text names the header.
     BadHeader(String),
+    /// The `TlsSettings` (features `http` / `ws`) cannot be used (from `TlsSettings::validate`); the
+    /// text says why (a root certificate file that cannot be read, PEM without a certificate, …).
+    Tls(String),
+    /// The `ProxySettings` (features `http` / `ws`) cannot be used (from `ProxySettings::validate`);
+    /// the text says why (not a proxy URL, a scheme that is not supported). Never shows the URL.
+    Proxy(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -36,6 +42,8 @@ impl fmt::Display for ConfigError {
             ConfigError::NoBaseUrl => f.write_str("no base URL is configured"),
             ConfigError::BadBaseUrl(why) => write!(f, "bad base URL: {why}"),
             ConfigError::BadHeader(why) => write!(f, "bad default header: {why}"),
+            ConfigError::Tls(why) => write!(f, "bad TLS settings: {why}"),
+            ConfigError::Proxy(why) => write!(f, "bad proxy settings: {why}"),
         }
     }
 }

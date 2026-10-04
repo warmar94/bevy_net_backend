@@ -9,8 +9,9 @@ use std::time::Duration;
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use http::{Method, Uri};
 
-use crate::body::StreamingBody;
+use crate::body::{StreamingBody, WipedBytes};
 use crate::config::ConfigError;
+use crate::download::HttpDownload;
 use crate::BackendError;
 
 /// Identifies one request made through `bevy_net_backend`. Every answer carries the id of the
@@ -84,7 +85,8 @@ pub struct OutgoingRequest {
     path: String,
     query: Vec<(String, String)>,
     headers: HeaderMap,
-    body: Option<Vec<u8>>,
+    /// Wiped when the request is dropped (it can hold a password or a token).
+    body: Option<WipedBytes>,
     /// A body read while it is sent (a form with files from disk); `body` is `None` then.
     stream: Option<StreamingBody>,
     timeout: Option<Duration>,
@@ -92,6 +94,7 @@ pub struct OutgoingRequest {
     credentials: bool,
     multipart: bool,
     progress: bool,
+    download: Option<HttpDownload>,
     error: Option<BackendError>,
 }
 
@@ -104,13 +107,14 @@ impl fmt::Debug for OutgoingRequest {
             .field("path", &self.path)
             .field("query_names", &query)
             .field("header_names", &headers)
-            .field("body_bytes", &self.body.as_ref().map(Vec::len))
+            .field("body_bytes", &self.body.as_ref().map(|b| b.len()))
             .field("streaming_body", &self.stream.is_some())
             .field("timeout", &self.timeout)
             .field("purpose", &self.purpose)
             .field("credentials", &self.credentials)
             .field("multipart", &self.multipart)
             .field("upload_progress", &self.progress)
+            .field("download", &self.download)
             .finish_non_exhaustive()
     }
 }
@@ -132,6 +136,7 @@ impl OutgoingRequest {
             credentials: true,
             multipart: false,
             progress: false,
+            download: None,
             error: None,
         }
     }
@@ -183,8 +188,10 @@ impl OutgoingRequest {
 
     /// Set the body (bytes, sent as they are; set a `Content-Type` header to match). It replaces a
     /// form set with `with_multipart`: [`is_multipart`](Self::is_multipart) is `false` again.
+    /// The body is overwritten with zeros when the request is answered and dropped (a `Vec<u8>`
+    /// handed in is moved, not copied).
     pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Self {
-        self.body = Some(body.into());
+        self.body = Some(WipedBytes::from(body.into()));
         self.stream = None;
         self.multipart = false;
         self
@@ -192,11 +199,12 @@ impl OutgoingRequest {
 
     /// Serialize `value` as the JSON body and set `Content-Type: application/json`. A value that
     /// cannot be serialized does not panic: the request is answered with
-    /// [`BackendError::Encode`] and never sent.
+    /// [`BackendError::Encode`] and never sent. The JSON is written into one exactly sized buffer
+    /// that is overwritten with zeros when the request is answered and dropped.
     #[cfg(feature = "json")]
     #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
     pub fn with_json<B: serde::Serialize + ?Sized>(mut self, value: &B) -> Self {
-        match serde_json::to_vec(value) {
+        match WipedBytes::json(value) {
             Ok(body) => {
                 self.body = Some(body);
                 self.stream = None;
@@ -223,7 +231,7 @@ impl OutgoingRequest {
     #[cfg_attr(docsrs, doc(cfg(feature = "http")))]
     pub fn with_multipart(mut self, form: &crate::Multipart) -> Self {
         let (content_type, body, stream) = match form.encode() {
-            Ok(crate::multipart::Encoded::Memory { content_type, body }) => (content_type, Some(body), None),
+            Ok(crate::multipart::Encoded::Memory { content_type, body }) => (content_type, Some(WipedBytes::from(body)), None),
             Ok(crate::multipart::Encoded::Stream { content_type, body }) => (content_type, None, Some(body)),
             Err(error) => {
                 if self.error.is_none() {
@@ -335,9 +343,18 @@ impl OutgoingRequest {
     }
 
     /// Replace the body (no longer a multipart form afterwards: [`is_multipart`](Self::is_multipart)
-    /// is `false`).
+    /// is `false`). The old body is overwritten with zeros; the new one is moved in and wiped when
+    /// the request is dropped.
     pub fn set_body(&mut self, body: Option<Vec<u8>>) {
-        self.body = body;
+        self.body = body.map(WipedBytes::from);
+        self.stream = None;
+        self.multipart = false;
+    }
+
+    /// Replace the body with bytes that are already in a wiped buffer.
+    #[cfg(feature = "json")]
+    pub(crate) fn set_wiped_body(&mut self, body: WipedBytes) {
+        self.body = Some(body);
         self.stream = None;
         self.multipart = false;
     }
@@ -363,6 +380,16 @@ impl OutgoingRequest {
         self.error.as_ref()
     }
 
+    /// Where the answer body is written ([`HttpClient::download`](crate::HttpClient::download)),
+    /// if this request is a download.
+    pub fn download(&self) -> Option<&HttpDownload> {
+        self.download.as_ref()
+    }
+
+    pub(crate) fn set_download(&mut self, download: HttpDownload) {
+        self.download = Some(download);
+    }
+
     #[cfg(feature = "ws")]
     pub(crate) fn set_purpose(&mut self, purpose: RequestPurpose) {
         self.purpose = purpose;
@@ -381,6 +408,7 @@ impl OutgoingRequest {
             timeout: self.timeout,
             purpose: self.purpose,
             progress: self.progress,
+            download: self.download,
         }
     }
 }
@@ -389,11 +417,12 @@ impl OutgoingRequest {
 pub(crate) struct RequestParts {
     pub(crate) method: Method,
     pub(crate) headers: HeaderMap,
-    pub(crate) body: Option<Vec<u8>>,
+    pub(crate) body: Option<WipedBytes>,
     pub(crate) stream: Option<StreamingBody>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) purpose: RequestPurpose,
     pub(crate) progress: bool,
+    pub(crate) download: Option<HttpDownload>,
 }
 
 /// A request ready for an [`HttpTransport`](crate::HttpTransport): the full URL, every header (defaults
@@ -410,8 +439,8 @@ pub struct PreparedRequest {
     pub uri: Uri,
     /// Every header to send.
     pub headers: HeaderMap,
-    /// The body, if any (in memory).
-    pub body: Option<Vec<u8>>,
+    /// The body, if any (in memory), overwritten with zeros when the request is dropped.
+    pub body: Option<WipedBytes>,
     /// A body read while it is sent (a multipart form with files from disk), instead of `body`.
     /// Only given to a transport whose [`HttpTransport::streams_bodies`](crate::HttpTransport::streams_bodies)
     /// is `true`.
@@ -424,6 +453,10 @@ pub struct PreparedRequest {
     pub max_body_bytes: u64,
     /// What the request is for.
     pub purpose: RequestPurpose,
+    /// For a download ([`HttpClient::download`](crate::HttpClient::download)): where a 2xx answer
+    /// body is written. Only given to a transport whose
+    /// [`HttpTransport::downloads_to_files`](crate::HttpTransport::downloads_to_files) is `true`.
+    pub download: Option<HttpDownload>,
 }
 
 impl fmt::Debug for PreparedRequest {
@@ -433,12 +466,13 @@ impl fmt::Debug for PreparedRequest {
             .field("method", &self.method)
             .field("url", &redacted_url(&self.uri))
             .field("header_names", &headers)
-            .field("body_bytes", &self.body.as_ref().map(Vec::len))
+            .field("body_bytes", &self.body.as_ref().map(|b| b.len()))
             .field("streaming_body", &self.streaming_body)
             .field("upload_progress", &self.upload_progress)
             .field("timeout", &self.timeout)
             .field("max_body_bytes", &self.max_body_bytes)
             .field("purpose", &self.purpose)
+            .field("download", &self.download)
             .finish()
     }
 }

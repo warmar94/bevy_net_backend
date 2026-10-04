@@ -43,6 +43,12 @@ jobs:
           - "--features ssh,sftp"
           - "--features ssh,ssh-rsa"
           - "--features ssh,ws"
+          - "--features os-certificates"
+          - "--no-default-features --features os-certificates"
+          - "--features ws,os-certificates"
+          - "--features oauth"
+          - "--no-default-features --features oauth"
+          - "--features oauth,ws"
           - "--all-features"
     runs-on: ubuntu-latest
     steps:
@@ -82,6 +88,11 @@ jobs:
       - run: cargo test --locked --features ssh,sftp
       - run: cargo test --locked --features ssh,ssh-rsa
       - run: cargo test --locked --features ssh,ws
+      - run: cargo test --locked --features ws,os-certificates
+      # OAuth (desktop sign-in) without `ssh`: no async runtime.
+      - run: cargo test --locked --features oauth
+      - run: cargo test --locked --no-default-features --features oauth
+      - run: cargo test --locked --features oauth,ws
       - run: cargo test --locked --all-features
 
   doc:
@@ -95,6 +106,7 @@ jobs:
       - run: cargo doc --locked --no-deps --all-features
       - run: cargo doc --locked --no-deps --no-default-features
       - run: cargo doc --locked --no-deps --features ssh
+      - run: cargo doc --locked --no-deps --features oauth
 
   # The minimum supported Rust version (Cargo.toml `rust-version`) really builds.
   msrv:
@@ -119,7 +131,7 @@ jobs:
           toolchain: "1.96.0"
       # "No tokio unless you enable `ssh`": every set without `ssh`.
       - run: |
-          for f in "--no-default-features" "" "--features gzip" "--no-default-features --features http" "--no-default-features --features json" "--features ws" "--no-default-features --features ws" "--features ws,gzip"; do
+          for f in "--no-default-features" "" "--features gzip" "--no-default-features --features http" "--no-default-features --features json" "--features ws" "--no-default-features --features ws" "--features ws,gzip" "--features oauth" "--no-default-features --features oauth" "--features oauth,ws"; do
             if cargo tree --locked --target all -e normal,build $f --prefix none | grep -E '^(tokio|tokio-macros|mio|russh|openssl-sys|native-tls|aws-lc-sys|aws-lc-rs|reqwest|hyper|rustls-rustcrypto|libssh2-sys) '; then
               echo "forbidden dependency with [$f]"; exit 1
             fi
@@ -141,7 +153,8 @@ jobs:
       # does appear in the dev tree through bevy's wasm-only dependencies; the tokio rule above is
       # checked on normal + build dependencies only.
       - run: |
-          if grep -qE 'name = "(aws-lc|openssl|libssh2)' Cargo.lock; then echo "aws-lc / openssl / libssh2 in Cargo.lock"; exit 1; fi
+          # `openssl-probe` (feature `os-certificates`, Linux / BSD: finds the system's CA files) links no OpenSSL.
+          if grep -E 'name = "(aws-lc|openssl|libssh2)' Cargo.lock | grep -v 'name = "openssl-probe"'; then echo "aws-lc / openssl / libssh2 in Cargo.lock"; exit 1; fi
           if cargo tree --locked --all-features --target all -e normal,dev,build --prefix none | grep -E '^(aws-lc|openssl-sys|native-tls|libssh2-sys) '; then
             echo "forbidden crate in the dev tree"; exit 1
           fi
